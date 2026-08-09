@@ -484,11 +484,19 @@ impl TaskStore {
     /// waits - a task that asks for input during it can never be answered. It
     /// is used only where the transport cannot be pumped; see
     /// [`try_result`](Self::try_result).
+    ///
+    /// The wait is bounded by the task's TTL. Nothing signals an expiry - it is
+    /// noticed by sweeping - so waiting on the condvar alone would sleep past
+    /// the deadline of a task that stopped making progress and never wake.
     pub fn await_result(&self, task_id: &str) -> Result<TaskOutcome> {
+        /// How often to look up from the condvar and re-sweep.
+        const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+
         let mut tasks = self.lock()?;
-        Self::sweep(&mut tasks, SystemTime::now());
 
         loop {
+            Self::sweep(&mut tasks, SystemTime::now());
+
             let record = tasks.get(task_id).ok_or_else(|| not_found(task_id))?;
             if record.task.status.is_terminal() {
                 return record.outcome.clone().ok_or_else(|| {
@@ -498,8 +506,9 @@ impl TaskStore {
 
             tasks = self
                 .changed
-                .wait(tasks)
-                .map_err(|_| McpError::Internal("Task store lock poisoned".into()))?;
+                .wait_timeout(tasks, SWEEP_INTERVAL)
+                .map_err(|_| McpError::Internal("Task store lock poisoned".into()))?
+                .0;
         }
     }
 }
@@ -1049,6 +1058,33 @@ mod tests {
         let (task, _) = store.create(None).unwrap();
         assert!(store.get(&task.task_id).is_ok());
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn await_result_gives_up_when_the_task_ttl_elapses() {
+        // Nothing signals an expiry, so a plain `Condvar::wait` sleeps straight
+        // past it. A worker that dies without finishing its task would hold
+        // this - and, on a transport that cannot be pumped, the whole server -
+        // forever.
+        let store = Arc::new(TaskStore::new(TaskConfig {
+            default_ttl_ms: 150,
+            ..Default::default()
+        }));
+        let (task, _cancelled) = store.create(None).unwrap();
+
+        let (done, waited) = std::sync::mpsc::channel();
+        let waiting = store.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(waiting.await_result(&task.task_id));
+        });
+
+        let outcome = waited
+            .recv_timeout(Duration::from_secs(5))
+            .expect("await_result must not outlive the task's TTL");
+        assert!(
+            outcome.unwrap_err().to_string().contains("not found"),
+            "an expired task is reported as missing"
+        );
     }
 
     #[test]

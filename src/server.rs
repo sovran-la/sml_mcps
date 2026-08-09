@@ -934,6 +934,20 @@ impl Default for ServerConfig {
     }
 }
 
+/// The message a panic carried, for reporting it as an error instead.
+///
+/// `panic!("text")` and `panic!("{fmt}")` produce a `&str` and a `String`
+/// respectively; anything else is a custom payload nobody can render.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return (*text).to_string();
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text.clone();
+    }
+    "no message".to_string()
+}
+
 /// Is this read failure the peer sending something unreadable, rather than the
 /// connection itself failing?
 ///
@@ -1520,7 +1534,14 @@ impl<C: Send + Sync + 'static> Server<C> {
                     }),
                 };
 
-                let (status, outcome) = match tool.execute(arguments, &mut context, &env) {
+                // A panic here used to unwind the thread with `finish` never
+                // reached: the task sat in `working` until its TTL, `tasks/get`
+                // reported `working` forever, and `tasks/result` - which runs
+                // on the server loop thread - blocked indefinitely, taking
+                // every other request down with it. A panic is a failed task,
+                // not a wedged server.
+                let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match tool.execute(arguments, &mut context, &env) {
                     // "For tool calls specifically, this includes cases where
                     // the tool call result has isError set to true" -> failed.
                     Ok(result) if result.is_error => {
@@ -1561,6 +1582,18 @@ impl<C: Send + Sync + 'static> Server<C> {
                     Err(other) => (
                         TaskStatus::Failed,
                         TaskOutcome::Error(other.to_jsonrpc_error()),
+                    ),
+                    }
+                }));
+
+                let (status, outcome) = match executed {
+                    Ok(finished) => finished,
+                    Err(payload) => (
+                        TaskStatus::Failed,
+                        TaskOutcome::Error(JsonRpcError::internal_error(format!(
+                            "task worker panicked: {}",
+                            panic_message(payload.as_ref())
+                        ))),
                     ),
                 };
 
@@ -1773,11 +1806,23 @@ impl<C: Send + Sync + 'static> Server<C> {
 
         let env = self.tool_env();
 
-        let outcome = tool.execute(
-            params.arguments.unwrap_or(serde_json::json!({})),
-            context,
-            &env,
-        );
+        // A panicking tool is a broken tool, not a broken server. Unwinding
+        // from here kills the process on stdio, the connection thread on a
+        // Unix daemon, and the whole accept loop on HTTP.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tool.execute(
+                params.arguments.unwrap_or(serde_json::json!({})),
+                context,
+                &env,
+            )
+        }))
+        .unwrap_or_else(|payload| {
+            Err(McpError::Internal(format!(
+                "tool `{}` panicked: {}",
+                params.name,
+                panic_message(payload.as_ref())
+            )))
+        });
 
         // Tool *execution* failures are results, not JSON-RPC errors: the spec
         // wants the model to see actionable text and self-correct. Only
@@ -4755,6 +4800,96 @@ mod tests {
             }
             Ok(CallToolResult::text("finished"))
         }
+    }
+
+    /// Tool that panics, to prove a broken tool cannot wedge the server.
+    struct PanickingTool;
+
+    impl Tool<TestContext> for PanickingTool {
+        fn name(&self) -> &str {
+            "panics"
+        }
+        fn description(&self) -> &str {
+            "Panics on purpose"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn task_support(&self) -> TaskSupport {
+            TaskSupport::Optional
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            panic!("tool exploded");
+        }
+    }
+
+    #[test]
+    fn test_a_panicking_task_worker_fails_the_task_instead_of_wedging_it() {
+        // Before: the worker thread unwound, `store.finish` was never reached,
+        // the task sat in `working` until its TTL, and `tasks/result` - handled
+        // on the server loop thread - blocked forever, so the server stopped
+        // answering everything else too.
+        let mut server = task_server();
+        server.add_tool(PanickingTool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "panics", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        let task = await_terminal(&mut server, &task_id);
+        assert_eq!(task["status"], "failed");
+        assert!(
+            task["statusMessage"]
+                .as_str()
+                .unwrap()
+                .contains("tool exploded"),
+            "{task}"
+        );
+
+        // And the result is retrievable rather than blocking forever.
+        let err = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap_err();
+        let error = err.to_jsonrpc_error();
+        assert_eq!(error.code, -32603);
+        assert!(error.message.contains("panicked"), "{}", error.message);
+    }
+
+    #[test]
+    fn test_a_panicking_tool_is_an_internal_error_not_a_crash() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(PanickingTool).unwrap();
+        server.add_tool(IncrementTool).unwrap();
+
+        let err = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "panics" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_jsonrpc_error().code, -32603);
+        assert!(err.to_string().contains("panicked"), "{err}");
+
+        // The server is still usable afterwards.
+        let ok = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "increment" }),
+        )
+        .unwrap();
+        assert_eq!(ok["content"][0]["text"], "Counter is now: 1");
     }
 
     /// Tool that must be invoked as a task.
