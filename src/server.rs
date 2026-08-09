@@ -17,30 +17,98 @@ use std::sync::{Arc, Mutex};
 ///
 /// Gives tools access to notifications, progress reporting, and resources.
 pub struct ToolEnv<'a> {
-    transport: &'a Arc<Mutex<dyn Transport>>,
+    /// `None` when the server was driven without a transport (direct dispatch
+    /// in tests, for example). Sending is then a no-op rather than a panic.
+    transport: Option<&'a Arc<Mutex<dyn Transport>>>,
     resources: &'a HashMap<String, Box<dyn Resource>>,
+    /// Minimum severity the client asked for via `logging/setLevel`.
+    log_level: LogLevel,
+    /// What to do with log records that the client will not see.
+    stderr_logging: StderrLogging,
+    /// Default `logger` name on emitted log records.
+    logger: &'a str,
 }
 
 impl<'a> ToolEnv<'a> {
     /// Send a notification to the client
+    ///
+    /// Returns `Ok(())` without doing anything when the server has no
+    /// transport attached.
     pub fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {
+        let Some(transport) = self.transport else {
+            return Ok(());
+        };
         let notification = JsonRpcMessage::notification(method, params);
-        let mut transport = self
-            .transport
+        let mut transport = transport
             .lock()
             .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
         transport.write(&notification)
     }
 
-    /// Send a log message notification
+    /// Send a log message to the client, falling back to stderr.
+    ///
+    /// The record reaches the client as a `notifications/message` only when
+    /// `level` meets the threshold the client set via `logging/setLevel` (the
+    /// server's configured default until then). Anything the client will not
+    /// see is written to stderr instead, so a suppressed log is still
+    /// diagnosable - the stdio transport explicitly permits stderr for
+    /// "any logging purposes including informational, debug, and error
+    /// messages."
+    ///
+    /// This never fails the calling tool: a transport write error is reported
+    /// on stderr and swallowed. Logging is diagnostics, not business logic.
     pub fn log(&self, level: LogLevel, message: impl Into<String>) -> Result<()> {
-        self.send_notification(
-            "notifications/message",
-            Some(serde_json::json!({
-                "level": level.as_str(),
-                "data": message.into()
-            })),
-        )
+        self.log_data(level, None, Value::String(message.into()));
+        Ok(())
+    }
+
+    /// Send a structured log record with an optional logger name.
+    ///
+    /// `data` may be any JSON value; the spec places no constraint on it
+    /// beyond being JSON-serializable. `logger` defaults to the server name.
+    pub fn log_data(&self, level: LogLevel, logger: Option<&str>, data: Value) {
+        let logger = logger.unwrap_or(self.logger);
+        let delivered = if level >= self.log_level {
+            self.send_notification(
+                "notifications/message",
+                Some(serde_json::json!({
+                    "level": level.as_str(),
+                    "logger": logger,
+                    "data": data,
+                })),
+            )
+            .inspect_err(|e| eprintln!("[{}] failed to deliver log record: {}", logger, e))
+            .is_ok()
+                && self.transport.is_some()
+        } else {
+            false
+        };
+
+        let write_stderr = match self.stderr_logging {
+            StderrLogging::Never => false,
+            StderrLogging::Fallback => !delivered,
+            StderrLogging::Always => true,
+        };
+
+        if write_stderr {
+            match data.as_str() {
+                // Strings are the common case; print them unquoted.
+                Some(text) => eprintln!("[{}] {}: {}", logger, level.as_str(), text),
+                None => eprintln!("[{}] {}: {}", logger, level.as_str(), data),
+            }
+        }
+    }
+
+    /// The minimum log severity the client is currently accepting.
+    pub fn log_level(&self) -> LogLevel {
+        self.log_level
+    }
+
+    /// Would a record at `level` be delivered to the client?
+    ///
+    /// Useful to skip building an expensive log payload that would be dropped.
+    pub fn log_enabled(&self, level: LogLevel) -> bool {
+        level >= self.log_level
     }
 
     /// Send progress update for long-running operations
@@ -66,23 +134,112 @@ impl<'a> ToolEnv<'a> {
     }
 }
 
-/// Log levels for notifications
-#[derive(Debug, Clone, Copy)]
+/// Where log records go when the client will not receive them.
+///
+/// The MCP stdio transport permits servers to write anything to stderr, and
+/// that is the sanctioned escape hatch for diagnostics a client did not
+/// subscribe to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StderrLogging {
+    /// Drop suppressed records entirely.
+    Never,
+    /// Write to stderr only when the record did not reach the client, because
+    /// it was below the client's threshold, there was no transport, or the
+    /// write failed. This is the default: it guarantees no log ever vanishes
+    /// silently, without duplicating records the client already has.
+    #[default]
+    Fallback,
+    /// Write every record to stderr, in addition to delivering it.
+    Always,
+}
+
+/// Log severity levels
+///
+/// These are the eight syslog severities from RFC 5424, which is what MCP's
+/// logging utility uses. Ordering is by increasing severity, so a record is
+/// emitted when `record_level >= configured_minimum`.
+///
+/// Marked `#[non_exhaustive]`: match on it with a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[non_exhaustive]
 pub enum LogLevel {
+    /// Detailed debugging information (function entry/exit points).
     Debug,
+    /// General informational messages (operation progress updates).
+    #[default]
     Info,
+    /// Normal but significant events (configuration changes).
+    Notice,
+    /// Warning conditions (deprecated feature usage).
     Warning,
+    /// Error conditions (operation failures).
     Error,
+    /// Critical conditions (system component failures).
+    Critical,
+    /// Action must be taken immediately (data corruption detected).
+    Alert,
+    /// System is unusable (complete system failure).
+    Emergency,
 }
 
 impl LogLevel {
+    /// The wire name for this level.
     pub fn as_str(&self) -> &'static str {
         match self {
             LogLevel::Debug => "debug",
             LogLevel::Info => "info",
+            LogLevel::Notice => "notice",
             LogLevel::Warning => "warning",
             LogLevel::Error => "error",
+            LogLevel::Critical => "critical",
+            LogLevel::Alert => "alert",
+            LogLevel::Emergency => "emergency",
         }
+    }
+
+    /// Parse a wire level name, case-insensitively.
+    ///
+    /// Returns `None` for anything not in RFC 5424, which callers turn into
+    /// `-32602 Invalid params`.
+    pub fn from_wire(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "debug" => Some(LogLevel::Debug),
+            "info" => Some(LogLevel::Info),
+            "notice" => Some(LogLevel::Notice),
+            "warning" => Some(LogLevel::Warning),
+            "error" => Some(LogLevel::Error),
+            "critical" => Some(LogLevel::Critical),
+            "alert" => Some(LogLevel::Alert),
+            "emergency" => Some(LogLevel::Emergency),
+            _ => None,
+        }
+    }
+
+    /// Every level, ascending by severity.
+    pub const ALL: [LogLevel; 8] = [
+        LogLevel::Debug,
+        LogLevel::Info,
+        LogLevel::Notice,
+        LogLevel::Warning,
+        LogLevel::Error,
+        LogLevel::Critical,
+        LogLevel::Alert,
+        LogLevel::Emergency,
+    ];
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LogLevel {
+    type Err = McpError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        LogLevel::from_wire(s)
+            .ok_or_else(|| McpError::InvalidParams(format!("Unknown log level: {}", s)))
     }
 }
 
@@ -191,6 +348,15 @@ pub struct ServerConfig {
     pub instructions: Option<String>,
     /// Page size for list operations (tools, resources, prompts)
     pub page_size: usize,
+    /// Minimum log severity delivered to clients that never call
+    /// `logging/setLevel`.
+    ///
+    /// The spec leaves the pre-`setLevel` default to the server. `Info` keeps
+    /// useful records flowing without drowning clients in `debug`.
+    pub default_log_level: LogLevel,
+    /// Where log records go when the client will not receive them
+    /// (default: [`StderrLogging::Fallback`]).
+    pub stderr_logging: StderrLogging,
 }
 
 impl Default for ServerConfig {
@@ -200,6 +366,8 @@ impl Default for ServerConfig {
             version: env!("CARGO_PKG_VERSION").to_string(),
             instructions: None,
             page_size: DEFAULT_PAGE_SIZE,
+            default_log_level: LogLevel::Info,
+            stderr_logging: StderrLogging::default(),
         }
     }
 }
@@ -216,11 +384,14 @@ pub struct Server<C> {
     prompts: HashMap<String, Box<dyn PromptDef>>,
     transport: Option<Arc<Mutex<dyn Transport>>>,
     initialized: bool,
+    /// Minimum log severity, as last set by `logging/setLevel`.
+    log_level: LogLevel,
 }
 
 impl<C: Send + Sync + 'static> Server<C> {
     /// Create a new server with the given configuration
     pub fn new(config: ServerConfig) -> Self {
+        let log_level = config.default_log_level;
         Self {
             config,
             tools: HashMap::new(),
@@ -228,6 +399,18 @@ impl<C: Send + Sync + 'static> Server<C> {
             prompts: HashMap::new(),
             transport: None,
             initialized: false,
+            log_level,
+        }
+    }
+
+    /// Build the environment handed to a tool for one invocation.
+    fn tool_env(&self) -> ToolEnv<'_> {
+        ToolEnv {
+            transport: self.transport.as_ref(),
+            resources: &self.resources,
+            log_level: self.log_level,
+            stderr_logging: self.config.stderr_logging,
+            logger: &self.config.name,
         }
     }
 
@@ -370,8 +553,33 @@ impl<C: Send + Sync + 'static> Server<C> {
             "resources/read" => self.handle_read_resource(request),
             "prompts/list" => self.handle_list_prompts(request),
             "prompts/get" => self.handle_get_prompt(request),
+            "logging/setLevel" => self.handle_set_level(request),
             method => Err(McpError::MethodNotFound(method.to_string())),
         }
+    }
+
+    /// `logging/setLevel` - set the minimum severity delivered to this client.
+    fn handle_set_level(&mut self, request: &JsonRpcRequest) -> Result<Value> {
+        let params: SetLevelParams = match &request.params {
+            Some(p) => serde_json::from_value(p.clone())
+                .map_err(|e| McpError::InvalidParams(format!("Invalid setLevel params: {}", e)))?,
+            None => return Err(McpError::InvalidParams("Missing params".into())),
+        };
+
+        // Unknown levels are Invalid params, per the logging spec.
+        self.log_level = LogLevel::from_wire(&params.level).ok_or_else(|| {
+            McpError::InvalidParams(format!(
+                "Unknown log level `{}`; expected one of: {}",
+                params.level,
+                LogLevel::ALL
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
+        Ok(serde_json::json!({}))
     }
 
     fn handle_initialize(&mut self, request: &JsonRpcRequest) -> Result<Value> {
@@ -400,7 +608,10 @@ impl<C: Send + Sync + 'static> Server<C> {
                 } else {
                     Some(PromptsCapability::default())
                 },
-                logging: None,
+                // The framework always implements `logging/setLevel` and can
+                // emit `notifications/message`, and a server that emits them
+                // MUST declare this. We used to emit without declaring.
+                logging: Some(serde_json::json!({})),
                 experimental: None,
             },
             server_info: Implementation {
@@ -457,10 +668,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             .get(&params.name)
             .ok_or_else(|| McpError::ToolError(format!("Unknown tool: {}", params.name)))?;
 
-        let env = ToolEnv {
-            transport: self.transport.as_ref().unwrap(),
-            resources: &self.resources,
-        };
+        let env = self.tool_env();
 
         let result = tool.execute(
             params.arguments.unwrap_or(serde_json::json!({})),
@@ -749,6 +957,51 @@ mod tests {
         }
     }
 
+    // Transport that records writes into a handle the test still owns, so
+    // messages can be inspected after the transport is erased to `dyn Transport`.
+    #[derive(Clone, Default)]
+    struct RecordingTransport {
+        written: Arc<Mutex<Vec<JsonRpcMessage>>>,
+    }
+
+    impl RecordingTransport {
+        fn written(&self) -> Vec<JsonRpcMessage> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    impl Transport for RecordingTransport {
+        fn read(&mut self) -> Result<JsonRpcMessage> {
+            Err(McpError::TransportClosed)
+        }
+
+        fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
+            self.written.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // Transport whose writes always fail, to prove logging swallows errors.
+    struct FailingTransport;
+
+    impl Transport for FailingTransport {
+        fn read(&mut self) -> Result<JsonRpcMessage> {
+            Err(McpError::TransportClosed)
+        }
+
+        fn write(&mut self, _message: &JsonRpcMessage) -> Result<()> {
+            Err(McpError::Internal("write failed".into()))
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     // Helper to create a request message
     fn make_request(id: i64, method: &str, params: Option<Value>) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest {
@@ -836,8 +1089,333 @@ mod tests {
     fn test_log_level_as_str() {
         assert_eq!(LogLevel::Debug.as_str(), "debug");
         assert_eq!(LogLevel::Info.as_str(), "info");
+        assert_eq!(LogLevel::Notice.as_str(), "notice");
         assert_eq!(LogLevel::Warning.as_str(), "warning");
         assert_eq!(LogLevel::Error.as_str(), "error");
+        assert_eq!(LogLevel::Critical.as_str(), "critical");
+        assert_eq!(LogLevel::Alert.as_str(), "alert");
+        assert_eq!(LogLevel::Emergency.as_str(), "emergency");
+    }
+
+    #[test]
+    fn test_log_level_covers_all_rfc5424_severities() {
+        // MCP's logging utility is exactly the eight syslog severities.
+        assert_eq!(LogLevel::ALL.len(), 8);
+        let names: Vec<_> = LogLevel::ALL.iter().map(|l| l.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "debug",
+                "info",
+                "notice",
+                "warning",
+                "error",
+                "critical",
+                "alert",
+                "emergency"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_log_level_ordering_is_by_severity() {
+        // The threshold check is `record >= minimum`, so ordering must be
+        // ascending by severity across the whole set.
+        for pair in LogLevel::ALL.windows(2) {
+            assert!(pair[0] < pair[1], "{:?} should be < {:?}", pair[0], pair[1]);
+        }
+        assert!(LogLevel::Error > LogLevel::Debug);
+        assert!(LogLevel::Emergency > LogLevel::Warning);
+    }
+
+    #[test]
+    fn test_log_level_round_trips_through_wire_names() {
+        for level in LogLevel::ALL {
+            assert_eq!(LogLevel::from_wire(level.as_str()), Some(level));
+            assert_eq!(level.to_string(), level.as_str());
+        }
+    }
+
+    #[test]
+    fn test_log_level_from_wire_is_case_insensitive() {
+        assert_eq!(LogLevel::from_wire("ERROR"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::from_wire("Warning"), Some(LogLevel::Warning));
+        assert_eq!(LogLevel::from_wire("bogus"), None);
+        assert_eq!(LogLevel::from_wire(""), None);
+        assert!("nonsense".parse::<LogLevel>().is_err());
+        assert_eq!("debug".parse::<LogLevel>().unwrap(), LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_logging_capability_is_declared() {
+        // A server that emits notifications/message MUST declare `logging`.
+        // We emit from ToolEnv::log, so we always declare it.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "initialize".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&req, &mut ctx).unwrap();
+        assert!(!result["capabilities"]["logging"].is_null());
+    }
+
+    #[test]
+    fn test_set_level_updates_threshold() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        assert_eq!(server.log_level, LogLevel::Info);
+
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "logging/setLevel".to_string(),
+            params: Some(serde_json::json!({ "level": "error" })),
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&req, &mut ctx).unwrap();
+
+        assert_eq!(result, serde_json::json!({}));
+        assert_eq!(server.log_level, LogLevel::Error);
+    }
+
+    #[test]
+    fn test_set_level_rejects_unknown_level() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "logging/setLevel".to_string(),
+            params: Some(serde_json::json!({ "level": "verbose" })),
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let err = server.dispatch_request(&req, &mut ctx).unwrap_err();
+
+        // Invalid log level: -32602 (Invalid params).
+        assert_eq!(err.to_jsonrpc_error().code, -32602);
+        // The threshold must be left alone on a rejected request.
+        assert_eq!(server.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn test_set_level_rejects_missing_params() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "logging/setLevel".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        assert!(matches!(
+            server.dispatch_request(&req, &mut ctx),
+            Err(McpError::InvalidParams(_))
+        ));
+    }
+
+    /// Build a standalone ToolEnv for direct logging tests.
+    fn log_env<'a>(
+        transport: Option<&'a Arc<Mutex<dyn Transport>>>,
+        resources: &'a HashMap<String, Box<dyn Resource>>,
+        log_level: LogLevel,
+        stderr_logging: StderrLogging,
+    ) -> ToolEnv<'a> {
+        ToolEnv {
+            transport,
+            resources,
+            log_level,
+            stderr_logging,
+            logger: "test-logger",
+        }
+    }
+
+    #[test]
+    fn test_log_respects_threshold() {
+        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let recorder = RecordingTransport::default();
+        let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
+
+        let env = log_env(
+            Some(&transport),
+            &resources,
+            LogLevel::Warning,
+            StderrLogging::Never,
+        );
+
+        // Below threshold: dropped.
+        env.log(LogLevel::Debug, "quiet").unwrap();
+        env.log(LogLevel::Info, "also quiet").unwrap();
+        // At or above threshold: delivered.
+        env.log(LogLevel::Warning, "loud").unwrap();
+        env.log(LogLevel::Error, "louder").unwrap();
+
+        let sent = recorder.written();
+        assert_eq!(sent.len(), 2);
+        for msg in &sent {
+            let JsonRpcMessage::Notification(n) = msg else {
+                panic!("expected notification");
+            };
+            assert_eq!(n.method, "notifications/message");
+        }
+    }
+
+    #[test]
+    fn test_log_emits_spec_shaped_notification() {
+        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let recorder = RecordingTransport::default();
+        let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
+        let env = log_env(
+            Some(&transport),
+            &resources,
+            LogLevel::Debug,
+            StderrLogging::Never,
+        );
+
+        env.log(LogLevel::Error, "boom").unwrap();
+
+        let sent = recorder.written();
+        let JsonRpcMessage::Notification(n) = &sent[0] else {
+            panic!("expected notification");
+        };
+        let params = n.params.as_ref().unwrap();
+        assert_eq!(params["level"], "error");
+        assert_eq!(params["logger"], "test-logger");
+        assert_eq!(params["data"], "boom");
+    }
+
+    #[test]
+    fn test_log_data_carries_structured_payload_and_logger() {
+        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let recorder = RecordingTransport::default();
+        let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
+        let env = log_env(
+            Some(&transport),
+            &resources,
+            LogLevel::Debug,
+            StderrLogging::Never,
+        );
+
+        env.log_data(
+            LogLevel::Critical,
+            Some("database"),
+            serde_json::json!({ "error": "Connection failed", "port": 5432 }),
+        );
+
+        let sent = recorder.written();
+        let JsonRpcMessage::Notification(n) = &sent[0] else {
+            panic!("expected notification");
+        };
+        let params = n.params.as_ref().unwrap();
+        assert_eq!(params["level"], "critical");
+        assert_eq!(params["logger"], "database");
+        assert_eq!(params["data"]["error"], "Connection failed");
+        assert_eq!(params["data"]["port"], 5432);
+    }
+
+    #[test]
+    fn test_log_never_fails_the_tool() {
+        // The whole point of the stderr fallback: logging must not be able to
+        // turn a working tool into a failing one.
+        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+
+        // No transport at all.
+        let env = log_env(None, &resources, LogLevel::Debug, StderrLogging::Fallback);
+        assert!(env.log(LogLevel::Error, "no transport").is_ok());
+
+        // Transport that errors on every write.
+        let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(FailingTransport));
+        let env = log_env(
+            Some(&transport),
+            &resources,
+            LogLevel::Debug,
+            StderrLogging::Fallback,
+        );
+        assert!(env.log(LogLevel::Error, "write fails").is_ok());
+    }
+
+    #[test]
+    fn test_log_enabled_matches_delivery() {
+        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let recorder = RecordingTransport::default();
+        let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
+        let env = log_env(
+            Some(&transport),
+            &resources,
+            LogLevel::Warning,
+            StderrLogging::Never,
+        );
+
+        assert_eq!(env.log_level(), LogLevel::Warning);
+        assert!(!env.log_enabled(LogLevel::Debug));
+        assert!(!env.log_enabled(LogLevel::Info));
+        assert!(!env.log_enabled(LogLevel::Notice));
+        assert!(env.log_enabled(LogLevel::Warning));
+        assert!(env.log_enabled(LogLevel::Emergency));
+
+        for level in LogLevel::ALL {
+            env.log(level, "x").unwrap();
+        }
+        let sent = recorder.written().len();
+        let expected = LogLevel::ALL
+            .iter()
+            .filter(|l| env.log_enabled(**l))
+            .count();
+        assert_eq!(sent, expected);
+    }
+
+    #[test]
+    fn test_stderr_logging_never_still_delivers_to_client() {
+        // StderrLogging::Never suppresses only the *fallback*, not delivery.
+        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let recorder = RecordingTransport::default();
+        let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
+        let env = log_env(
+            Some(&transport),
+            &resources,
+            LogLevel::Debug,
+            StderrLogging::Never,
+        );
+
+        env.log(LogLevel::Info, "delivered").unwrap();
+        assert_eq!(recorder.written().len(), 1);
+    }
+
+    #[test]
+    fn test_server_default_log_level_is_configurable() {
+        let server: Server<TestContext> = Server::new(ServerConfig {
+            default_log_level: LogLevel::Error,
+            ..Default::default()
+        });
+        assert_eq!(server.log_level, LogLevel::Error);
+    }
+
+    #[test]
+    fn test_stderr_logging_default_is_fallback() {
+        assert_eq!(StderrLogging::default(), StderrLogging::Fallback);
+        assert_eq!(
+            ServerConfig::default().stderr_logging,
+            StderrLogging::Fallback
+        );
+        assert_eq!(ServerConfig::default().default_log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn test_tool_call_without_transport_does_not_panic() {
+        // ToolEnv used to unwrap the transport; dispatching a tool call
+        // directly (no start/process_one) panicked.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(NotifyTool).unwrap();
+
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": "notify" })),
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        assert_eq!(result["content"][0]["text"], "done");
     }
 
     #[test]
@@ -1336,10 +1914,12 @@ mod tests {
         );
 
         let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(MockTransport::new(vec![])));
-        let env = ToolEnv {
-            transport: &transport,
-            resources: &resources,
-        };
+        let env = log_env(
+            Some(&transport),
+            &resources,
+            LogLevel::Info,
+            StderrLogging::Never,
+        );
 
         let uris = env.list_resources();
         assert_eq!(uris.len(), 2);
@@ -1359,10 +1939,12 @@ mod tests {
         );
 
         let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(MockTransport::new(vec![])));
-        let env = ToolEnv {
-            transport: &transport,
-            resources: &resources,
-        };
+        let env = log_env(
+            Some(&transport),
+            &resources,
+            LogLevel::Info,
+            StderrLogging::Never,
+        );
 
         let found = env.get_resource("test://data");
         assert!(found.is_some());

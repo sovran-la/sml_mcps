@@ -398,6 +398,29 @@ pub enum Role {
 }
 
 //
+// Logging
+//
+
+/// Params for `logging/setLevel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLevelParams {
+    /// One of the eight RFC 5424 severities, lowercase.
+    pub level: String,
+}
+
+/// Params for the `notifications/message` log notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogMessageParams {
+    pub level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logger: Option<String>,
+    /// Any JSON-serializable payload.
+    pub data: Value,
+}
+
+//
 // Ping
 //
 
