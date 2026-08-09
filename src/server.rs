@@ -1007,6 +1007,51 @@ pub struct Server<C> {
     broker: Arc<RequestBroker>,
     /// Present only once [`Server::enable_tasks`] has been called.
     tasks: Option<TaskRuntime<C>>,
+    /// Workers held until the response announcing their task has been written.
+    ///
+    /// A worker writes through an independent handle on its own thread, so
+    /// without this its first message - an elicitation, a log record, a status
+    /// notification - can beat the `CreateTaskResult` onto the wire, and the
+    /// client is told about a task it has never heard of.
+    task_starts: Mutex<Vec<Arc<TaskGate>>>,
+}
+
+/// One-shot gate holding a task worker until its `CreateTaskResult` is out.
+#[derive(Debug, Default)]
+struct TaskGate {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl TaskGate {
+    /// Block until the gate opens, or give up after `limit`.
+    ///
+    /// Giving up rather than waiting forever: a caller that dispatches without
+    /// ever writing (a test driving `dispatch_request` directly) would
+    /// otherwise strand the worker.
+    fn wait(&self, limit: std::time::Duration) {
+        let deadline = std::time::Instant::now() + limit;
+        let Ok(mut open) = self.open.lock() else {
+            return;
+        };
+        while !*open {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let Ok((guard, _)) = self.opened.wait_timeout(open, left) else {
+                return;
+            };
+            open = guard;
+        }
+    }
+
+    fn open(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = true;
+        }
+        self.opened.notify_all();
+    }
 }
 
 /// Everything needed to run tools on a background thread.
@@ -1038,6 +1083,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             client_capabilities: ClientCapabilities::default(),
             broker: Arc::new(RequestBroker::new()),
             tasks: None,
+            task_starts: Mutex::new(Vec::new()),
         }
     }
 
@@ -1241,10 +1287,25 @@ impl<C: Send + Sync + 'static> Server<C> {
         let Some(writer) = self.writer.as_ref().or(self.transport.as_ref()) else {
             return Ok(());
         };
-        writer
+        let outcome = writer
             .lock()
             .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?
-            .write(message)
+            .write(message);
+
+        // Whatever we just wrote, any task started while handling this request
+        // has now been announced, so its worker may speak.
+        self.release_task_workers();
+        outcome
+    }
+
+    /// Let every worker parked at its start gate run.
+    fn release_task_workers(&self) {
+        let Ok(mut gates) = self.task_starts.lock() else {
+            return;
+        };
+        for gate in gates.drain(..) {
+            gate.open();
+        }
     }
 
     /// Process a single request (for HTTP - single request/response)
@@ -1431,11 +1492,53 @@ impl<C: Send + Sync + 'static> Server<C> {
                 // The client hung up. Fall back to waiting on the task alone -
                 // it is still running, and its result may still be wanted.
                 Err(McpError::TransportClosed) => return store.await_result(task_id),
+                // Unreadable input is the client's problem, not a reason to
+                // abandon the task. Answer it and keep pumping.
+                Err(e) if is_malformed(&e) => {
+                    self.write_message(&JsonRpcMessage::error(
+                        RequestId::Null,
+                        e.to_jsonrpc_error(),
+                    ))?;
+                }
                 Err(e) => return Err(e),
                 Ok(JsonRpcMessage::Response(response)) => self.broker.deliver(response),
+                Ok(JsonRpcMessage::Request(request)) => match self.answer_inline(&request) {
+                    Some(response) => self.write_message(&response)?,
+                    None => self.broker.defer(JsonRpcMessage::Request(request)),
+                },
                 Ok(other) => self.broker.defer(other),
             }
         }
+    }
+
+    /// Answer a request from inside the `tasks/result` pump, if it is one of
+    /// the few that can safely be handled re-entrantly.
+    ///
+    /// Deferring everything is what made `tasks/result` a trap: deferred
+    /// messages are only replayed by the main loop, which cannot run until
+    /// `tasks/result` returns, so a client that followed the spec - "receivers
+    /// **MUST** transition the task to `cancelled` status before sending the
+    /// response", "requestors can continue polling via `tasks/get` in parallel"
+    /// - was answered with silence. Worse, the flow the spec *prescribes* for
+    ///   `input_required` (call `tasks/result`, then decide) is exactly the one
+    ///   that trapped it.
+    ///
+    /// These four are `&self`, touch only the task store or nothing at all, and
+    /// cannot re-enter this function. Everything else - including a second
+    /// `tasks/result` - keeps being deferred.
+    fn answer_inline(&self, request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
+        let outcome = match request.method.as_str() {
+            "ping" => self.handle_ping(),
+            "tasks/get" => self.handle_task_get(request),
+            "tasks/list" => self.handle_task_list(request),
+            "tasks/cancel" => self.handle_task_cancel(request),
+            _ => return None,
+        };
+
+        Some(match outcome {
+            Ok(result) => JsonRpcMessage::response(request.id.clone(), result),
+            Err(e) => JsonRpcMessage::error(request.id.clone(), e.to_jsonrpc_error()),
+        })
     }
 
     fn handle_task_list(&self, request: &JsonRpcRequest) -> Result<Value> {
@@ -1499,11 +1602,28 @@ impl<C: Send + Sync + 'static> Server<C> {
         };
         let task_id = task.task_id.clone();
 
+        // Held until this call's `CreateTaskResult` is on the wire. Only
+        // installed when there is something to write through: a caller
+        // dispatching without a transport has no response to wait for.
+        let gate = transport.is_some().then(|| {
+            let gate = Arc::new(TaskGate::default());
+            if let Ok(mut gates) = self.task_starts.lock() {
+                gates.push(gate.clone());
+            }
+            gate
+        });
+
         // std::thread, not a runtime: the work really does run alongside the
         // server loop, so polling returns live answers.
         let spawned = std::thread::Builder::new()
             .name(format!("sml-task-{}", &task_id[..8.min(task_id.len())]))
             .spawn(move || {
+                // The client cannot make sense of a message about a task it has
+                // not been told about yet.
+                if let Some(gate) = &gate {
+                    gate.wait(std::time::Duration::from_secs(5));
+                }
+
                 let mut context = context_factory();
                 let env = ToolEnv {
                     transport: transport.as_ref(),
@@ -5680,6 +5800,179 @@ mod tests {
         // `accepted_content` withholds content on anything but accept, so the
         // tool sees no name.
         assert_eq!(result.result.unwrap()["content"][0]["text"], "hello <none>");
+    }
+
+    /// Drive the flow the spec prescribes for `input_required`: start a task,
+    /// let it elicit, then open `tasks/result` without answering. Returns the
+    /// client and the task id, with the elicitation still outstanding.
+    #[cfg(unix)]
+    fn task_blocked_on_input(
+        client: &mut crate::transport::UnixTransport,
+    ) -> (String, JsonRpcRequest) {
+        initialize_with_elicitation(client);
+
+        send(
+            client,
+            2,
+            "tools/call",
+            serde_json::json!({ "name": "asks", "task": {} }),
+        );
+        let created = read_until_response(client, 2, |_, other| panic!("unexpected {other:?}"));
+        let task_id = created.result.unwrap()["task"]["taskId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let elicitation = loop {
+            match client.read().expect("client read") {
+                JsonRpcMessage::Request(r) if r.method == "elicitation/create" => break r,
+                JsonRpcMessage::Notification(n) if n.method == "notifications/tasks/status" => {}
+                other => panic!("expected an elicitation, got {other:?}"),
+            }
+        };
+
+        (task_id, elicitation)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_worker_never_speaks_before_its_task_is_announced() {
+        // The worker writes through an independent handle on its own thread, so
+        // without a start gate its elicitation can win the race to the writer
+        // and the client is told about a task it has never heard of. Repeated
+        // because losing that race is a matter of scheduling luck.
+        for _ in 0..5 {
+            let (mut client, _server) = task_server_on_a_socket();
+            initialize_with_elicitation(&mut client);
+
+            send(
+                &mut client,
+                2,
+                "tools/call",
+                serde_json::json!({ "name": "asks", "task": {} }),
+            );
+
+            match client.read().expect("client read") {
+                JsonRpcMessage::Response(r) => assert_eq!(r.id, RequestId::Number(2)),
+                other => panic!("the task must be announced first, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_tasks_cancel_is_answered_while_tasks_result_blocks() {
+        // The deadlock: the client is told to call `tasks/result` on
+        // `input_required`, then decides to cancel instead. Every request sent
+        // during `tasks/result` used to be deferred to a main loop that could
+        // not run until `tasks/result` returned - which it never would.
+        let (mut client, _server) = task_server_on_a_socket();
+        let (task_id, _elicitation) = task_blocked_on_input(&mut client);
+
+        send(
+            &mut client,
+            3,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        );
+        send(
+            &mut client,
+            4,
+            "tasks/cancel",
+            serde_json::json!({ "taskId": task_id }),
+        );
+
+        // "Upon receiving a valid cancellation request, receivers ... MUST
+        // transition the task to `cancelled` status before sending the
+        // response."
+        let mut seen = Vec::new();
+        let cancelled = read_until_response(&mut client, 4, |_, other| seen.push(other));
+        assert_eq!(cancelled.result.unwrap()["status"], "cancelled");
+
+        // And the blocked `tasks/result` unblocks with the cancellation.
+        let result = read_until_response(&mut client, 3, |_, other| seen.push(other));
+        assert!(result.error.is_some(), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_tasks_get_and_ping_are_answered_while_tasks_result_blocks() {
+        // "While `tasks/result` blocks until the task reaches a terminal
+        // status, requestors can continue polling via `tasks/get` in parallel."
+        let (mut client, _server) = task_server_on_a_socket();
+        let (task_id, elicitation) = task_blocked_on_input(&mut client);
+
+        send(
+            &mut client,
+            3,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        );
+        send(
+            &mut client,
+            4,
+            "tasks/get",
+            serde_json::json!({ "taskId": task_id }),
+        );
+        send(&mut client, 5, "ping", serde_json::json!({}));
+
+        let mut seen = Vec::new();
+        let polled = read_until_response(&mut client, 4, |_, other| seen.push(other));
+        assert_eq!(polled.result.unwrap()["status"], "input_required");
+
+        let pong = read_until_response(&mut client, 5, |_, other| seen.push(other));
+        assert!(pong.result.is_some());
+
+        // The task is still live and finishes normally once answered.
+        client
+            .write(&JsonRpcMessage::response(
+                elicitation.id,
+                serde_json::json!({ "action": "accept", "content": { "name": "octocat" } }),
+            ))
+            .unwrap();
+
+        let result = read_until_response(&mut client, 3, |_, other| seen.push(other));
+        assert_eq!(
+            result.result.unwrap()["content"][0]["text"],
+            "hello octocat"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_second_tasks_result_is_deferred_not_answered_re_entrantly() {
+        // Only the safe read-only methods are answered inline. A nested
+        // `tasks/result` would recurse into the pump, so it waits for the main
+        // loop like everything else - and is answered once the first returns.
+        let (mut client, _server) = task_server_on_a_socket();
+        let (task_id, elicitation) = task_blocked_on_input(&mut client);
+
+        send(
+            &mut client,
+            3,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        );
+        send(
+            &mut client,
+            4,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        );
+
+        client
+            .write(&JsonRpcMessage::response(
+                elicitation.id,
+                serde_json::json!({ "action": "accept", "content": { "name": "twice" } }),
+            ))
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let first = read_until_response(&mut client, 3, |_, other| seen.push(other));
+        assert_eq!(first.result.unwrap()["content"][0]["text"], "hello twice");
+
+        let second = read_until_response(&mut client, 4, |_, other| seen.push(other));
+        assert_eq!(second.result.unwrap()["content"][0]["text"], "hello twice");
     }
 
     #[test]
