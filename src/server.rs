@@ -2,6 +2,7 @@
 //!
 //! Core server implementation with generic context support.
 
+use crate::broker::RequestBroker;
 use crate::pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
 use crate::transport::Transport;
 use crate::types::*;
@@ -27,6 +28,15 @@ pub struct ToolEnv<'a> {
     stderr_logging: StderrLogging,
     /// Default `logger` name on emitted log records.
     logger: &'a str,
+    /// What the client said it can do, from `initialize`.
+    client_capabilities: &'a ClientCapabilities,
+    /// Routing for server-initiated request/response round trips.
+    broker: &'a RequestBroker,
+    /// Whether this environment may block waiting on the client.
+    ///
+    /// False inside task workers: nothing would be reading the transport while
+    /// the worker blocked, so the round trip could never complete.
+    can_request: bool,
 }
 
 impl<'a> ToolEnv<'a> {
@@ -131,6 +141,180 @@ impl<'a> ToolEnv<'a> {
     /// Get a resource by URI
     pub fn get_resource(&self, uri: &str) -> Option<&dyn Resource> {
         self.resources.get(uri).map(|r| r.as_ref())
+    }
+
+    /// What the client declared it supports during `initialize`.
+    ///
+    /// Check this before doing anything that depends on a client feature; the
+    /// spec forbids using a capability the peer did not declare.
+    pub fn client_capabilities(&self) -> &ClientCapabilities {
+        self.client_capabilities
+    }
+
+    //
+    // Server-initiated requests
+    //
+
+    /// Send a JSON-RPC request to the client and block until it answers.
+    ///
+    /// Only usable on a bidirectional transport (stdio, Unix socket) from the
+    /// thread running the server loop. Inside a task worker, or on the HTTP
+    /// transport where a request carries one message and has no back-channel,
+    /// this returns an error rather than hanging.
+    ///
+    /// There is no timeout: `Transport::read` blocks, and interrupting it
+    /// would need a second thread per call. A client that never answers will
+    /// stall this tool, which is also true of a client that never answers any
+    /// other request.
+    pub fn send_request(&self, method: &str, params: Value) -> Result<Value> {
+        if !self.can_request {
+            return Err(McpError::Internal(format!(
+                "`{}` needs a response from the client, which is not possible here: \
+                 nothing is reading the transport on this thread",
+                method
+            )));
+        }
+        let Some(transport) = self.transport else {
+            return Err(McpError::Internal(format!(
+                "`{}` needs a transport to reach the client",
+                method
+            )));
+        };
+
+        let id = self.broker.next_request_id();
+        let request = JsonRpcMessage::request(id.clone(), method, Some(params));
+
+        {
+            let mut guard = transport
+                .lock()
+                .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
+            guard.write(&request)?;
+        }
+
+        // We are now the only reader. Everything that comes off the wire is
+        // ours to route: our response, someone else's response, or a client
+        // message the main loop still needs to see.
+        loop {
+            if let Some(response) = self.broker.take_parked(&id) {
+                return RequestBroker::into_result(response);
+            }
+
+            let message = {
+                let mut guard = transport
+                    .lock()
+                    .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
+                guard.read()?
+            };
+
+            match message {
+                JsonRpcMessage::Response(response) if response.id == id => {
+                    return RequestBroker::into_result(response);
+                }
+                JsonRpcMessage::Response(response) => self.broker.park(response),
+                other => self.broker.defer(other),
+            }
+        }
+    }
+
+    //
+    // Elicitation
+    //
+
+    /// Ask the user for input via the client.
+    ///
+    /// Refuses to send a mode the client did not declare, which the spec
+    /// requires, and validates the request shape before it goes out.
+    pub fn elicit(&self, params: ElicitParams) -> Result<ElicitResult> {
+        let mode = params.resolved_mode();
+        if !self.client_capabilities.supports_elicitation(mode) {
+            return Err(McpError::Internal(format!(
+                "client did not declare support for {:?} mode elicitation",
+                mode
+            )));
+        }
+        params.validate().map_err(McpError::InvalidParams)?;
+
+        let value = self.send_request("elicitation/create", serde_json::to_value(&params)?)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Ask for structured data with a form.
+    ///
+    /// Convenience over [`ToolEnv::elicit`] for the common case. Build the
+    /// schema with [`ElicitSchema`].
+    pub fn elicit_form(&self, message: impl Into<String>, schema: Value) -> Result<ElicitResult> {
+        self.elicit(ElicitParams::form(message, schema))
+    }
+
+    /// Send the user out to a URL for an interaction the client must not see.
+    ///
+    /// This is the required mode for credentials, payments, and third-party
+    /// OAuth. An `accept` response means the user consented to navigate, *not*
+    /// that the interaction finished - that happens out of band.
+    pub fn elicit_url(
+        &self,
+        message: impl Into<String>,
+        url: impl Into<String>,
+        elicitation_id: impl Into<String>,
+    ) -> Result<ElicitResult> {
+        self.elicit(ElicitParams::url(message, url, elicitation_id))
+    }
+
+    /// Tell the client an out-of-band URL elicitation finished.
+    ///
+    /// Fire-and-forget: clients **MUST** ignore unknown or already-completed
+    /// ids, and **SHOULD** offer manual retry in case this never arrives.
+    pub fn notify_elicitation_complete(&self, elicitation_id: impl Into<String>) -> Result<()> {
+        self.send_notification(
+            "notifications/elicitation/complete",
+            Some(serde_json::to_value(ElicitationCompleteParams {
+                elicitation_id: elicitation_id.into(),
+            })?),
+        )
+    }
+
+    //
+    // Sampling
+    //
+
+    /// Ask the client's LLM for a completion.
+    ///
+    /// Refuses to send tools to a client that did not declare
+    /// `sampling.tools`, and validates the tool-use/tool-result structure the
+    /// spec requires before spending a round trip on it.
+    pub fn create_message(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
+        if !self.client_capabilities.supports_sampling() {
+            return Err(McpError::Internal(
+                "client did not declare support for sampling".into(),
+            ));
+        }
+        if !params.tools.is_empty() && !self.client_capabilities.supports_sampling_tools() {
+            return Err(McpError::Internal(
+                "client did not declare `sampling.tools`, so tool-enabled sampling \
+                 requests must not be sent to it"
+                    .into(),
+            ));
+        }
+        if params
+            .include_context
+            .as_deref()
+            .is_some_and(|context| context != "none")
+            && !self
+                .client_capabilities
+                .sampling
+                .as_ref()
+                .is_some_and(|s| s.supports_context())
+        {
+            return Err(McpError::Internal(
+                "client did not declare `sampling.context`, so `includeContext` must \
+                 be omitted or \"none\""
+                    .into(),
+            ));
+        }
+        params.validate().map_err(McpError::InvalidParams)?;
+
+        let value = self.send_request("sampling/createMessage", serde_json::to_value(&params)?)?;
+        Ok(serde_json::from_value(value)?)
     }
 }
 
@@ -511,6 +695,14 @@ pub struct Server<C> {
     initialized: bool,
     /// Minimum log severity, as last set by `logging/setLevel`.
     log_level: LogLevel,
+    /// What the client declared during `initialize`.
+    ///
+    /// Defaults to "nothing declared", so a server that never saw an
+    /// `initialize` will refuse to send elicitation or sampling requests -
+    /// which is correct, since it has no evidence the client can handle them.
+    client_capabilities: ClientCapabilities,
+    /// Routing for server-initiated request/response round trips.
+    broker: Arc<RequestBroker>,
 }
 
 impl<C: Send + Sync + 'static> Server<C> {
@@ -526,6 +718,8 @@ impl<C: Send + Sync + 'static> Server<C> {
             transport: None,
             initialized: false,
             log_level,
+            client_capabilities: ClientCapabilities::default(),
+            broker: Arc::new(RequestBroker::new()),
         }
     }
 
@@ -549,6 +743,9 @@ impl<C: Send + Sync + 'static> Server<C> {
             log_level: self.log_level,
             stderr_logging: self.config.stderr_logging,
             logger: &self.config.name,
+            client_capabilities: &self.client_capabilities,
+            broker: &self.broker,
+            can_request: true,
         }
     }
 
@@ -612,15 +809,20 @@ impl<C: Send + Sync + 'static> Server<C> {
         );
 
         loop {
-            // Read message
-            let message = {
-                let mut t = transport
-                    .lock()
-                    .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
-                match t.read() {
-                    Ok(msg) => msg,
-                    Err(McpError::TransportClosed) => break,
-                    Err(e) => return Err(e),
+            // A tool awaiting a server-initiated response reads from the same
+            // transport, and hands back anything that was not its own. Drain
+            // that first so those messages are handled in arrival order.
+            let message = match self.broker.next_deferred() {
+                Some(message) => message,
+                None => {
+                    let mut t = transport
+                        .lock()
+                        .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
+                    match t.read() {
+                        Ok(msg) => msg,
+                        Err(McpError::TransportClosed) => break,
+                        Err(e) => return Err(e),
+                    }
                 }
             };
 
@@ -741,11 +943,14 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     fn handle_initialize(&mut self, request: &JsonRpcRequest) -> Result<Value> {
-        let _params: InitializeParams = match &request.params {
+        let params: InitializeParams = match &request.params {
             Some(p) => serde_json::from_value(p.clone())?,
             None => InitializeParams::default(),
         };
 
+        // Remembered so ToolEnv can refuse to use a capability the client
+        // never declared, which the spec requires of both parties.
+        self.client_capabilities = params.capabilities;
         self.initialized = true;
 
         let result = InitializeResult {
@@ -974,6 +1179,7 @@ impl<C: Send + Sync + 'static> Server<C> {
 mod tests {
     use super::*;
     use crate::transport::Transport;
+    use std::collections::VecDeque;
 
     // Test context
     struct TestContext {
@@ -1414,6 +1620,12 @@ mod tests {
         ));
     }
 
+    // Borrowed by log_env, which needs somewhere for the &-fields to point.
+    static NO_CAPABILITIES: std::sync::LazyLock<ClientCapabilities> =
+        std::sync::LazyLock::new(ClientCapabilities::default);
+    static TEST_BROKER: std::sync::LazyLock<RequestBroker> =
+        std::sync::LazyLock::new(RequestBroker::new);
+
     /// Build a standalone ToolEnv for direct logging tests.
     fn log_env<'a>(
         transport: Option<&'a Arc<Mutex<dyn Transport>>>,
@@ -1427,6 +1639,9 @@ mod tests {
             log_level,
             stderr_logging,
             logger: "test-logger",
+            client_capabilities: &NO_CAPABILITIES,
+            broker: &TEST_BROKER,
+            can_request: true,
         }
     }
 
@@ -2737,6 +2952,608 @@ mod tests {
 
         let list = serde_json::json!({ "cursor": "abc", "_meta": {}, "future": 1 });
         assert!(serde_json::from_value::<ListToolsParams>(list).is_ok());
+    }
+
+    //
+    // Server-initiated requests: elicitation and sampling
+    //
+
+    /// Transport that answers every server-initiated request from a queue of
+    /// canned responses, and records what was sent.
+    struct ScriptedTransport {
+        /// Responses to hand back, in order, as raw result values.
+        replies: VecDeque<Value>,
+        /// Messages the server wrote.
+        written: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        /// Messages to inject that are *not* the awaited response.
+        inject: VecDeque<JsonRpcMessage>,
+    }
+
+    impl ScriptedTransport {
+        fn new(replies: Vec<Value>) -> Self {
+            Self {
+                replies: replies.into(),
+                written: Arc::new(Mutex::new(Vec::new())),
+                inject: VecDeque::new(),
+            }
+        }
+
+        fn with_injected(mut self, messages: Vec<JsonRpcMessage>) -> Self {
+            self.inject = messages.into();
+            self
+        }
+
+        /// The id of the most recent request the server wrote.
+        fn last_request_id(&self) -> Option<RequestId> {
+            self.written
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    JsonRpcMessage::Request(r) => Some(r.id.clone()),
+                    _ => None,
+                })
+        }
+    }
+
+    impl Transport for ScriptedTransport {
+        fn read(&mut self) -> Result<JsonRpcMessage> {
+            // Anything queued for injection comes first, so the waiter has to
+            // route it rather than mistake it for its own response.
+            if let Some(message) = self.inject.pop_front() {
+                return Ok(message);
+            }
+            let Some(result) = self.replies.pop_front() else {
+                return Err(McpError::TransportClosed);
+            };
+            let id = self
+                .last_request_id()
+                .ok_or_else(|| McpError::Internal("no request to answer".into()))?;
+            Ok(JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: Default::default(),
+                id,
+                result: Some(result),
+                error: None,
+            }))
+        }
+
+        fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
+            self.written.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A server, the log of what it wrote, and a handle keeping the transport
+    /// alive for the duration of the test.
+    type ScriptedServer = (
+        Server<TestContext>,
+        Arc<Mutex<Vec<JsonRpcMessage>>>,
+        Arc<Mutex<dyn Transport>>,
+    );
+
+    /// Build a server wired to a scripted transport, with the given client
+    /// capabilities already negotiated.
+    fn scripted_server(capabilities: Value, transport: ScriptedTransport) -> ScriptedServer {
+        let written = transport.written.clone();
+        let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(transport));
+
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.transport = Some(transport.clone());
+        server.client_capabilities = serde_json::from_value(capabilities).unwrap();
+
+        (server, written, transport)
+    }
+
+    fn written_requests(written: &Arc<Mutex<Vec<JsonRpcMessage>>>) -> Vec<JsonRpcRequest> {
+        written
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                JsonRpcMessage::Request(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_elicit_form_round_trip() {
+        let transport = ScriptedTransport::new(vec![serde_json::json!({
+            "action": "accept",
+            "content": { "name": "octocat" }
+        })]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        let result = env
+            .elicit_form(
+                "Please provide your GitHub username",
+                ElicitSchema::new()
+                    .string("name", |f| f)
+                    .required("name")
+                    .build(),
+            )
+            .unwrap();
+
+        assert!(result.accepted());
+        assert_eq!(result.accepted_content().unwrap()["name"], "octocat");
+
+        let requests = written_requests(&written);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "elicitation/create");
+        let params = requests[0].params.as_ref().unwrap();
+        assert_eq!(params["mode"], "form");
+        assert_eq!(params["requestedSchema"]["required"][0], "name");
+    }
+
+    #[test]
+    fn test_elicit_url_round_trip() {
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "accept" })]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "url": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        let result = env
+            .elicit_url(
+                "Please provide your API key to continue.",
+                "https://mcp.example.com/ui/set_api_key",
+                "550e8400-e29b-41d4-a716-446655440000",
+            )
+            .unwrap();
+
+        assert!(result.accepted());
+        // URL mode accept means consent to navigate, not completion.
+        assert!(result.accepted_content().is_none());
+
+        let params = written_requests(&written)[0].params.clone().unwrap();
+        assert_eq!(params["mode"], "url");
+        assert_eq!(
+            params["elicitationId"],
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn test_elicit_refuses_mode_the_client_did_not_declare() {
+        // "Servers MUST NOT send elicitation requests with modes that are not
+        // supported by the client."
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "accept" })]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        let err = env
+            .elicit_url("m", "https://example.com/x", "id-1")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Url"), "{err}");
+        // Nothing may go out on the wire.
+        assert!(written_requests(&written).is_empty());
+    }
+
+    #[test]
+    fn test_elicit_refuses_when_no_elicitation_capability() {
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, written, _t) = scripted_server(serde_json::json!({}), transport);
+
+        let env = server.tool_env();
+        assert!(env.elicit_form("m", serde_json::json!({})).is_err());
+        assert!(written_requests(&written).is_empty());
+    }
+
+    #[test]
+    fn test_elicit_validates_before_sending() {
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {}, "url": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        let mut bad = ElicitParams::url("m", "not-a-url", "id");
+        bad.url = Some("not-a-url".into());
+
+        assert!(matches!(env.elicit(bad), Err(McpError::InvalidParams(_))));
+        assert!(written_requests(&written).is_empty());
+    }
+
+    #[test]
+    fn test_elicit_surfaces_client_errors() {
+        // A client that got a mode it does not support answers -32602.
+        struct ErroringTransport(Arc<Mutex<Vec<JsonRpcMessage>>>);
+        impl Transport for ErroringTransport {
+            fn read(&mut self) -> Result<JsonRpcMessage> {
+                let id = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find_map(|m| match m {
+                        JsonRpcMessage::Request(r) => Some(r.id.clone()),
+                        _ => None,
+                    })
+                    .unwrap();
+                Ok(JsonRpcMessage::error(
+                    id,
+                    JsonRpcError::invalid_params("unsupported mode"),
+                ))
+            }
+            fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
+                self.0.lock().unwrap().push(message.clone());
+                Ok(())
+            }
+            fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let transport: Arc<Mutex<dyn Transport>> =
+            Arc::new(Mutex::new(ErroringTransport(written.clone())));
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.transport = Some(transport);
+        server.client_capabilities =
+            serde_json::from_value(serde_json::json!({ "elicitation": { "form": {} } })).unwrap();
+
+        let env = server.tool_env();
+        let err = env.elicit_form("m", serde_json::json!({})).unwrap_err();
+        assert!(err.to_string().contains("unsupported mode"), "{err}");
+    }
+
+    #[test]
+    fn test_round_trip_defers_client_messages_it_reads() {
+        // While awaiting its response, the waiter is the only reader, so it
+        // must hand back anything that is not its own answer.
+        let injected = vec![
+            JsonRpcMessage::notification("notifications/cancelled", None),
+            JsonRpcMessage::request(99i64, "ping", None),
+        ];
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "decline" })])
+            .with_injected(injected);
+        let (server, _w, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        let result = env.elicit_form("m", serde_json::json!({})).unwrap();
+        assert_eq!(result.action, ElicitAction::Decline);
+
+        // Both injected messages are queued for the main loop, in order.
+        let first = server.broker.next_deferred().unwrap();
+        let second = server.broker.next_deferred().unwrap();
+        assert!(
+            matches!(first, JsonRpcMessage::Notification(ref n) if n.method == "notifications/cancelled")
+        );
+        assert!(matches!(second, JsonRpcMessage::Request(ref r) if r.method == "ping"));
+        assert!(server.broker.next_deferred().is_none());
+    }
+
+    #[test]
+    fn test_round_trip_parks_responses_for_other_requests() {
+        // A response for a different in-flight id must be kept, not dropped.
+        let stray = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: Default::default(),
+            id: RequestId::String("sml-999".into()),
+            result: Some(serde_json::json!({ "action": "accept" })),
+            error: None,
+        });
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "cancel" })])
+            .with_injected(vec![stray]);
+        let (server, _w, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        let result = env.elicit_form("m", serde_json::json!({})).unwrap();
+        assert_eq!(result.action, ElicitAction::Cancel);
+
+        // The stray response is parked, not discarded.
+        assert!(
+            server
+                .broker
+                .take_parked(&RequestId::String("sml-999".into()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_round_trip_uses_prefixed_string_ids() {
+        // Server ids must not collide with the numeric ids clients use.
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "accept" })]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        server
+            .tool_env()
+            .elicit_form("m", serde_json::json!({}))
+            .unwrap();
+
+        let RequestId::String(id) = &written_requests(&written)[0].id else {
+            panic!("expected a string id");
+        };
+        assert!(id.starts_with("sml-"), "{id}");
+    }
+
+    #[test]
+    fn test_round_trip_fails_cleanly_without_a_transport() {
+        // Rather than hanging, a round trip with nowhere to go errors out.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.client_capabilities =
+            serde_json::from_value(serde_json::json!({ "elicitation": { "form": {} } })).unwrap();
+
+        let err = server
+            .tool_env()
+            .elicit_form("m", serde_json::json!({}))
+            .unwrap_err();
+        assert!(err.to_string().contains("transport"), "{err}");
+    }
+
+    #[test]
+    fn test_round_trip_fails_cleanly_when_the_transport_closes() {
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, _w, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        assert!(matches!(
+            server.tool_env().elicit_form("m", serde_json::json!({})),
+            Err(McpError::TransportClosed)
+        ));
+    }
+
+    #[test]
+    fn test_elicitation_complete_notification() {
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "url": {} } }),
+            transport,
+        );
+
+        server
+            .tool_env()
+            .notify_elicitation_complete("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap();
+
+        let sent = written.lock().unwrap().clone();
+        let JsonRpcMessage::Notification(n) = &sent[0] else {
+            panic!("expected notification");
+        };
+        assert_eq!(n.method, "notifications/elicitation/complete");
+        assert_eq!(
+            n.params.as_ref().unwrap()["elicitationId"],
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn test_sampling_round_trip() {
+        let transport = ScriptedTransport::new(vec![serde_json::json!({
+            "role": "assistant",
+            "content": { "type": "text", "text": "The capital of France is Paris." },
+            "model": "claude-3-sonnet-20240307",
+            "stopReason": "endTurn"
+        })]);
+        let (server, written, _t) =
+            scripted_server(serde_json::json!({ "sampling": {} }), transport);
+
+        let result = server
+            .tool_env()
+            .create_message(CreateMessageParams::new(
+                vec![SamplingMessage::user(SamplingContent::text(
+                    "What is the capital of France?",
+                ))],
+                100,
+            ))
+            .unwrap();
+
+        assert_eq!(result.text(), "The capital of France is Paris.");
+        assert!(!result.wants_tools());
+        assert_eq!(
+            written_requests(&written)[0].method,
+            "sampling/createMessage"
+        );
+    }
+
+    #[test]
+    fn test_sampling_with_tools_round_trip() {
+        let transport = ScriptedTransport::new(vec![serde_json::json!({
+            "role": "assistant",
+            "content": [
+                { "type": "tool_use", "id": "call_abc123", "name": "get_weather",
+                  "input": { "city": "Paris" } }
+            ],
+            "model": "claude-3-sonnet-20240307",
+            "stopReason": "toolUse"
+        })]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "sampling": { "tools": {} } }),
+            transport,
+        );
+
+        let result = server
+            .tool_env()
+            .create_message(
+                CreateMessageParams::new(
+                    vec![SamplingMessage::user(SamplingContent::text("weather?"))],
+                    1000,
+                )
+                .with_tools([SamplingTool::new(
+                    "get_weather",
+                    serde_json::json!({ "type": "object" }),
+                )])
+                .with_tool_choice(ToolChoice::auto()),
+            )
+            .unwrap();
+
+        assert!(result.wants_tools());
+        assert_eq!(result.tool_uses()[0].1, "get_weather");
+
+        let params = written_requests(&written)[0].params.clone().unwrap();
+        assert_eq!(params["tools"][0]["name"], "get_weather");
+        assert_eq!(params["toolChoice"]["mode"], "auto");
+    }
+
+    #[test]
+    fn test_sampling_refuses_tools_without_the_capability() {
+        // "Servers MUST NOT send tool-enabled sampling requests to Clients
+        // that have not declared support via the sampling.tools capability."
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, written, _t) =
+            scripted_server(serde_json::json!({ "sampling": {} }), transport);
+
+        let err = server
+            .tool_env()
+            .create_message(
+                CreateMessageParams::new(
+                    vec![SamplingMessage::user(SamplingContent::text("hi"))],
+                    100,
+                )
+                .with_tools([SamplingTool::new("t", serde_json::json!({}))]),
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("sampling.tools"), "{err}");
+        assert!(written_requests(&written).is_empty());
+    }
+
+    #[test]
+    fn test_sampling_refuses_without_the_sampling_capability() {
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, written, _t) = scripted_server(serde_json::json!({}), transport);
+
+        let err = server
+            .tool_env()
+            .create_message(CreateMessageParams::new(
+                vec![SamplingMessage::user(SamplingContent::text("hi"))],
+                100,
+            ))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("sampling"), "{err}");
+        assert!(written_requests(&written).is_empty());
+    }
+
+    #[test]
+    fn test_sampling_refuses_include_context_without_the_capability() {
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, written, _t) =
+            scripted_server(serde_json::json!({ "sampling": {} }), transport);
+
+        let mut params = CreateMessageParams::new(
+            vec![SamplingMessage::user(SamplingContent::text("hi"))],
+            100,
+        );
+        params.include_context = Some("thisServer".into());
+
+        let err = server.tool_env().create_message(params).unwrap_err();
+        assert!(err.to_string().contains("includeContext"), "{err}");
+        assert!(written_requests(&written).is_empty());
+
+        // "none" needs no capability.
+        let transport = ScriptedTransport::new(vec![serde_json::json!({
+            "role": "assistant",
+            "content": { "type": "text", "text": "ok" },
+            "model": "m"
+        })]);
+        let (server, _w, _t) = scripted_server(serde_json::json!({ "sampling": {} }), transport);
+        let mut params = CreateMessageParams::new(
+            vec![SamplingMessage::user(SamplingContent::text("hi"))],
+            100,
+        );
+        params.include_context = Some("none".into());
+        assert!(server.tool_env().create_message(params).is_ok());
+    }
+
+    #[test]
+    fn test_sampling_validates_the_tool_loop_before_sending() {
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "sampling": { "tools": {} } }),
+            transport,
+        );
+
+        // An assistant turn with an unanswered tool use.
+        let params = CreateMessageParams::new(
+            vec![SamplingMessage::assistant(vec![SamplingContent::ToolUse {
+                id: "a".into(),
+                name: "t".into(),
+                input: serde_json::json!({}),
+            }])],
+            100,
+        );
+
+        assert!(matches!(
+            server.tool_env().create_message(params),
+            Err(McpError::InvalidParams(_))
+        ));
+        assert!(written_requests(&written).is_empty());
+    }
+
+    #[test]
+    fn test_client_capabilities_recorded_at_initialize() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        assert!(!server.client_capabilities.supports_sampling());
+
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {
+                    "sampling": { "tools": {} },
+                    "elicitation": { "form": {}, "url": {} }
+                },
+                "clientInfo": { "name": "test", "version": "1.0" }
+            })),
+        };
+        let mut ctx = TestContext { counter: 0 };
+        server.dispatch_request(&request, &mut ctx).unwrap();
+
+        assert!(server.client_capabilities.supports_sampling());
+        assert!(server.client_capabilities.supports_sampling_tools());
+        assert!(
+            server
+                .client_capabilities
+                .supports_elicitation(ElicitationMode::Url)
+        );
+        assert!(
+            server
+                .client_capabilities
+                .supports_elicitation(ElicitationMode::Form)
+        );
+    }
+
+    #[test]
+    fn test_uninitialized_server_declares_no_client_capabilities() {
+        // Without an initialize, we have no evidence the client can handle
+        // server-initiated requests, so we must not send any.
+        let server: Server<TestContext> = Server::new(ServerConfig::default());
+        assert!(!server.client_capabilities.supports_sampling());
+        assert!(!server.client_capabilities.supports_sampling_tools());
+        assert!(
+            !server
+                .client_capabilities
+                .supports_elicitation(ElicitationMode::Form)
+        );
     }
 
     #[test]

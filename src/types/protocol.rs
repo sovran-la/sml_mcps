@@ -184,10 +184,42 @@ pub struct InitializeResult {
 pub struct ClientCapabilities {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub experimental: HashMap<String, Value>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub sampling: HashMap<String, Value>,
+    /// Present when the client can run `sampling/createMessage`.
+    ///
+    /// Absent and present-but-empty differ: `{}` means basic sampling, `None`
+    /// means the client declared no sampling support at all and servers
+    /// **MUST NOT** send it one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<crate::types::SamplingCapability>,
+    /// Present when the client can run `elicitation/create` (2025-06-18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<crate::types::ElicitationCapability>,
     #[serde(default)]
     pub roots: RootCapabilities,
+}
+
+impl ClientCapabilities {
+    /// May we send this client an elicitation in `mode`?
+    ///
+    /// "Servers **MUST NOT** send elicitation requests with modes that are not
+    /// supported by the client."
+    pub fn supports_elicitation(&self, mode: crate::types::ElicitationMode) -> bool {
+        self.elicitation
+            .as_ref()
+            .is_some_and(|capability| capability.supports(mode))
+    }
+
+    /// May we send this client a sampling request?
+    pub fn supports_sampling(&self) -> bool {
+        self.sampling.is_some()
+    }
+
+    /// May we send this client a *tool-enabled* sampling request?
+    pub fn supports_sampling_tools(&self) -> bool {
+        self.sampling
+            .as_ref()
+            .is_some_and(|capability| capability.supports_tools())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

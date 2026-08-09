@@ -9,6 +9,7 @@
 //! - `auth` - JWT validation for hosted deployments
 //! - `hosted` - Enables both `http` and `auth`
 
+mod broker;
 pub mod pagination;
 pub mod schema_check;
 pub mod server;
