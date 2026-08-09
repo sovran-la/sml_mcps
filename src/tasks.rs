@@ -478,10 +478,10 @@ pub fn related_task_meta(task_id: &str) -> crate::types::Meta {
 /// "**MUST** generate cryptographically secure task IDs with enough entropy to
 /// prevent guessing."
 ///
-/// Entropy comes from the OS. `getrandom`-style crates are the usual answer;
-/// this crate takes no such dependency, so on unix it reads `/dev/urandom`
-/// directly, and elsewhere falls back to `RandomState`, whose keys the standard
-/// library seeds from the platform CSPRNG.
+/// Entropy comes from the platform CSPRNG via `getrandom`, which is the same
+/// source `rand` uses: `getrandom(2)` on Linux, `arc4random_buf` on the BSDs
+/// and macOS, `ProcessPrng` on Windows. That makes every target equally strong,
+/// rather than unix being solid and everything else best-effort.
 fn new_task_id() -> String {
     let bytes = random_bytes();
     let mut id = String::with_capacity(32);
@@ -491,22 +491,21 @@ fn new_task_id() -> String {
     id
 }
 
-#[cfg(unix)]
+/// 16 bytes from the OS.
+///
+/// `getrandom` fails only when the platform has no usable entropy source at
+/// all, which for a running process is close to unheard of. Falling back beats
+/// panicking in a tool call, and beats handing out a predictable id: the
+/// fallback is weaker but not trivially guessable.
 fn random_bytes() -> [u8; 16] {
-    use std::io::Read;
-
     let mut bytes = [0u8; 16];
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        if file.read_exact(&mut bytes).is_ok() {
-            return bytes;
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => bytes,
+        Err(e) => {
+            eprintln!("sml_mcps: OS entropy unavailable ({e}); task ids are degraded");
+            fallback_random_bytes()
         }
     }
-    fallback_random_bytes()
-}
-
-#[cfg(not(unix))]
-fn random_bytes() -> [u8; 16] {
-    fallback_random_bytes()
 }
 
 /// Entropy from `RandomState`, which the standard library seeds from the
@@ -730,6 +729,60 @@ mod tests {
     fn fallback_entropy_is_also_unique() {
         let ids: HashSet<[u8; 16]> = (0..1000).map(|_| fallback_random_bytes()).collect();
         assert_eq!(ids.len(), 1000);
+    }
+
+    #[test]
+    fn os_entropy_is_available_on_this_platform() {
+        // The fallback exists for a platform with no entropy source; every
+        // platform this crate is built for has one, and this fails loudly if a
+        // new target does not.
+        let mut bytes = [0u8; 16];
+        assert!(
+            getrandom::fill(&mut bytes).is_ok(),
+            "getrandom must work on a supported target"
+        );
+    }
+
+    #[test]
+    fn every_bit_of_a_task_id_varies() {
+        // A source stuck at a constant - or one only stirring the low bytes -
+        // still produces unique-looking ids, so uniqueness alone proves very
+        // little. Over enough samples each of the 128 bits must take both
+        // values; the chance of a healthy source failing this is 2^-255.
+        let mut ones = [0u32; 128];
+        const SAMPLES: u32 = 256;
+
+        for _ in 0..SAMPLES {
+            let bytes = random_bytes();
+            for (index, slot) in ones.iter_mut().enumerate() {
+                if bytes[index / 8] & (1 << (index % 8)) != 0 {
+                    *slot += 1;
+                }
+            }
+        }
+
+        for (index, count) in ones.iter().enumerate() {
+            assert!(*count > 0, "bit {index} was never set");
+            assert!(*count < SAMPLES, "bit {index} was always set");
+        }
+    }
+
+    #[test]
+    fn task_ids_do_not_repeat_across_threads() {
+        // Ids are minted from whatever thread starts a task, so the generator
+        // must not depend on per-thread state to stay unique.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(std::thread::spawn(|| {
+                (0..250).map(|_| new_task_id()).collect::<Vec<_>>()
+            }));
+        }
+
+        let ids: HashSet<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 8 * 250);
     }
 
     //
