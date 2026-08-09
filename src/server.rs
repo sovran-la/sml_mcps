@@ -934,6 +934,16 @@ impl Default for ServerConfig {
     }
 }
 
+/// Is this read failure the peer sending something unreadable, rather than the
+/// connection itself failing?
+///
+/// The distinction decides whether the session survives: a message we could not
+/// parse gets an error response and the loop continues, while a broken socket
+/// ends it.
+fn is_malformed(error: &McpError) -> bool {
+    matches!(error, McpError::Json(_) | McpError::InvalidMessage(_))
+}
+
 /// Parse a request's params, treating an absent `params` as invalid.
 fn parse_params<T: serde::de::DeserializeOwned>(request: &JsonRpcRequest) -> Result<T> {
     let params = request
@@ -1166,12 +1176,33 @@ impl<C: Send + Sync + 'static> Server<C> {
             let message = match self.broker.next_deferred() {
                 Some(message) => message,
                 None => {
-                    let mut t = transport
-                        .lock()
-                        .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
-                    match t.read() {
+                    // The guard is released before anything is written: on a
+                    // transport that cannot be split, the writer is this very
+                    // mutex.
+                    let read = {
+                        let mut t = transport
+                            .lock()
+                            .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
+                        t.read()
+                    };
+                    match read {
                         Ok(msg) => msg,
                         Err(McpError::TransportClosed) => break,
+                        // A deadline someone else armed and did not clear. The
+                        // loop itself never sets one, so this is not our
+                        // timeout to report; just read again.
+                        Err(McpError::Timeout(_)) => continue,
+                        // Garbage on the wire is the client's problem, not a
+                        // reason to hang up on it. JSON-RPC wants an error
+                        // response, with a null id when the id could not be
+                        // read, and the session carries on.
+                        Err(e) if is_malformed(&e) => {
+                            self.write_message(&JsonRpcMessage::error(
+                                RequestId::Null,
+                                e.to_jsonrpc_error(),
+                            ))?;
+                            continue;
+                        }
                         Err(e) => return Err(e),
                     }
                 }
@@ -5800,5 +5831,181 @@ mod tests {
         let result = server.dispatch_request(&req, &mut ctx).unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1); // Should get the one tool
+    }
+
+    //
+    // Malformed input: answered, never fatal
+    //
+    // Every case here used to end the session with nothing written back. On
+    // stdio that is a one-line remote kill; on a Unix daemon it drops the
+    // client. JSON-RPC wants an error response and MCP explicitly allows a
+    // null id for "error cases where the ID could not be read".
+    //
+
+    /// A plain server on one end of a socket pair, with the *raw* other end so
+    /// a test can put bytes on the wire that no `Transport` would produce.
+    #[cfg(unix)]
+    fn server_on_a_raw_socket() -> (std::os::unix::net::UnixStream, std::thread::JoinHandle<()>) {
+        use crate::transport::UnixTransport;
+        use std::os::unix::net::UnixStream;
+
+        let (server_end, client_end) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+            server.add_tool(IncrementTool).unwrap();
+            let _ = server.start(
+                UnixTransport::from_stream(server_end),
+                TestContext { counter: 0 },
+            );
+        });
+
+        client_end
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        (client_end, handle)
+    }
+
+    /// Write raw bytes plus a newline, then read one line back.
+    #[cfg(unix)]
+    fn exchange_raw(client: &mut std::os::unix::net::UnixStream, line: &[u8]) -> Value {
+        use std::io::{BufRead, BufReader, Write};
+
+        client.write_all(line).unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut response = String::new();
+        reader.read_line(&mut response).expect("a response line");
+        assert!(!response.is_empty(), "server hung up instead of answering");
+        serde_json::from_str(&response).expect("response is JSON")
+    }
+
+    /// The session still works after whatever we just sent it.
+    #[cfg(unix)]
+    fn assert_still_alive(client: &mut std::os::unix::net::UnixStream) {
+        let pong = exchange_raw(
+            client,
+            br#"{"jsonrpc":"2.0","id":99,"method":"ping"}"#.as_ref(),
+        );
+        assert_eq!(pong["id"], 99, "session did not survive: {pong}");
+        assert!(pong["result"].is_object(), "{pong}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_json_syntax_error_is_answered_with_parse_error() {
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let error = exchange_raw(&mut client, b"{not json");
+        assert_eq!(error["error"]["code"], -32700, "{error}");
+        assert!(error["id"].is_null(), "id must be null when unreadable");
+
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_batch_array_is_answered_with_invalid_request() {
+        // The migration notes claimed this already worked. It did in
+        // `JsonRpcMessage::parse`; on the wire the client saw a closed socket.
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let error = exchange_raw(&mut client, br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#);
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("batching"),
+            "{error}"
+        );
+
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_null_id_is_answered_with_invalid_request() {
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let error = exchange_raw(&mut client, br#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#);
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+        assert!(
+            error["error"]["message"].as_str().unwrap().contains("null"),
+            "{error}"
+        );
+
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_float_id_is_answered_rather_than_silently_reclassified() {
+        // Dropping `deny_unknown_fields` would make an untagged parse read this
+        // as a *notification* (id ignored), so the client would wait forever
+        // for a response nobody owes it.
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let error = exchange_raw(&mut client, br#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#);
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_non_utf8_bytes_are_answered_with_invalid_request() {
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let error = exchange_raw(&mut client, &[0x7b, 0xff, 0xfe, 0x7d]);
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+        assert!(
+            error["error"]["message"].as_str().unwrap().contains("UTF-8"),
+            "{error}"
+        );
+
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_an_unknown_top_level_key_is_not_fatal() {
+        // The nastiest of the set: one unrecognised key used to take the whole
+        // server down. Forward compatibility says ignore it and answer.
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let response = exchange_raw(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":7,"method":"ping","extra":true}"#,
+        );
+        assert_eq!(response["id"], 7, "{response}");
+        assert!(response["result"].is_object(), "{response}");
+
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_stray_response_with_a_null_id_is_not_fatal() {
+        // What a conformant client sends back when *it* could not read an id.
+        // It answers nothing, so the session must simply carry on.
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        use std::io::Write;
+        client
+            .write_all(br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"nope"}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        assert_still_alive(&mut client);
+    }
+
+    #[test]
+    fn test_null_request_id_serializes_as_json_null() {
+        let message = JsonRpcMessage::error(RequestId::Null, JsonRpcError::parse_error("bad"));
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"id\":null"), "{json}");
     }
 }

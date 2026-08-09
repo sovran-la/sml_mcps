@@ -15,11 +15,20 @@ impl Default for JsonRpcVersion {
 }
 
 /// Request ID - can be number or string per JSON-RPC spec
+///
+/// [`RequestId::Null`] exists for one purpose: answering a message so malformed
+/// that no id could be read from it. JSON-RPC 2.0 requires an error response
+/// even then, and MCP says as much - "Error responses **MUST** include the same
+/// ID as the request they correspond to (except in error cases where the ID
+/// could not be read due a malformed request)". It is never a legal id on an
+/// incoming request; [`JsonRpcMessage::parse`] rejects those.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum RequestId {
     Number(i64),
     String(String),
+    /// Serializes as JSON `null`. Outgoing only - see the type docs.
+    Null,
 }
 
 impl From<i64> for RequestId {
@@ -34,20 +43,28 @@ impl From<String> for RequestId {
     }
 }
 
+impl From<&str> for RequestId {
+    fn from(s: &str) -> Self {
+        RequestId::String(s.to_owned())
+    }
+}
+
 impl std::fmt::Display for RequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RequestId::Number(n) => write!(f, "{}", n),
             RequestId::String(s) => write!(f, "{}", s),
+            RequestId::Null => f.write_str("null"),
         }
     }
 }
 
 /// A JSON-RPC message - request, response, or notification
 ///
-/// Note: Order matters for serde untagged deserialization.
-/// Request comes first (has method + id), then Notification (has method, no id),
-/// then Response (has id, no method).
+/// Serialization is untagged: a message is just its envelope. Deserialization
+/// does *not* rely on untagged variant order - [`JsonRpcMessage::from_value`]
+/// discriminates on `method`/`id` so that a malformed message produces a
+/// specific complaint instead of "no variant matched".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
@@ -102,12 +119,21 @@ impl JsonRpcMessage {
 
     /// Parse one message off the wire.
     ///
-    /// All transports go through here so that the batching rejection lives in
-    /// exactly one place. MCP removed JSON-RPC batching in 2025-06-18: the body
-    /// of a request "**MUST** be a single JSON-RPC *request*, *notification*,
-    /// or *response*." A top-level array is well-formed JSON but not a valid
-    /// message, so it gets `-32600 Invalid Request` with an explanation rather
-    /// than a bare `-32700` parse error.
+    /// All transports go through here so that message classification lives in
+    /// exactly one place. Two error classes come out, and they are not the
+    /// same thing:
+    ///
+    /// - text that is not JSON at all -> [`McpError::Json`], which the server
+    ///   answers with `-32700 Parse error`
+    /// - JSON that is not a JSON-RPC message -> [`McpError::InvalidMessage`],
+    ///   answered with `-32600 Invalid Request`
+    ///
+    /// Either way the caller is expected to *answer*, not hang up.
+    ///
+    /// MCP removed JSON-RPC batching in 2025-06-18: the body of a request
+    /// "**MUST** be a single JSON-RPC *request*, *notification*, or
+    /// *response*." A top-level array is well-formed JSON but not a valid
+    /// message, so it lands in the second class with an explanation.
     pub fn parse(text: &str) -> crate::types::Result<Self> {
         if text.trim_start().starts_with('[') {
             return Err(crate::types::McpError::InvalidMessage(
@@ -116,13 +142,71 @@ impl JsonRpcMessage {
                     .into(),
             ));
         }
-        Ok(serde_json::from_str(text)?)
+        Self::from_value(serde_json::from_str(text)?)
+    }
+
+    /// Classify an already-parsed JSON value as a JSON-RPC message.
+    ///
+    /// Discrimination is by shape - `method` means request or notification,
+    /// `id` alone means response - rather than by serde's untagged fallback.
+    /// Untagged deserialization can only say "no variant matched", which turns
+    /// every small mistake (a float id, a stray key) into one opaque error, and
+    /// silently reclassifies a request with an unusable id as a notification.
+    pub fn from_value(value: Value) -> crate::types::Result<Self> {
+        use crate::types::McpError;
+
+        let Some(object) = value.as_object() else {
+            return Err(McpError::InvalidMessage(format!(
+                "a JSON-RPC message must be a JSON object, got {}",
+                type_name_of(&value)
+            )));
+        };
+
+        let has_method = object.contains_key("method");
+        let id = object.get("id");
+
+        match (has_method, id) {
+            // "Unlike base JSON-RPC, the ID MUST NOT be null."
+            (true, Some(Value::Null)) => Err(McpError::InvalidMessage(
+                "request id must not be null".into(),
+            )),
+            (true, Some(_)) => serde_json::from_value(value)
+                .map(JsonRpcMessage::Request)
+                .map_err(|e| McpError::InvalidMessage(format!("invalid request: {e}"))),
+            (true, None) => serde_json::from_value(value)
+                .map(JsonRpcMessage::Notification)
+                .map_err(|e| McpError::InvalidMessage(format!("invalid notification: {e}"))),
+            (false, Some(_)) => serde_json::from_value(value)
+                .map(JsonRpcMessage::Response)
+                .map_err(|e| McpError::InvalidMessage(format!("invalid response: {e}"))),
+            (false, None) => Err(McpError::InvalidMessage(
+                "a JSON-RPC message needs either `method` (request/notification) \
+                 or `id` (response)"
+                    .into(),
+            )),
+        }
+    }
+}
+
+/// The JSON type of `value`, for error messages.
+fn type_name_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
 /// JSON-RPC Request
+///
+/// Unknown keys are ignored rather than refused. A future revision that adds a
+/// top-level field must not make every message from a newer peer unparseable,
+/// and the envelope is discriminated by shape in
+/// [`JsonRpcMessage::from_value`], so strictness here buys nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct JsonRpcRequest {
     pub id: RequestId,
     pub method: String,
@@ -132,8 +216,9 @@ pub struct JsonRpcRequest {
 }
 
 /// JSON-RPC Response
+///
+/// Unknown keys are ignored; see [`JsonRpcRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct JsonRpcResponse {
     pub id: RequestId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,8 +229,9 @@ pub struct JsonRpcResponse {
 }
 
 /// JSON-RPC Notification (no id, no response expected)
+///
+/// Unknown keys are ignored; see [`JsonRpcRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct JsonRpcNotification {
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
