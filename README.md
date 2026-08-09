@@ -289,13 +289,35 @@ if t.has_notifications() {
 
 ## Protocol Version
 
-Implements MCP protocol version `2025-03-26` (Streamable HTTP).
+Implements MCP protocol version `2025-11-25`, and negotiates down to
+`2025-06-18` or `2025-03-26` for older clients.
+
+Supported across those revisions:
+
+- **Tools** with `outputSchema` / `structuredContent`, titles, icons, and
+  annotations
+- **Resources** and resource templates; **Prompts**
+- **Logging** with `logging/setLevel` and a stderr fallback
+- **Elicitation**, both form and URL mode, with a schema builder
+- **Sampling**, including tool calling (`tools` / `toolChoice`)
+- **Roots**
+- **Tasks** - task-augmented `tools/call`, polling, and cooperative
+  cancellation, opt-in via `Server::enable_tasks`
+- **Streamable HTTP** with `Origin` validation and `MCP-Protocol-Version`
+  handling
+- **Authorization** as an OAuth 2.1 resource server: RFC 8707 audience
+  validation and RFC 9728 Protected Resource Metadata (`auth` feature)
+
+See [docs/2025-11-25-migration-notes.md](docs/2025-11-25-migration-notes.md)
+for the decision log and the breaking changes from 0.5.x.
 
 ## What's NOT Included
 
 - **Client implementation** - this is a server SDK
-- **Sampling/LLM callbacks** - not needed for tool servers  
 - **Async anything** - by design
+- **`completion/complete`**, resource subscriptions, and `listChanged`
+  notifications - all optional, and none are declared as capabilities
+- **Task `input_required`** - see the migration notes for why
 
 ## License
 

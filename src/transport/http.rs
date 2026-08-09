@@ -86,6 +86,7 @@ impl Transport for HttpTransport {
 
 use crate::server::{Server, ServerConfig};
 use crate::transport::OriginPolicy;
+use crate::types::ASSUMED_PROTOCOL_VERSION;
 use std::io::Cursor;
 use tiny_http::{Header, Method, Request as TinyRequest, Response, Server as TinyServer};
 
@@ -299,6 +300,24 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
         if request.method() != &Method::Post {
             return Some(error_response(405, -32600, "Method Not Allowed"));
+        }
+
+        // "If the server receives a request with an invalid or unsupported
+        // MCP-Protocol-Version, it MUST respond with 400 Bad Request." An
+        // absent header is not an error: it means 2025-03-26, which we speak.
+        let version =
+            header_value(request, "MCP-Protocol-Version").unwrap_or(ASSUMED_PROTOCOL_VERSION);
+        if !self.config.supported_versions.iter().any(|v| v == version) {
+            eprintln!("  ✗ Unsupported MCP-Protocol-Version: {}", version);
+            return Some(error_response(
+                400,
+                -32600,
+                format!(
+                    "Unsupported MCP-Protocol-Version `{}`; this server supports: {}",
+                    version,
+                    self.config.supported_versions.join(", ")
+                ),
+            ));
         }
 
         // Only a *present* Origin is validated. Non-browser clients omit it,
@@ -868,6 +887,56 @@ mod http_server_tests {
         for method in ["GET", "DELETE", "PUT"] {
             let (status, _, _) = http_request(&addr, method, "/mcp", "", &[]).unwrap();
             assert_eq!(status, 405, "{method} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_protocol_version_header_accepted_when_supported() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+        for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
+            let (status, _, _) = http_request(
+                &addr,
+                "POST",
+                "/mcp",
+                PING,
+                &[("MCP-Protocol-Version", version)],
+            )
+            .unwrap();
+            assert_eq!(status, 200, "{version} should be accepted");
+        }
+    }
+
+    #[test]
+    fn test_absent_protocol_version_header_is_allowed() {
+        // "if the server does not receive an MCP-Protocol-Version header [...]
+        // the server SHOULD assume protocol version 2025-03-26" - which we
+        // still support, so the request proceeds.
+        let addr = spawn_server(OriginPolicy::Loopback);
+        let (status, _, _) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn test_unsupported_protocol_version_header_is_400() {
+        // "If the server receives a request with an invalid or unsupported
+        // MCP-Protocol-Version, it MUST respond with 400 Bad Request."
+        let addr = spawn_server(OriginPolicy::Loopback);
+        for version in ["2024-11-05", "2026-07-28", "garbage"] {
+            let (status, _, body) = http_request(
+                &addr,
+                "POST",
+                "/mcp",
+                PING,
+                &[("MCP-Protocol-Version", version)],
+            )
+            .unwrap();
+
+            assert_eq!(status, 400, "{version} should be rejected");
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            let message = parsed["error"]["message"].as_str().unwrap();
+            assert!(message.contains(version), "{message}");
+            // The error names what we do support, so the client can retry.
+            assert!(message.contains("2025-11-25"), "{message}");
         }
     }
 

@@ -298,6 +298,26 @@ impl<'a> ToolEnv<'a> {
     }
 
     //
+    // Roots
+    //
+
+    /// Ask the client which filesystem roots it has exposed.
+    ///
+    /// Returns an error if the client declared no `roots` capability, since
+    /// both parties may "only use capabilities that were successfully
+    /// negotiated".
+    pub fn list_roots(&self) -> Result<Vec<Root>> {
+        if !self.client_capabilities.supports_roots() {
+            return Err(McpError::Internal(
+                "client did not declare support for roots".into(),
+            ));
+        }
+        let value = self.send_request("roots/list", serde_json::json!({}))?;
+        let result: ListRootsResult = serde_json::from_value(value)?;
+        Ok(result.roots)
+    }
+
+    //
     // Sampling
     //
 
@@ -676,6 +696,12 @@ pub struct ServerConfig {
     pub icons: Vec<Icon>,
     /// Page size for list operations (tools, resources, prompts)
     pub page_size: usize,
+    /// Protocol revisions this server will negotiate, newest first.
+    ///
+    /// Defaults to [`SUPPORTED_PROTOCOL_VERSIONS`]. Narrow it to drop support
+    /// for older clients; the first entry is what an unrecognized request
+    /// negotiates down to.
+    pub supported_versions: Vec<String>,
     /// Minimum log severity delivered to clients that never call
     /// `logging/setLevel`.
     ///
@@ -698,6 +724,10 @@ impl Default for ServerConfig {
             website_url: None,
             icons: Vec::new(),
             page_size: DEFAULT_PAGE_SIZE,
+            supported_versions: SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .map(|v| v.to_string())
+                .collect(),
             default_log_level: LogLevel::Info,
             stderr_logging: StderrLogging::default(),
         }
@@ -1247,8 +1277,25 @@ impl<C: Send + Sync + 'static> Server<C> {
         self.client_capabilities = params.capabilities;
         self.initialized = true;
 
+        // "If the server supports the requested protocol version, it MUST
+        // respond with the same version. Otherwise, the server MUST respond
+        // with another protocol version it supports [...] the latest."
+        let negotiated = self
+            .config
+            .supported_versions
+            .iter()
+            .find(|version| **version == params.protocol_version)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.config
+                    .supported_versions
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PROTOCOL_VERSION.to_string())
+            });
+
         let result = InitializeResult {
-            protocol_version: PROTOCOL_VERSION.to_string(),
+            protocol_version: negotiated,
             capabilities: ServerCapabilities {
                 tools: if self.tools.is_empty() {
                     None
@@ -4505,6 +4552,158 @@ mod tests {
         for id in &ids {
             await_terminal(&mut server, id);
         }
+    }
+
+    //
+    // Version negotiation
+    //
+
+    fn initialize_with(server: &mut Server<TestContext>, version: &str) -> Value {
+        dispatch(
+            server,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": version,
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_protocol_version_is_2025_11_25() {
+        assert_eq!(PROTOCOL_VERSION, "2025-11-25");
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS[0], PROTOCOL_VERSION);
+        assert!(is_supported_protocol_version("2025-11-25"));
+        assert!(is_supported_protocol_version("2025-06-18"));
+        assert!(is_supported_protocol_version("2025-03-26"));
+        assert!(!is_supported_protocol_version("2024-11-05"));
+        assert!(!is_supported_protocol_version(""));
+    }
+
+    #[test]
+    fn test_supported_version_is_echoed_back() {
+        // "If the server supports the requested protocol version, it MUST
+        // respond with the same version."
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            let result = initialize_with(&mut server, version);
+            assert_eq!(result["protocolVersion"], *version);
+        }
+    }
+
+    #[test]
+    fn test_unsupported_version_negotiates_down_to_the_latest() {
+        // "Otherwise, the server MUST respond with another protocol version it
+        // supports. This SHOULD be the latest version supported by the server."
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        for version in ["2024-11-05", "1.0.0", "", "not-a-version"] {
+            let result = initialize_with(&mut server, version);
+            assert_eq!(
+                result["protocolVersion"], PROTOCOL_VERSION,
+                "for {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_supported_versions_are_configurable() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig {
+            supported_versions: vec!["2025-11-25".into()],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            initialize_with(&mut server, "2025-11-25")["protocolVersion"],
+            "2025-11-25"
+        );
+        // A dropped revision negotiates up to the only one on offer.
+        assert_eq!(
+            initialize_with(&mut server, "2025-03-26")["protocolVersion"],
+            "2025-11-25"
+        );
+    }
+
+    #[test]
+    fn test_initialize_without_params_still_negotiates() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "initialize".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn test_malformed_initialize_is_invalid_params_not_a_parse_error() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let err = dispatch(
+            &mut server,
+            "initialize",
+            serde_json::json!({ "protocolVersion": 42 }),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_jsonrpc_error().code, -32602);
+    }
+
+    //
+    // Roots
+    //
+
+    #[test]
+    fn test_list_roots_round_trip() {
+        let transport = ScriptedTransport::new(vec![serde_json::json!({
+            "roots": [
+                { "uri": "file:///home/user/project", "name": "My Project" },
+                { "uri": "file:///tmp" }
+            ]
+        })]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "roots": { "listChanged": true } }),
+            transport,
+        );
+
+        let roots = server.tool_env().list_roots().unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].uri, "file:///home/user/project");
+        assert_eq!(roots[0].name.as_deref(), Some("My Project"));
+        assert!(roots[1].name.is_none());
+
+        assert_eq!(written_requests(&written)[0].method, "roots/list");
+    }
+
+    #[test]
+    fn test_list_roots_refuses_without_the_capability() {
+        let transport = ScriptedTransport::new(vec![]);
+        let (server, written, _t) = scripted_server(serde_json::json!({}), transport);
+
+        let err = server.tool_env().list_roots().unwrap_err();
+        assert!(err.to_string().contains("roots"), "{err}");
+        assert!(written_requests(&written).is_empty());
+    }
+
+    #[test]
+    fn test_roots_capability_is_recorded_at_initialize() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        assert!(!server.client_capabilities.supports_roots());
+
+        dispatch(
+            &mut server,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "roots": { "listChanged": true } },
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }),
+        )
+        .unwrap();
+
+        assert!(server.client_capabilities.supports_roots());
     }
 
     #[test]

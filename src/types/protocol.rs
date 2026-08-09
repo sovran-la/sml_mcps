@@ -6,8 +6,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Current MCP protocol version
-pub const PROTOCOL_VERSION: &str = "2025-03-26";
+/// The protocol revision this crate implements.
+pub const PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Every revision this server can speak, newest first.
+///
+/// Version negotiation is a two-line rule: "If the server supports the
+/// requested protocol version, it MUST respond with the same version.
+/// Otherwise, the server MUST respond with another protocol version it
+/// supports. This SHOULD be the latest version supported by the server."
+///
+/// The older entries are honest. Everything 2025-03-26 and 2025-06-18 require
+/// is implemented here; the newer fields those revisions lack are all
+/// `skip_serializing_if`-optional, so a result shaped for 2025-11-25 is also a
+/// valid result for them.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
+
+/// The version a client is assumed to be speaking when it says nothing.
+///
+/// The transports spec pins this: "if the server does not receive an
+/// `MCP-Protocol-Version` header, and has no other way to identify the version
+/// [...] the server SHOULD assume protocol version 2025-03-26."
+pub const ASSUMED_PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Can this server speak `version`?
+pub fn is_supported_protocol_version(version: &str) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+}
 
 /// Free-form metadata attached to a protocol object.
 ///
@@ -202,8 +227,12 @@ pub struct ClientCapabilities {
     /// Present when the client can run `elicitation/create` (2025-06-18).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elicitation: Option<crate::types::ElicitationCapability>,
-    #[serde(default)]
-    pub roots: RootCapabilities,
+    /// Present when the client exposes filesystem roots.
+    ///
+    /// As with sampling, absent and present-but-empty differ: `None` means the
+    /// client declared no roots support and must not be sent `roots/list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roots: Option<RootCapabilities>,
 }
 
 impl ClientCapabilities {
@@ -228,6 +257,11 @@ impl ClientCapabilities {
             .as_ref()
             .is_some_and(|capability| capability.supports_tools())
     }
+
+    /// May we ask this client for its filesystem roots?
+    pub fn supports_roots(&self) -> bool {
+        self.roots.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -235,6 +269,25 @@ impl ClientCapabilities {
 pub struct RootCapabilities {
     #[serde(default)]
     pub list_changed: bool,
+}
+
+/// A filesystem root the client has exposed to this server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Root {
+    /// A `file://` URI. The spec currently only defines that scheme.
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+/// Result of `roots/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListRootsResult {
+    pub roots: Vec<Root>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
