@@ -10,6 +10,7 @@
 //! - `hosted` - Enables both `http` and `auth`
 
 pub mod pagination;
+pub mod schema_check;
 pub mod server;
 pub mod transport;
 pub mod types;

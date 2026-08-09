@@ -258,7 +258,43 @@ pub trait Tool<C>: Send + Sync {
     fn description(&self) -> &str;
 
     /// JSON Schema for input arguments
+    ///
+    /// Interpreted as JSON Schema 2020-12 unless it carries a `$schema` key.
     fn schema(&self) -> Value;
+
+    /// Human-readable display name, distinct from the programmatic `name`.
+    ///
+    /// Default: `None`, so clients fall back to `name`.
+    fn title(&self) -> Option<String> {
+        None
+    }
+
+    /// JSON Schema describing the tool's `structuredContent`.
+    ///
+    /// Declaring this is a promise: every successful result **MUST** carry
+    /// `structuredContent` conforming to the schema, and the server validates
+    /// that promise before responding.
+    ///
+    /// Default: `None` (unstructured output only).
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
+    /// Icons for display in user interfaces.
+    ///
+    /// Default: empty.
+    fn icons(&self) -> Vec<Icon> {
+        Vec::new()
+    }
+
+    /// Whether this tool can be invoked as a task.
+    ///
+    /// Default: [`TaskSupport::Forbidden`]. Returning `Optional` or `Required`
+    /// only has an effect once the server has tasks enabled via
+    /// [`Server::enable_tasks`].
+    fn task_support(&self) -> TaskSupport {
+        TaskSupport::Forbidden
+    }
 
     /// Tool behavior annotations (hints for clients)
     ///
@@ -266,14 +302,42 @@ pub trait Tool<C>: Send + Sync {
     /// - `read_only_hint`: Tool only reads, never modifies
     /// - `idempotent_hint`: Safe to retry (same result on repeat calls)
     /// - `destructive_hint`: May overwrite or heavily mutate data
+    /// - `open_world_hint`: Tool touches an open world (network, shared store)
     ///
     /// Default returns None (no hints).
     fn annotations(&self) -> Option<ToolAnnotations> {
         None
     }
 
+    /// Protocol metadata for this tool.
+    ///
+    /// Default: `None`.
+    fn meta(&self) -> Option<Meta> {
+        None
+    }
+
     /// Execute the tool
     fn execute(&self, args: Value, context: &mut C, env: &ToolEnv) -> Result<CallToolResult>;
+
+    /// Build the wire representation of this tool.
+    fn as_protocol_tool(&self) -> crate::types::Tool {
+        let task_support = self.task_support();
+        crate::types::Tool {
+            name: self.name().to_string(),
+            title: self.title(),
+            description: Some(self.description().to_string()),
+            input_schema: self.schema(),
+            output_schema: self.output_schema(),
+            annotations: self.annotations(),
+            icons: self.icons(),
+            // `forbidden` is the default; omitting it keeps `tools/list`
+            // compact and means the same thing to a client.
+            execution: (task_support != TaskSupport::Forbidden).then_some(ToolExecution {
+                task_support: Some(task_support),
+            }),
+            meta: self.meta(),
+        }
+    }
 }
 
 //
@@ -297,13 +361,43 @@ pub trait Resource: Send + Sync {
     /// Get resource content
     fn content(&self) -> Vec<ResourceContent>;
 
+    /// Human-readable display name, distinct from `name`. Default: `None`.
+    fn title(&self) -> Option<String> {
+        None
+    }
+
+    /// Size in bytes, when cheaply known. Default: `None`.
+    fn size(&self) -> Option<u64> {
+        None
+    }
+
+    /// Icons for display in user interfaces. Default: empty.
+    fn icons(&self) -> Vec<Icon> {
+        Vec::new()
+    }
+
+    /// Audience / priority / last-modified hints. Default: `None`.
+    fn annotations(&self) -> Option<Annotations> {
+        None
+    }
+
+    /// Protocol metadata. Default: `None`.
+    fn meta(&self) -> Option<Meta> {
+        None
+    }
+
     /// Convert to protocol Resource type
     fn as_protocol_resource(&self) -> crate::types::Resource {
         crate::types::Resource {
             uri: self.uri(),
             name: self.name(),
+            title: self.title(),
             description: Some(self.description()),
             mime_type: Some(self.mime_type()),
+            size: self.size(),
+            icons: self.icons(),
+            annotations: self.annotations(),
+            meta: self.meta(),
         }
     }
 }
@@ -326,12 +420,30 @@ pub trait PromptDef: Send + Sync {
     /// Generate prompt messages
     fn get_messages(&self, args: &HashMap<String, String>) -> Result<Vec<PromptMessage>>;
 
+    /// Human-readable display name, distinct from `name`. Default: `None`.
+    fn title(&self) -> Option<String> {
+        None
+    }
+
+    /// Icons for display in user interfaces. Default: empty.
+    fn icons(&self) -> Vec<Icon> {
+        Vec::new()
+    }
+
+    /// Protocol metadata. Default: `None`.
+    fn meta(&self) -> Option<Meta> {
+        None
+    }
+
     /// Convert to protocol Prompt type
     fn as_protocol_prompt(&self) -> Prompt {
         Prompt {
             name: self.name().to_string(),
+            title: self.title(),
             description: self.description().map(String::from),
             arguments: self.arguments(),
+            icons: self.icons(),
+            meta: self.meta(),
         }
     }
 }
@@ -346,6 +458,14 @@ pub struct ServerConfig {
     pub name: String,
     pub version: String,
     pub instructions: Option<String>,
+    /// Human-readable display name for this server (2025-06-18).
+    pub title: Option<String>,
+    /// Human-readable description of what this server does (2025-11-25).
+    pub description: Option<String>,
+    /// Project or documentation URL.
+    pub website_url: Option<String>,
+    /// Icons identifying this server in user interfaces (2025-11-25).
+    pub icons: Vec<Icon>,
     /// Page size for list operations (tools, resources, prompts)
     pub page_size: usize,
     /// Minimum log severity delivered to clients that never call
@@ -365,6 +485,10 @@ impl Default for ServerConfig {
             name: "sml_mcps".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             instructions: None,
+            title: None,
+            description: None,
+            website_url: None,
+            icons: Vec::new(),
             page_size: DEFAULT_PAGE_SIZE,
             default_log_level: LogLevel::Info,
             stderr_logging: StderrLogging::default(),
@@ -381,6 +505,7 @@ pub struct Server<C> {
     config: ServerConfig,
     tools: HashMap<String, Box<dyn Tool<C>>>,
     resources: HashMap<String, Box<dyn Resource>>,
+    resource_templates: Vec<ResourceTemplate>,
     prompts: HashMap<String, Box<dyn PromptDef>>,
     transport: Option<Arc<Mutex<dyn Transport>>>,
     initialized: bool,
@@ -396,10 +521,23 @@ impl<C: Send + Sync + 'static> Server<C> {
             config,
             tools: HashMap::new(),
             resources: HashMap::new(),
+            resource_templates: Vec::new(),
             prompts: HashMap::new(),
             transport: None,
             initialized: false,
             log_level,
+        }
+    }
+
+    /// This server's identity as advertised to clients.
+    fn server_info(&self) -> Implementation {
+        Implementation {
+            name: self.config.name.clone(),
+            version: self.config.version.clone(),
+            title: self.config.title.clone(),
+            description: self.config.description.clone(),
+            icons: self.config.icons.clone(),
+            website_url: self.config.website_url.clone(),
         }
     }
 
@@ -431,6 +569,25 @@ impl<C: Send + Sync + 'static> Server<C> {
             return Err(McpError::Internal(format!("Duplicate resource: {}", uri)));
         }
         self.resources.insert(uri, Box::new(resource));
+        Ok(())
+    }
+
+    /// Add a resource template, exposed via `resources/templates/list`
+    ///
+    /// Templates are static metadata (an RFC 6570 URI template plus display
+    /// fields); reads still go through `resources/read` against a concrete URI.
+    pub fn add_resource_template(&mut self, template: ResourceTemplate) -> Result<()> {
+        if self
+            .resource_templates
+            .iter()
+            .any(|t| t.uri_template == template.uri_template)
+        {
+            return Err(McpError::Internal(format!(
+                "Duplicate resource template: {}",
+                template.uri_template
+            )));
+        }
+        self.resource_templates.push(template);
         Ok(())
     }
 
@@ -550,6 +707,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             "tools/list" => self.handle_list_tools(request),
             "tools/call" => self.handle_call_tool(request, context),
             "resources/list" => self.handle_list_resources(request),
+            "resources/templates/list" => self.handle_list_resource_templates(request),
             "resources/read" => self.handle_read_resource(request),
             "prompts/list" => self.handle_list_prompts(request),
             "prompts/get" => self.handle_get_prompt(request),
@@ -598,7 +756,7 @@ impl<C: Send + Sync + 'static> Server<C> {
                 } else {
                     Some(ToolsCapability::default())
                 },
-                resources: if self.resources.is_empty() {
+                resources: if self.resources.is_empty() && self.resource_templates.is_empty() {
                     None
                 } else {
                     Some(ResourcesCapability::default())
@@ -614,10 +772,7 @@ impl<C: Send + Sync + 'static> Server<C> {
                 logging: Some(serde_json::json!({})),
                 experimental: None,
             },
-            server_info: Implementation {
-                name: self.config.name.clone(),
-                version: self.config.version.clone(),
-            },
+            server_info: self.server_info(),
             instructions: self.config.instructions.clone(),
         };
 
@@ -635,16 +790,8 @@ impl<C: Send + Sync + 'static> Server<C> {
         };
 
         // Collect all tools (sorted for consistent pagination)
-        let mut all_tools: Vec<crate::types::Tool> = self
-            .tools
-            .values()
-            .map(|t| crate::types::Tool {
-                name: t.name().to_string(),
-                description: Some(t.description().to_string()),
-                input_schema: t.schema(),
-                annotations: t.annotations(),
-            })
-            .collect();
+        let mut all_tools: Vec<crate::types::Tool> =
+            self.tools.values().map(|t| t.as_protocol_tool()).collect();
         all_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Apply pagination
@@ -663,18 +810,51 @@ impl<C: Send + Sync + 'static> Server<C> {
             None => return Err(McpError::InvalidParams("Missing params".into())),
         };
 
+        // An unknown tool is a protocol error, and the spec's own example gives
+        // it -32602. It is not something a model can fix by retrying with
+        // different arguments, so it must not be an `isError` result.
         let tool = self
             .tools
             .get(&params.name)
-            .ok_or_else(|| McpError::ToolError(format!("Unknown tool: {}", params.name)))?;
+            .ok_or_else(|| McpError::InvalidParams(format!("Unknown tool: {}", params.name)))?;
 
         let env = self.tool_env();
 
-        let result = tool.execute(
+        let outcome = tool.execute(
             params.arguments.unwrap_or(serde_json::json!({})),
             context,
             &env,
-        )?;
+        );
+
+        // Tool *execution* failures are results, not JSON-RPC errors: the spec
+        // wants the model to see actionable text and self-correct. Only
+        // genuinely protocol-level failures propagate as errors.
+        let result = match outcome {
+            Ok(result) => result,
+            Err(McpError::ToolError(message)) => CallToolResult::error(message),
+            Err(McpError::InvalidParams(message)) => {
+                // SEP-1303: input validation errors are Tool Execution Errors.
+                CallToolResult::error(format!("Invalid arguments: {}", message))
+            }
+            Err(other) => return Err(other),
+        };
+
+        // Declaring an outputSchema is a promise that every successful result
+        // carries conforming structured content. Catch a broken promise here
+        // rather than shipping malformed data to the client.
+        if !result.is_error {
+            if let Some(schema) = tool.output_schema() {
+                if let Err(problem) = crate::schema_check::validate_structured_output(
+                    &schema,
+                    result.structured_content.as_ref(),
+                ) {
+                    return Err(McpError::Internal(format!(
+                        "Tool `{}` declares an outputSchema but returned {}",
+                        params.name, problem
+                    )));
+                }
+            }
+        }
 
         Ok(serde_json::to_value(result)?)
     }
@@ -699,6 +879,25 @@ impl<C: Send + Sync + 'static> Server<C> {
 
         Ok(serde_json::to_value(ListResourcesResult {
             resources,
+            next_cursor,
+        })?)
+    }
+
+    fn handle_list_resource_templates(&self, request: &JsonRpcRequest) -> Result<Value> {
+        let params: ListResourceTemplatesParams = match &request.params {
+            Some(p) => serde_json::from_value(p.clone())?,
+            None => ListResourceTemplatesParams::default(),
+        };
+
+        // Sorted for stable pagination, same as the other list handlers.
+        let mut all: Vec<ResourceTemplate> = self.resource_templates.clone();
+        all.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
+
+        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size);
+        let (resource_templates, next_cursor) = paginate(&all, &state);
+
+        Ok(serde_json::to_value(ListResourceTemplatesResult {
+            resource_templates,
             next_cursor,
         })?)
     }
@@ -905,6 +1104,7 @@ mod tests {
                 name: "name".into(),
                 description: Some("Your name".into()),
                 required: true,
+                ..Default::default()
             }]
         }
         fn get_messages(&self, args: &HashMap<String, String>) -> Result<Vec<PromptMessage>> {
@@ -1549,8 +1749,11 @@ mod tests {
             params: Some(serde_json::json!({ "name": "nonexistent" })),
         };
         let mut ctx = TestContext { counter: 0 };
+        // An unknown tool is a protocol error (Invalid params), not a tool
+        // execution error: no argument change can fix it.
         let result = server.dispatch_request(&request, &mut ctx);
-        assert!(matches!(result, Err(McpError::ToolError(_))));
+        assert!(matches!(result, Err(McpError::InvalidParams(_))));
+        assert_eq!(result.unwrap_err().to_jsonrpc_error().code, -32602);
     }
 
     #[test]
@@ -1567,8 +1770,17 @@ mod tests {
             params: Some(serde_json::json!({ "name": "fail" })),
         };
         let mut ctx = TestContext { counter: 0 };
-        let result = server.dispatch_request(&request, &mut ctx);
-        assert!(matches!(result, Err(McpError::ToolError(_))));
+        // A tool that returns McpError::ToolError produced a JSON-RPC error
+        // before; the spec wants it as an `isError` result so the model can
+        // read the message and self-correct.
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("intentional failure")
+        );
     }
 
     #[test]
@@ -2126,6 +2338,405 @@ mod tests {
         assert_eq!(tools4.len(), 1);
         assert_eq!(tools4[0]["name"], "tool_009");
         assert!(result4["nextCursor"].is_null()); // No more pages
+    }
+
+    //
+    // Structured output (2025-06-18)
+    //
+
+    /// Tool that declares an output schema and honors it.
+    struct StructuredTool;
+
+    impl Tool<TestContext> for StructuredTool {
+        fn name(&self) -> &str {
+            "structured"
+        }
+        fn description(&self) -> &str {
+            "Returns structured data"
+        }
+        fn title(&self) -> Option<String> {
+            Some("Structured Thing".into())
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Option<Value> {
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": { "count": { "type": "integer" } },
+                "required": ["count"]
+            }))
+        }
+        fn icons(&self) -> Vec<Icon> {
+            vec![Icon::new("https://example.com/i.png")]
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            Ok(CallToolResult::structured(
+                serde_json::json!({ "count": 3 }),
+            )?)
+        }
+    }
+
+    /// Tool that declares an output schema and then breaks the promise.
+    struct BrokenSchemaTool;
+
+    impl Tool<TestContext> for BrokenSchemaTool {
+        fn name(&self) -> &str {
+            "broken"
+        }
+        fn description(&self) -> &str {
+            "Declares a schema it does not honor"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Option<Value> {
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": { "count": { "type": "integer" } },
+                "required": ["count"]
+            }))
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            // No structuredContent at all.
+            Ok(CallToolResult::text("just text"))
+        }
+    }
+
+    /// Tool that reports an execution failure the model could act on.
+    struct BadInputTool;
+
+    impl Tool<TestContext> for BadInputTool {
+        fn name(&self) -> &str {
+            "bad_input"
+        }
+        fn description(&self) -> &str {
+            "Rejects its arguments"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Option<Value> {
+            Some(serde_json::json!({ "type": "object", "required": ["x"] }))
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            Err(McpError::InvalidParams("date must be in the future".into()))
+        }
+    }
+
+    fn call(server: &mut Server<TestContext>, name: &str) -> Result<Value> {
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": name })),
+        };
+        let mut ctx = TestContext { counter: 0 };
+        server.dispatch_request(&request, &mut ctx)
+    }
+
+    #[test]
+    fn test_structured_tool_result_carries_structured_content() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(StructuredTool).unwrap();
+
+        let result = call(&mut server, "structured").unwrap();
+        assert_eq!(result["structuredContent"]["count"], 3);
+        // The spec asks for a text mirror for pre-2025-06-18 clients.
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("3"));
+    }
+
+    #[test]
+    fn test_output_schema_violation_is_an_internal_error() {
+        // Declaring outputSchema is a MUST-level promise. Breaking it is a
+        // server bug, so it must not be silently shipped to the client.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(BrokenSchemaTool).unwrap();
+
+        let err = call(&mut server, "broken").unwrap_err();
+        assert!(matches!(err, McpError::Internal(_)));
+        assert!(err.to_string().contains("outputSchema"), "{err}");
+    }
+
+    #[test]
+    fn test_output_schema_not_enforced_on_error_results() {
+        // An isError result has nothing structured to validate; enforcing the
+        // schema there would turn a reportable failure into an internal error.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(BadInputTool).unwrap();
+
+        let result = call(&mut server, "bad_input").unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("date must be in the future")
+        );
+    }
+
+    #[test]
+    fn test_invalid_params_from_tool_becomes_execution_error() {
+        // SEP-1303: input validation errors are Tool Execution Errors, so the
+        // model sees the message and can retry with corrected arguments.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(BadInputTool).unwrap();
+
+        let result = call(&mut server, "bad_input").unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn test_tools_list_exposes_title_output_schema_and_icons() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(StructuredTool).unwrap();
+
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        let tool = &result["tools"][0];
+
+        assert_eq!(tool["name"], "structured");
+        assert_eq!(tool["title"], "Structured Thing");
+        assert_eq!(tool["outputSchema"]["required"][0], "count");
+        assert_eq!(tool["icons"][0]["src"], "https://example.com/i.png");
+        // taskSupport defaults to forbidden and is omitted.
+        assert!(tool.get("execution").is_none());
+    }
+
+    #[test]
+    fn test_tools_list_omits_optional_fields_for_plain_tools() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(IncrementTool).unwrap();
+
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        let tool = &result["tools"][0];
+
+        for absent in ["title", "outputSchema", "icons", "execution", "_meta"] {
+            assert!(tool.get(absent).is_none(), "{absent} should be omitted");
+        }
+    }
+
+    //
+    // Server identity (2025-06-18 / 2025-11-25)
+    //
+
+    #[test]
+    fn test_initialize_reports_configured_server_identity() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig {
+            name: "srv".into(),
+            version: "2.0.0".into(),
+            title: Some("My Server".into()),
+            description: Some("Does things".into()),
+            website_url: Some("https://example.com".into()),
+            icons: vec![Icon::new("https://example.com/s.png")],
+            ..Default::default()
+        });
+
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "initialize".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        let info = &result["serverInfo"];
+
+        assert_eq!(info["name"], "srv");
+        assert_eq!(info["title"], "My Server");
+        assert_eq!(info["description"], "Does things");
+        assert_eq!(info["websiteUrl"], "https://example.com");
+        assert_eq!(info["icons"][0]["src"], "https://example.com/s.png");
+    }
+
+    //
+    // Resource templates
+    //
+
+    fn template(uri: &str, name: &str) -> ResourceTemplate {
+        ResourceTemplate {
+            uri_template: uri.into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resource_templates_list() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server
+            .add_resource_template(template("file:///{path}", "Project Files"))
+            .unwrap();
+        server
+            .add_resource_template(template("db:///{table}", "Tables"))
+            .unwrap();
+
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "resources/templates/list".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+
+        let templates = result["resourceTemplates"].as_array().unwrap();
+        assert_eq!(templates.len(), 2);
+        // Sorted by uriTemplate for stable pagination.
+        assert_eq!(templates[0]["uriTemplate"], "db:///{table}");
+        assert_eq!(templates[1]["uriTemplate"], "file:///{path}");
+    }
+
+    #[test]
+    fn test_resource_templates_list_empty_by_default() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "resources/templates/list".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        assert_eq!(result["resourceTemplates"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_duplicate_resource_template_error() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server
+            .add_resource_template(template("file:///{path}", "A"))
+            .unwrap();
+        assert!(
+            server
+                .add_resource_template(template("file:///{path}", "B"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_templates_alone_declare_the_resources_capability() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server
+            .add_resource_template(template("file:///{path}", "A"))
+            .unwrap();
+
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "initialize".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        assert!(!result["capabilities"]["resources"].is_null());
+    }
+
+    #[test]
+    fn test_resource_templates_paginate() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig {
+            page_size: 2,
+            ..Default::default()
+        });
+        for i in 0..5 {
+            server
+                .add_resource_template(template(&format!("x:///{:02}", i), "t"))
+                .unwrap();
+        }
+
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "resources/templates/list".to_string(),
+            params: None,
+        };
+        let mut ctx = TestContext { counter: 0 };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        assert_eq!(result["resourceTemplates"].as_array().unwrap().len(), 2);
+        assert!(result["nextCursor"].is_string());
+    }
+
+    //
+    // JSON-RPC batching removal (2025-06-18)
+    //
+
+    #[test]
+    fn test_batch_messages_are_rejected() {
+        // "Remove support for JSON-RPC batching" - a top-level array is not a
+        // valid message and must be reported as Invalid Request, not as an
+        // opaque parse failure.
+        let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},
+                        {"jsonrpc":"2.0","id":2,"method":"ping"}]"#;
+        let err = JsonRpcMessage::parse(batch).unwrap_err();
+
+        assert!(matches!(err, McpError::InvalidMessage(_)));
+        assert_eq!(err.to_jsonrpc_error().code, -32600);
+        assert!(err.to_string().to_lowercase().contains("batch"), "{err}");
+    }
+
+    #[test]
+    fn test_batch_rejection_tolerates_leading_whitespace() {
+        let err = JsonRpcMessage::parse("   \n\t[{\"jsonrpc\":\"2.0\"}]").unwrap_err();
+        assert!(matches!(err, McpError::InvalidMessage(_)));
+    }
+
+    #[test]
+    fn test_single_messages_still_parse() {
+        let request = JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+        assert!(matches!(request, JsonRpcMessage::Request(_)));
+
+        let notification =
+            JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .unwrap();
+        assert!(matches!(notification, JsonRpcMessage::Notification(_)));
+
+        let response = JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).unwrap();
+        assert!(matches!(response, JsonRpcMessage::Response(_)));
+    }
+
+    #[test]
+    fn test_params_structs_tolerate_unknown_fields() {
+        // Forward compatibility: params must never gain deny_unknown_fields,
+        // or every future spec addition becomes a hard parse failure here.
+        let with_extras = serde_json::json!({
+            "name": "increment",
+            "arguments": {},
+            "_meta": { "io.modelcontextprotocol/progressToken": 1 },
+            "task": { "ttl": 60000 },
+            "somethingFromTheFuture": true
+        });
+        assert!(serde_json::from_value::<CallToolParams>(with_extras).is_ok());
+
+        let list = serde_json::json!({ "cursor": "abc", "_meta": {}, "future": 1 });
+        assert!(serde_json::from_value::<ListToolsParams>(list).is_ok());
     }
 
     #[test]

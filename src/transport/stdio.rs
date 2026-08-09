@@ -36,8 +36,7 @@ impl Transport for StdioTransport {
             return Err(crate::types::McpError::TransportClosed);
         }
 
-        let message: JsonRpcMessage = serde_json::from_str(&line)?;
-        Ok(message)
+        JsonRpcMessage::parse(&line)
     }
 
     fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {

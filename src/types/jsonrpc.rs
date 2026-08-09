@@ -99,6 +99,25 @@ impl JsonRpcMessage {
             jsonrpc: JsonRpcVersion::default(),
         })
     }
+
+    /// Parse one message off the wire.
+    ///
+    /// All transports go through here so that the batching rejection lives in
+    /// exactly one place. MCP removed JSON-RPC batching in 2025-06-18: the body
+    /// of a request "**MUST** be a single JSON-RPC *request*, *notification*,
+    /// or *response*." A top-level array is well-formed JSON but not a valid
+    /// message, so it gets `-32600 Invalid Request` with an explanation rather
+    /// than a bare `-32700` parse error.
+    pub fn parse(text: &str) -> crate::types::Result<Self> {
+        if text.trim_start().starts_with('[') {
+            return Err(crate::types::McpError::InvalidMessage(
+                "JSON-RPC batching is not supported; send a single request, \
+                 notification, or response per message"
+                    .into(),
+            ));
+        }
+        Ok(serde_json::from_str(text)?)
+    }
 }
 
 /// JSON-RPC Request
