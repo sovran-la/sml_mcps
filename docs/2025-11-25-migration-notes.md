@@ -7,7 +7,15 @@ Read this if you maintain a downstream server, or if you want to know why
 something was built the way it was rather than the obvious way.
 
 Confidence is flagged per decision. Anything marked **REVIEW** is a judgement
-call that deserves a second opinion.
+call that deserves a second opinion; anything marked **RESOLVED** was one, and
+has since been settled — the original reasoning is kept alongside what replaced
+it, because a decision that got reversed is worth more than one that was never
+questioned.
+
+Everything the first pass flagged for review has now been resolved: full JSON
+Schema validation (§3.3), timeouts on server-initiated requests (§3.4), task
+`input_required` (§3.5), and cross-platform task-ID entropy (§3.7). The known
+flake in §5 is fixed, along with two others found while confirming it.
 
 ---
 
@@ -131,8 +139,16 @@ by the framework; nothing downstream constructs it.
   `task_support`, `meta`, `as_protocol_tool`. Existing impls compile untouched.
 - `Resource` and `PromptDef` likewise.
 - `ToolEnv` gained `elicit*`, `create_message`, `list_roots`, `send_request`,
-  `log_data`, `log_enabled`, `is_cancelled`, `is_task`, `client_capabilities`.
-  Its fields are private with no public constructor, so additions are free.
+  `send_request_with_timeout`, `log_data`, `log_enabled`, `is_cancelled`,
+  `is_task`, `task_id`, `client_capabilities`. Its fields are private with no
+  public constructor, so additions are free.
+- `Transport` gained `set_read_timeout`, defaulted to "not supported". A custom
+  transport compiles untouched and keeps blocking forever, which is what it did
+  before; implement it to get elicitation timeouts and task `input_required`.
+- `ServerConfig` also gained `request_timeout`. It builds with
+  `..Default::default()` downstream, so this costs nothing.
+- `McpError` gained `Timeout`. The enum is `#[non_exhaustive]`, so downstream
+  matches already carry a wildcard arm.
 
 ---
 
@@ -178,38 +194,51 @@ time — noted here because it is a real semantic change.
 Default threshold is `Info`. The spec does not define a pre-`setLevel` default,
 so this is our choice; `ServerConfig::default_log_level` overrides it.
 
-### 3.3 Output-schema validation is deliberately partial
+### 3.3 Output-schema validation is full JSON Schema
 
-**Confidence: medium. REVIEW if you plan to lean on it.**
+**Confidence: high. RESOLVED** — was "deliberately partial, REVIEW if you plan
+to lean on it".
 
 Declaring `outputSchema` is a MUST-level promise: "Servers MUST provide
-structured results that conform to this schema." Shipping a broken promise to
-the client silently seemed worse than checking.
+structured results that conform to this schema." The first cut of
+`src/schema_check.rs` checked only presence, the top-level `type`, `required`,
+and one level of property types, and explicitly declined to judge `pattern`,
+`minimum`, `format`, `additionalProperties`, `$ref`, or `oneOf`/`anyOf`/`allOf`.
+Anything it accepted could still be rejected by a strict client, which made it
+close to worthless as a guarantee.
 
-But a full JSON Schema 2020-12 implementation is a large dependency for a crate
-whose entire pitch is being small. `src/schema_check.rs` therefore checks:
+It now validates properly, through `boon` (draft 2020-12).
 
-- `structuredContent` is present at all
-- the top-level `type` matches
-- every entry in `required` is present
-- declared property types match, recursing one level
+**Why `boon` over `jsonschema`:** `jsonschema`'s default features pull in
+reqwest and rustls, and it offers a tokio-backed resolver. `boon` has no async
+anywhere in its tree. It costs ~25 transitive crates, mostly the `url`/`idna`
+chain. That is a real cost and a deliberate one — the crate is small because it
+excludes tokio, not because it refuses useful dependencies.
 
-and explicitly declines to judge `pattern`, `minimum`, `format`,
-`additionalProperties`, `$ref`, or `oneOf`/`anyOf`/`allOf`.
+Two behaviours are deliberate:
 
-It errs **permissive**: a false rejection breaks a working tool, while a false
-acceptance only leaves the client exactly where it would have been with no
-check at all.
+- **An uncompilable schema is skipped, not fatal.** A typo in a server's own
+  `outputSchema` should not fail every call to a tool that works. The presence
+  half of the promise is still enforced.
+- **External `$ref`s are refused, not resolved.** boon's default loader reads
+  `file://` URLs, which would turn validation into a file read as a side
+  effect. A no-op loader closes that off. Internal `#/$defs/...` refs are
+  unaffected.
 
-**Alternative considered:** depend on the `jsonschema` crate. Rejected — it
-pulls in a substantial tree, and this crate's whole value proposition is not
-doing that. **If a downstream server needs strict validation, validate before
-returning.**
+`format` stays an annotation, per 2020-12 and boon's default.
 
-### 3.4 Server-initiated requests: one reader, no timeout
+`CompiledSchema` is available for servers that want to compile once and reuse;
+`validate_structured_output` keeps its old signature and compiles per call
+(sub-millisecond for typical tool schemas).
 
-**Confidence: medium-high on the design, medium on the no-timeout call.
-REVIEW the timeout question.**
+**Downstream impact:** a server whose `structuredContent` did not really match
+its declared schema now gets an error where it previously got silence. That is
+the point, but it is worth knowing about before upgrading.
+
+### 3.4 Server-initiated requests: one reader, bounded wait
+
+**Confidence: high on the design. The timeout question is settled — see
+below.**
 
 Elicitation and sampling need the server to send a request and block for a
 response. In a sync server with no runtime, the thing reading the transport is
@@ -229,38 +258,91 @@ Nothing is dropped, nothing is delivered twice.
 - *smol.* Introduces async through the whole call chain for two features, and
   `Tool::execute` would have to become async. Rejected outright.
 
-**No timeout.** `Transport::read` blocks; interrupting it needs a second thread
-per call. A client that never answers an elicitation stalls that tool — which
-is no worse than a client that never answers any other request. If this turns
-out to matter, the fix is a reader thread (above), not a timeout bolted onto
-the current shape.
+**Timeouts: RESOLVED** — was "no timeout, REVIEW the timeout question".
+
+The original reasoning was that interrupting `Transport::read` needs a second
+thread per call. It does not; it needs the transport to be able to expire a
+read, which both bidirectional transports can do. `UnixTransport` sets
+`SO_RCVTIMEO`; `StdioTransport` polls stdin.
+
+`Transport::set_read_timeout` reports whether the deadline was honored rather
+than pretending, and defaults to `Ok(false)` — a transport that has not thought
+about deadlines cannot deliver them.
+
+`ServerConfig::request_timeout` defaults to **2 minutes**, chosen for
+elicitation, which waits on a person rather than a machine.
+`ToolEnv::send_request_with_timeout` overrides it per call; `None` restores the
+old unbounded wait.
+
+On expiry the request is abandoned — a late answer is discarded rather than
+handed to whoever asks next, which would be silent data corruption — and
+`notifications/cancelled` goes out, which the spec asks of a party that times
+out.
+
+Framing under a deadline lives in `src/transport/line.rs`, shared by both
+transports. Three things it gets right that `BufRead::read_line` does not: an
+expired read keeps the bytes it already had (losing them desyncs framing
+permanently), the deadline covers the whole message rather than each syscall,
+and bytes are decoded only once a full line exists, so a multi-byte character
+split across reads survives.
+
+Polling stdin meant giving up `io::Stdin`, whose private buffer is invisible to
+`poll`: a client that pipelined two messages into one write would have looked
+idle while holding the answer. `StdioTransport` reads fd 0 directly now,
+borrowing the descriptor rather than owning it. **If your server also reads
+stdin itself, that is now a private buffer it cannot see** — no downstream
+server does.
+
+One platform note, now a regression test: on macOS `setsockopt(SO_RCVTIMEO)`
+fails with `EINVAL` once the peer has closed, so clearing a deadline that was
+never armed turned an ordinary hangup into an IO error.
 
 **Server-initiated request ids** are strings prefixed `sml-`. JSON-RPC shares
 one id namespace across both directions; a numeric id could collide with a
 client's. The prefix makes the two spaces disjoint by construction.
 
-### 3.5 Tasks never reach `input_required`
+### 3.5 Tasks reach `input_required`
 
-**Confidence: high on the reasoning, medium on whether it matters.
-REVIEW if a downstream server wants elicitation inside a long task.**
+**Confidence: high. RESOLVED** — was "tasks never reach `input_required`,
+REVIEW if a downstream server wants elicitation inside a long task".
 
-The spec describes `input_required` as a task pausing to elicit. We cannot do
-that safely:
+The original reasoning was sound: a task worker runs on its own thread, nothing
+reads the transport there, and the server loop may itself be blocked inside
+`tasks/result` waiting on that very task. A round trip could never complete, so
+workers got `can_request: false` and a clear refusal rather than a deadlock.
 
-- the task runs on a worker thread
-- nothing is reading the transport on that thread
-- the *server loop* may itself be blocked inside `tasks/result` waiting on that
-  very task
+Both halves are now fixed, and it did not take the dedicated-reader-thread
+redesign this section originally predicted.
 
-So a round trip from a worker could never complete. Rather than deadlock, task
-workers get a `ToolEnv` with `can_request: false`, which refuses server-initiated
-requests with a clear message.
+**The worker does not read.** It registers as a waiter in the broker, writes its
+request, and blocks on a channel until whichever thread *is* reading hands the
+answer over. Responses the server loop used to drop — safe only while nothing
+could be waiting for one — are routed to that waiter. The task sits in
+`input_required` for exactly as long as it waits, then returns to `working`.
 
-Tasks therefore move `working -> completed | failed | cancelled`, a legal
-subset of the state machine. `input_required` is a SHOULD ("when the task
-receiver has messages for the requestor…"), and we never have such messages.
+**`tasks/result` pumps.** It reads the transport while it blocks instead of only
+sleeping on the store, so an elicitation issued by the task it is waiting for
+can still get through. Client traffic is deferred to the main loop exactly as
+during any other server-initiated request. Reads carry a short deadline, because
+nothing on the wire announces a task finishing.
 
-**To lift this** would take the dedicated-reader-thread design from §3.4.
+**Writes moved to a second handle.** The server loop holds the transport lock
+for the whole of a blocking read, so a worker writing through it would wait for
+the loop to wake — the very thing it is trying to cause. `try_clone_writer`
+already existed for the bridge; the server uses it the same way. Every server
+write then had to move onto that one handle: two handles to one socket are two
+different mutexes, and the loop's responses interleaved with a worker's requests
+into a line that was not valid JSON. This incidentally fixes a task worker's log
+records being stuck behind the loop's read.
+
+**Where it does not apply.** Splitting the transport and bounding a read are
+both required. The HTTP transport can do neither, so workers there are refused
+exactly as before, and tasks move `working -> completed | failed | cancelled`.
+The same holds for any custom transport that has not implemented
+`set_read_timeout`.
+
+**Downstream impact:** none required. A server that never elicits inside a task
+is unaffected; one that wants to now can.
 
 ### 3.6 Tasks are opt-in
 
@@ -284,9 +366,9 @@ shared state (an `Arc<Db>`, a config) this is invisible. For one holding
 per-request mutable state it is a real semantic difference — **document it in
 your server if that applies.**
 
-### 3.7 Task IDs use OS entropy, with a fallback
+### 3.7 Task IDs use the platform CSPRNG
 
-**Confidence: medium-high. REVIEW the non-unix path.**
+**Confidence: high. RESOLVED — the non-unix path no longer differs.**
 
 The spec is blunt:
 
@@ -296,14 +378,25 @@ The spec is blunt:
 That is every stdio server — the task ID is the only thing protecting a task's
 results. So this is not decoration.
 
-We take no `getrandom`/`rand` dependency, so: on unix, read 16 bytes from
-`/dev/urandom`. Elsewhere, fall back to `RandomState`, whose keys the standard
-library seeds from the platform CSPRNG, mixed with a counter and the clock.
+**RESOLVED** — was "the unix path is solid, the fallback is best-effort, REVIEW
+the non-unix path".
 
-**The unix path is solid. The fallback is best-effort** — `RandomState`
-increments its key per call within a thread after the first, so the mixing is
-doing real work there. Every deployment target for this crate today is unix. If
-Windows becomes a target, add `getrandom`.
+The original code read `/dev/urandom` on unix and fell back to `RandomState`
+mixed with a counter and the clock elsewhere. Unpredictable in practice, but not
+a CSPRNG, and not something to rest a security property on.
+
+Task ids now come from `getrandom` on every target, which is the platform source
+directly: `getrandom(2)` on Linux, `arc4random_buf` on the BSDs and macOS,
+`ProcessPrng` on Windows. That deletes the `cfg(unix)` split and the hand-rolled
+`/dev/urandom` read. It is the same crate `rand` uses for this, has no async in
+its tree, and adds `cfg-if` next to the `libc` we already depend on.
+
+The `RandomState` mixer survives only for a platform with no entropy source at
+all, since panicking inside a tool call is worse than a degraded id. It says so
+on stderr if it is ever reached.
+
+Entropy is tested per-bit now rather than only for uniqueness — a source stuck
+in its high bytes still produces unique-looking ids.
 
 We also do **not** declare `tasks.list` conditionally on auth context, though
 the spec suggests receivers that cannot identify requestors `SHOULD NOT`
@@ -394,7 +487,6 @@ error.
 | `completion/complete` | Optional; we declare no `completions` capability, which is compliant. Nothing downstream has completable arguments. |
 | `resources/subscribe` | Optional; we declare no `subscribe`. No downstream resource changes after registration. |
 | `notifications/*/list_changed` | Optional; we declare no `listChanged`. Tool/resource/prompt sets are fixed at startup. |
-| Task `input_required` | See §3.5. |
 | Per-auth-context task binding | Meaningful only for a hosted HTTP deployment. See §3.7. |
 | Acting on `notifications/cancelled` | Accepted and ignored. The server is single-threaded per request, so there is nothing to interrupt; task cancellation goes through `tasks/cancel`, which is implemented. |
 | SSE resumability (`Last-Event-ID`) | Our HTTP transport buffers a whole response and returns it as one body. There is no long-lived stream to resume. |
@@ -403,24 +495,55 @@ error.
 
 ---
 
-## 5. Known test flake (pre-existing)
+## 5. Test flakes (all fixed)
 
-`bridge::tests::test_auto_start_connects_to_running_daemon` fails
-intermittently, roughly 1 run in 4, and only on the first run after a fresh
-build. It races a real daemon spawn against a 5-second deadline.
+Three, all pre-existing. The first was the one on the list; the other two
+surfaced while stress-running the suite to confirm it was gone.
 
-**This predates these changes** — verified by running it on the unmodified base
-commit (`4378095`) in a clean worktree, where it fails the same way. The larger
-test suite here makes it slightly more likely by loading the machine. Worth
-fixing separately; not touched.
+### `bridge::tests::test_auto_start_connects_to_running_daemon`
 
----
+Failed roughly one run in four. Not a test bug — a real one in `auto_start`.
+
+It treated "socket file present, PID file absent" as an orphaned socket and
+deleted it. That is also exactly what a healthy `UnixServer::serve` daemon looks
+like, because only `serve_daemon` writes a PID file. A daemon that finished
+binding in the window between the opening connect attempt and the `exists()`
+check had its socket unlinked out from under it: still listening, on an inode
+with no name, unreachable until its idle timeout.
+
+Removal now requires proof. `probe_socket` connects, and only `ECONNREFUSED`,
+`ENOENT`, or `ENOTSOCK` count as "dead". `EACCES` or a backlog-full `EAGAIN`
+prove nothing and leave the file alone. A single `ECONNREFUSED` is ambiguous on
+the BSDs — a saturated listener refuses identically — so the probe repeats, and
+any successful connect ends it early and hands back that live connection instead
+of a deletion.
+
+The test dropped its retry loop: it waits for the daemon as setup, then calls
+`auto_start` once, which is the behaviour under test.
+
+### `test_sigterm_clean_shutdown` / `test_sigint_clean_shutdown`
+
+Waited for the socket and PID file to disappear, then immediately asserted the
+process was dead. The daemon removes those files and *then* unwinds and exits —
+separate moments, and a loaded machine deschedules it in between. Both now wait
+for the exit on the same 5s budget as every other wait, so a daemon that
+genuinely hangs still fails the test.
+
+### `test_daemon_survives_parent_exit`
+
+`example_binary()` ran `cargo build --example unix_server` from inside each of
+the five integration tests, concurrently. Cargo publishes the example by
+unlinking and re-linking `target/debug/examples/unix_server`, so a test that had
+just checked `exists()` could spawn a path another build had removed — `ENOENT`
+from `spawn`, roughly one run in ten. The build happens once behind a `LazyLock`
+now.
 
 ## 6. Verification
 
-- 396 tests, all passing, `--all-features`
+- 472 tests, all passing, `--all-features` (465 unit + 5 integration + 2 doc)
 - `cargo clippy --all-features --all-targets`: clean
 - `cargo fmt --check`: clean
+- suite run 12+ consecutive times to confirm the flakes above are gone
 
 Conformance checks that exist specifically as regression guards:
 
@@ -429,5 +552,11 @@ Conformance checks that exist specifically as regression guards:
 - JSON-RPC batch arrays are rejected with `-32600`, not an opaque parse error
 - task IDs are unique, 128-bit, and non-sequential
 - `tasks/result` genuinely blocks until the task finishes
-- a task worker cannot make a server-initiated request (deadlock guard)
+- a task worker's elicitation completes, including while `tasks/result` is
+  outstanding on that same task (the deadlock this design exists to avoid)
+- a task worker is still refused where the transport cannot be pumped
+- an expired server-initiated request cannot have its late answer mistaken for
+  the next request's
+- a read that times out mid-message keeps the bytes it already had
+- `auto_start` never unlinks a socket a daemon is listening on
 - an audience-less token is rejected
