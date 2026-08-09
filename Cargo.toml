@@ -24,6 +24,7 @@ jsonwebtoken = { version = "9", optional = true }
 
 # HTTP server (tiny, sync, no deps)
 tiny_http = { version = "0.12", optional = true }
+boon = "0.6"
 
 # Unix daemon syscalls (fork, setsid, dup2, kill) for UnixServer::serve_daemon.
 # Unix-only, always available there - no feature flag (matches #[cfg(unix)] gating).
