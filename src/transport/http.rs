@@ -90,7 +90,7 @@ use std::io::Cursor;
 use tiny_http::{Header, Method, Request as TinyRequest, Response, Server as TinyServer};
 
 #[cfg(feature = "auth")]
-use crate::auth::{Claims, JwtValidator};
+use crate::auth::{Claims, JwtValidator, ProtectedResourceMetadata, unauthorized_challenge};
 
 /// Setup function type for configuring tools on each request
 type SetupFn<C> = Box<dyn Fn(&mut Server<C>) -> Result<()> + Send + Sync>;
@@ -164,6 +164,10 @@ pub struct HttpServer<C> {
     endpoint: String,
     setup: Option<SetupFn<C>>,
     origin_policy: OriginPolicy,
+    /// Served at the RFC 9728 well-known path, and pointed at by the
+    /// `WWW-Authenticate` challenge on a 401.
+    #[cfg(feature = "auth")]
+    protected_resource: Option<ProtectedResourceMetadata>,
 }
 
 impl<C: Send + Sync + 'static> HttpServer<C> {
@@ -177,6 +181,8 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             endpoint: "/mcp".to_string(),
             setup: None,
             origin_policy: OriginPolicy::default(),
+            #[cfg(feature = "auth")]
+            protected_resource: None,
         }
     }
 
@@ -203,6 +209,67 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         self
     }
 
+    /// Publish OAuth 2.0 Protected Resource Metadata (RFC 9728).
+    ///
+    /// The spec makes this a MUST for protected servers: "MCP servers **MUST**
+    /// implement OAuth 2.0 Protected Resource Metadata to indicate the
+    /// locations of authorization servers."
+    ///
+    /// Setting it does two things:
+    ///
+    /// - serves the document at the well-known path derived from the resource
+    ///   URI, over GET, with no authentication
+    /// - adds `WWW-Authenticate: Bearer resource_metadata="...", scope="..."`
+    ///   to every 401, which is the discovery path clients try first
+    ///
+    /// ```ignore
+    /// let resource = ResourceUri::parse("https://mcp.example.com/mcp")?;
+    /// HttpServer::new(config)
+    ///     .protected_resource(
+    ///         ProtectedResourceMetadata::new(resource.clone(), ["https://auth.example.com"])
+    ///             .with_scopes(["files:read"]),
+    ///     )
+    ///     .serve_with_auth(addr, JwtValidator::rs256_pem(key)?.for_resource(&resource), ..)?;
+    /// ```
+    #[cfg(feature = "auth")]
+    pub fn protected_resource(mut self, metadata: ProtectedResourceMetadata) -> Self {
+        self.protected_resource = Some(metadata);
+        self
+    }
+
+    /// The `WWW-Authenticate` challenge to attach to a 401, if metadata is
+    /// published.
+    #[cfg(feature = "auth")]
+    fn challenge(&self) -> Option<String> {
+        let metadata = self.protected_resource.as_ref()?;
+        let url = metadata.resource_uri().ok()?.metadata_url();
+        Some(unauthorized_challenge(&url, &metadata.scopes_supported))
+    }
+
+    /// Serve the metadata document when this request is asking for it.
+    #[cfg(feature = "auth")]
+    fn protected_resource_response(&self, request: &TinyRequest) -> Option<HttpResponse> {
+        let metadata = self.protected_resource.as_ref()?;
+        let path = metadata.resource_uri().ok()?.metadata_path();
+        if request.url() != path {
+            return None;
+        }
+
+        // Discovery must work before the client has a token, so this endpoint
+        // is deliberately unauthenticated - it contains nothing secret.
+        if request.method() != &Method::Get {
+            return Some(error_response(405, -32600, "Method Not Allowed"));
+        }
+
+        let body = serde_json::to_string(metadata).ok()?;
+        Some(
+            Response::from_string(body).with_header(
+                Header::from_bytes("Content-Type", "application/json")
+                    .expect("static Content-Type header is valid"),
+            ),
+        )
+    }
+
     /// Configure tools via a setup closure
     ///
     /// The closure is called for each request to set up a fresh server.
@@ -219,6 +286,13 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     ///
     /// Returns `Some(response)` when the request must be rejected.
     fn precheck(&self, request: &TinyRequest) -> Option<HttpResponse> {
+        // Discovery is served before the endpoint check, since it lives at a
+        // different path by design.
+        #[cfg(feature = "auth")]
+        if let Some(response) = self.protected_resource_response(request) {
+            return Some(response);
+        }
+
         if request.url() != self.endpoint {
             return Some(error_response(404, -32600, "Not Found"));
         }
@@ -241,6 +315,20 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         }
 
         None
+    }
+
+    /// A 401 carrying the `WWW-Authenticate` challenge, when metadata is
+    /// published for clients to discover the authorization server from.
+    #[cfg(feature = "auth")]
+    fn unauthorized(&self, message: impl AsRef<str>) -> HttpResponse {
+        let response = error_response(401, -32600, message);
+        match self.challenge() {
+            Some(challenge) => match Header::from_bytes("WWW-Authenticate", challenge) {
+                Ok(header) => response.with_header(header),
+                Err(_) => response,
+            },
+            None => response,
+        }
     }
 
     /// Read the request body, or produce the 400 response to send instead.
@@ -358,21 +446,14 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
                     }
                     Err(e) => {
                         eprintln!("  ✗ Auth failed: {}", e);
-                        let _ = request.respond(error_response(
-                            401,
-                            -32600,
-                            format!("Unauthorized: {}", e),
-                        ));
+                        let _ = request.respond(self.unauthorized(format!("Unauthorized: {}", e)));
                         continue;
                     }
                 },
                 None => {
                     eprintln!("  ✗ No Authorization header");
-                    let _ = request.respond(error_response(
-                        401,
-                        -32600,
-                        "Unauthorized: Missing Authorization header",
-                    ));
+                    let _ = request
+                        .respond(self.unauthorized("Unauthorized: Missing Authorization header"));
                     continue;
                 }
             };
@@ -1265,6 +1346,218 @@ mod http_server_tests {
             assert_eq!(status, 401);
 
             drop(handle);
+        }
+
+        //
+        // RFC 8707 / RFC 9728
+        //
+
+        use crate::auth::{ProtectedResourceMetadata, ResourceUri};
+
+        const RESOURCE: &str = "https://mcp.example.com/mcp";
+
+        fn metadata() -> ProtectedResourceMetadata {
+            ProtectedResourceMetadata::new(
+                ResourceUri::parse(RESOURCE).unwrap(),
+                ["https://auth.example.com"],
+            )
+            .with_scopes(["files:read", "files:write"])
+        }
+
+        /// Token with an explicit audience, so RFC 8707 validation has
+        /// something to check.
+        fn make_token_for(audience: Option<&str>) -> String {
+            #[derive(Serialize)]
+            struct AudClaims {
+                sub: String,
+                tenant_id: String,
+                exp: u64,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                aud: Option<String>,
+            }
+
+            let claims = AudClaims {
+                sub: "alice".into(),
+                tenant_id: "tenant-1".into(),
+                exp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600,
+                aud: audience.map(String::from),
+            };
+
+            encode(
+                &JwtHeader::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(SECRET),
+            )
+            .unwrap()
+        }
+
+        /// Spawn an authenticated server bound to the canonical resource URI.
+        fn spawn_protected_server() -> String {
+            let addr = format!("127.0.0.1:{}", next_port());
+            let server_addr = addr.clone();
+
+            thread::spawn(move || {
+                let resource = ResourceUri::parse(RESOURCE).unwrap();
+                let _ = HttpServer::new(ServerConfig {
+                    name: "protected".into(),
+                    ..Default::default()
+                })
+                .protected_resource(metadata())
+                .with_tools(|s: &mut Server<AuthContext>| {
+                    s.add_tool(WhoamiTool)?;
+                    Ok(())
+                })
+                .serve_with_auth(
+                    &server_addr,
+                    JwtValidator::hs256(SECRET).for_resource(&resource),
+                    |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
+                    },
+                );
+            });
+
+            thread::sleep(Duration::from_millis(100));
+            addr
+        }
+
+        #[test]
+        fn test_protected_resource_metadata_is_served_unauthenticated() {
+            // Discovery has to work before the client has a token.
+            let addr = spawn_protected_server();
+            let (status, content_type, body) = http_request(
+                &addr,
+                "GET",
+                "/.well-known/oauth-protected-resource/mcp",
+                "",
+                &[],
+            )
+            .unwrap();
+
+            assert_eq!(status, 200);
+            assert_eq!(content_type, "application/json");
+
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["resource"], RESOURCE);
+            assert_eq!(
+                parsed["authorization_servers"][0],
+                "https://auth.example.com"
+            );
+            assert_eq!(parsed["scopes_supported"][0], "files:read");
+            assert_eq!(parsed["bearer_methods_supported"][0], "header");
+        }
+
+        #[test]
+        fn test_unauthorized_response_carries_the_discovery_challenge() {
+            let addr = spawn_protected_server();
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                addr,
+                body.len(),
+                body
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+
+            assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+            let challenge = response
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("www-authenticate:"))
+                .expect("401 must carry a WWW-Authenticate challenge");
+
+            assert!(challenge.contains(
+                "resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource/mcp\""
+            ));
+            // Naming the scopes is a SHOULD, and saves the client a guess.
+            assert!(challenge.contains("scope=\"files:read files:write\""));
+        }
+
+        #[test]
+        fn test_token_for_another_audience_is_rejected() {
+            // The RFC 8707 MUST: a token minted for some other service must not
+            // be usable here.
+            let addr = spawn_protected_server();
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+            let foreign = make_token_for(Some("https://other.example.com/mcp"));
+            let (status, _, _) = http_post_with_auth(&addr, "/mcp", body, Some(&foreign)).unwrap();
+            assert_eq!(status, 401, "foreign-audience token must be rejected");
+
+            // A token with no audience at all is equally unusable.
+            let audienceless = make_token_for(None);
+            let (status, _, _) =
+                http_post_with_auth(&addr, "/mcp", body, Some(&audienceless)).unwrap();
+            assert_eq!(status, 401, "audience-less token must be rejected");
+        }
+
+        #[test]
+        fn test_token_for_this_resource_is_accepted() {
+            let addr = spawn_protected_server();
+            let token = make_token_for(Some(RESOURCE));
+            let body =
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami"}}"#;
+
+            let (status, _, response) =
+                http_post_with_auth(&addr, "/mcp", body, Some(&token)).unwrap();
+
+            assert_eq!(status, 200);
+            assert!(response.contains("User: alice"));
+        }
+
+        #[test]
+        fn test_metadata_endpoint_rejects_non_get() {
+            let addr = spawn_protected_server();
+            let (status, _, _) = http_request(
+                &addr,
+                "POST",
+                "/.well-known/oauth-protected-resource/mcp",
+                "",
+                &[],
+            )
+            .unwrap();
+            assert_eq!(status, 405);
+        }
+
+        #[test]
+        fn test_no_metadata_means_no_challenge() {
+            // A server that publishes nothing still 401s, just without the
+            // discovery hint.
+            let addr = format!("127.0.0.1:{}", next_port());
+            let server_addr = addr.clone();
+            thread::spawn(move || {
+                let _ = HttpServer::new(ServerConfig::default())
+                    .with_tools(|s: &mut Server<AuthContext>| {
+                        s.add_tool(WhoamiTool)?;
+                        Ok(())
+                    })
+                    .serve_with_auth(&server_addr, JwtValidator::hs256(SECRET), |claims| {
+                        AuthContext {
+                            user_id: claims.user_id().to_string(),
+                        }
+                    });
+            });
+            thread::sleep(Duration::from_millis(100));
+
+            let (status, _, _) = http_request(
+                &addr,
+                "GET",
+                "/.well-known/oauth-protected-resource",
+                "",
+                &[],
+            )
+            .unwrap();
+            assert_eq!(status, 404, "nothing is published at the well-known path");
         }
 
         #[test]
