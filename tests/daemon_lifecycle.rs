@@ -32,8 +32,14 @@ fn pid_path(socket: &Path) -> PathBuf {
     p
 }
 
-/// Build the example and return the binary path.
-fn example_binary() -> PathBuf {
+/// The `unix_server` example, built once for the whole test binary.
+///
+/// Building per test raced: every test runs in its own thread, cargo replaces
+/// `target/debug/examples/unix_server` by unlinking and re-linking it, and a
+/// test that checked `exists()` just before another build's unlink would go on
+/// to spawn a path that had ceased to exist. Building once behind a
+/// `LazyLock` removes the window along with four redundant builds.
+static EXAMPLE_BINARY: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
     let status = Command::new(env!("CARGO"))
         .args(["build", "--example", "unix_server"])
         .stdout(std::process::Stdio::null())
@@ -49,6 +55,11 @@ fn example_binary() -> PathBuf {
     path.push("unix_server");
     assert!(path.exists(), "example binary not found at {:?}", path);
     path
+});
+
+/// Path to the built example.
+fn example_binary() -> PathBuf {
+    EXAMPLE_BINARY.clone()
 }
 
 /// Wait for a file to appear on disk, with timeout.
@@ -90,6 +101,23 @@ fn kill(pid: i32, signal: libc::c_int) -> bool {
 /// Check if a process is alive.
 fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Wait for a process to exit, with timeout.
+///
+/// A daemon removes its socket and PID file and *then* returns from `serve`,
+/// unwinds, and exits. Those are separate moments, so checking liveness the
+/// instant the files disappear is a race - one the machine loses whenever it is
+/// busy enough to deschedule the daemon in between.
+fn wait_for_death(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !alive(pid) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
 }
 
 /// Connect to a socket, retrying until it's ready.
@@ -254,7 +282,10 @@ fn test_sigterm_clean_shutdown() {
         wait_for_removal(&pid_file, Duration::from_secs(5)),
         "PID file should be removed after SIGTERM"
     );
-    assert!(!alive(pid), "daemon should be dead after SIGTERM");
+    assert!(
+        wait_for_death(pid, Duration::from_secs(5)),
+        "daemon should exit after SIGTERM"
+    );
 }
 
 #[test]
@@ -287,7 +318,10 @@ fn test_sigint_clean_shutdown() {
         wait_for_removal(&pid_file, Duration::from_secs(5)),
         "PID file should be removed after SIGINT"
     );
-    assert!(!alive(pid), "daemon should be dead after SIGINT");
+    assert!(
+        wait_for_death(pid, Duration::from_secs(5)),
+        "daemon should exit after SIGINT"
+    );
 }
 
 #[test]
