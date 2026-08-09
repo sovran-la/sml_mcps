@@ -2,6 +2,7 @@
 //!
 //! Abstracts communication between client and server.
 
+mod origin;
 mod stdio;
 
 #[cfg(feature = "http")]
@@ -13,6 +14,7 @@ mod unix;
 #[cfg(unix)]
 mod unix_server;
 
+pub use origin::OriginPolicy;
 pub use stdio::StdioTransport;
 
 #[cfg(feature = "http")]

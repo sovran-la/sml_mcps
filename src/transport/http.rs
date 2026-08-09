@@ -86,13 +86,48 @@ impl Transport for HttpTransport {
 //
 
 use crate::server::{Server, ServerConfig};
-use tiny_http::{Header, Method, Response, Server as TinyServer};
+use crate::transport::OriginPolicy;
+use std::io::Cursor;
+use tiny_http::{Header, Method, Request as TinyRequest, Response, Server as TinyServer};
 
 #[cfg(feature = "auth")]
 use crate::auth::{Claims, JwtValidator};
 
 /// Setup function type for configuring tools on each request
 type SetupFn<C> = Box<dyn Fn(&mut Server<C>) -> Result<()> + Send + Sync>;
+
+/// A ready-to-send HTTP response with an owned body.
+type HttpResponse = Response<Cursor<Vec<u8>>>;
+
+/// Look up a request header case-insensitively.
+fn header_value<'a>(request: &'a TinyRequest, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str())
+}
+
+/// Build an error response whose body is a JSON-RPC error object.
+///
+/// The spec permits (and dual-era clients benefit from) HTTP error responses
+/// carrying a JSON-RPC *error response* with no `id` - a plain-text body forces
+/// clients to guess why the request failed.
+fn error_response(status: u16, code: i32, message: impl AsRef<str>) -> HttpResponse {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": { "code": code, "message": message.as_ref() },
+    })
+    .to_string();
+
+    Response::from_string(body)
+        .with_status_code(status)
+        .with_header(
+            // Constructed from a string literal that is always a valid header.
+            Header::from_bytes("Content-Type", "application/json")
+                .expect("static Content-Type header is valid"),
+        )
+}
 
 /// High-level HTTP MCP server
 ///
@@ -129,21 +164,43 @@ pub struct HttpServer<C> {
     config: ServerConfig,
     endpoint: String,
     setup: Option<SetupFn<C>>,
+    origin_policy: OriginPolicy,
 }
 
 impl<C: Send + Sync + 'static> HttpServer<C> {
     /// Create a new HTTP server with the given configuration
+    ///
+    /// The `Origin` policy defaults to [`OriginPolicy::Loopback`]. Bind to
+    /// `127.0.0.1` unless you specifically intend to be reachable off-host.
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config,
             endpoint: "/mcp".to_string(),
             setup: None,
+            origin_policy: OriginPolicy::default(),
         }
     }
 
     /// Set the endpoint path (default: "/mcp")
     pub fn endpoint(mut self, path: impl Into<String>) -> Self {
         self.endpoint = path.into();
+        self
+    }
+
+    /// Set which `Origin` headers are accepted (default:
+    /// [`OriginPolicy::Loopback`]).
+    ///
+    /// Requests carrying an `Origin` the policy rejects are answered with
+    /// HTTP 403, as the spec requires. Requests with no `Origin` header at all
+    /// - which is every non-browser client - are unaffected.
+    ///
+    /// ```ignore
+    /// HttpServer::new(config)
+    ///     .origin_policy(OriginPolicy::allowlist(["https://app.example.com"]))
+    ///     .serve("127.0.0.1:3000", || Ctx::new())?;
+    /// ```
+    pub fn origin_policy(mut self, policy: OriginPolicy) -> Self {
+        self.origin_policy = policy;
         self
     }
 
@@ -156,6 +213,63 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     {
         self.setup = Some(Box::new(setup));
         self
+    }
+
+    /// Run the transport-level checks every request must pass, regardless of
+    /// authentication: endpoint path, HTTP method, and `Origin`.
+    ///
+    /// Returns `Some(response)` when the request must be rejected.
+    fn precheck(&self, request: &TinyRequest) -> Option<HttpResponse> {
+        if request.url() != self.endpoint {
+            return Some(error_response(404, -32600, "Not Found"));
+        }
+
+        if request.method() != &Method::Post {
+            return Some(error_response(405, -32600, "Method Not Allowed"));
+        }
+
+        // Only a *present* Origin is validated. Non-browser clients omit it,
+        // and DNS rebinding requires a browser, which always sends it.
+        if let Some(origin) = header_value(request, "Origin") {
+            if !self.origin_policy.is_allowed(origin) {
+                eprintln!("  ✗ Rejected Origin: {}", origin);
+                return Some(error_response(
+                    403,
+                    -32600,
+                    format!("Forbidden: disallowed Origin `{}`", origin),
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// Read the request body, or produce the 400 response to send instead.
+    fn read_body(request: &mut TinyRequest) -> std::result::Result<String, HttpResponse> {
+        let mut body = String::new();
+        match request.as_reader().read_to_string(&mut body) {
+            Ok(_) => Ok(body),
+            Err(e) => {
+                eprintln!("  Failed to read body: {}", e);
+                Err(error_response(400, -32700, "Bad Request: unreadable body"))
+            }
+        }
+    }
+
+    /// Turn a processed result into the HTTP response to send.
+    fn finish(&self, outcome: Result<(String, &'static str)>) -> HttpResponse {
+        match outcome {
+            Ok((response_body, content_type)) => {
+                eprintln!("  Response ({}): {}", content_type, response_body);
+                let header = Header::from_bytes("Content-Type", content_type)
+                    .expect("static Content-Type header is valid");
+                Response::from_data(response_body.into_bytes()).with_header(header)
+            }
+            Err(e) => {
+                eprintln!("  Error: {}", e);
+                error_response(500, -32603, format!("Internal error: {}", e))
+            }
+        }
     }
 
     /// Serve without authentication
@@ -174,53 +288,27 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         );
 
         for mut request in http_server.incoming_requests() {
-            let path = request.url().to_string();
-            let method = request.method().clone();
+            eprintln!("{} {}", request.method(), request.url());
 
-            eprintln!("{} {}", method, path);
-
-            // Validate endpoint
-            if path != self.endpoint {
-                let response = Response::from_string("Not Found").with_status_code(404);
-                let _ = request.respond(response);
+            if let Some(rejection) = self.precheck(&request) {
+                let _ = request.respond(rejection);
                 continue;
             }
 
-            // Validate method
-            if method != Method::Post {
-                let response = Response::from_string("Method Not Allowed").with_status_code(405);
-                let _ = request.respond(response);
-                continue;
-            }
-
-            // Read body
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                eprintln!("  Failed to read body: {}", e);
-                let response = Response::from_string("Bad Request").with_status_code(400);
-                let _ = request.respond(response);
-                continue;
-            }
+            let body = match Self::read_body(&mut request) {
+                Ok(body) => body,
+                Err(rejection) => {
+                    let _ = request.respond(rejection);
+                    continue;
+                }
+            };
 
             eprintln!("  Request: {}", body);
 
-            // Process request
             let mut ctx = context_factory();
-            match self.process_request(body, &mut ctx) {
-                Ok((response_body, content_type)) => {
-                    eprintln!("  Response ({}): {}", content_type, response_body);
-                    let header = Header::from_bytes("Content-Type", content_type).unwrap();
-                    let response = Response::from_string(response_body).with_header(header);
-                    if let Err(e) = request.respond(response) {
-                        eprintln!("  Failed to send response: {}", e);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  Error: {}", e);
-                    let response = Response::from_string(format!("Internal Error: {}", e))
-                        .with_status_code(500);
-                    let _ = request.respond(response);
-                }
+            let response = self.finish(self.process_request(body, &mut ctx));
+            if let Err(e) = request.respond(response) {
+                eprintln!("  Failed to send response: {}", e);
             }
         }
 
@@ -249,34 +337,15 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         );
 
         for mut request in http_server.incoming_requests() {
-            let path = request.url().to_string();
-            let method = request.method().clone();
+            eprintln!("{} {}", request.method(), request.url());
 
-            eprintln!("{} {}", method, path);
-
-            // Validate endpoint
-            if path != self.endpoint {
-                let response = Response::from_string("Not Found").with_status_code(404);
-                let _ = request.respond(response);
-                continue;
-            }
-
-            // Validate method
-            if method != Method::Post {
-                let response = Response::from_string("Method Not Allowed").with_status_code(405);
-                let _ = request.respond(response);
+            if let Some(rejection) = self.precheck(&request) {
+                let _ = request.respond(rejection);
                 continue;
             }
 
             // JWT Authentication
-            let auth_header = request
-                .headers()
-                .iter()
-                .find(|h| {
-                    let field = h.field.as_str();
-                    field == "Authorization" || field == "authorization"
-                })
-                .map(|h| h.value.as_str());
+            let auth_header = header_value(&request, "Authorization");
 
             let claims = match auth_header {
                 Some(header) => match validator.validate_header(header) {
@@ -290,50 +359,40 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
                     }
                     Err(e) => {
                         eprintln!("  ✗ Auth failed: {}", e);
-                        let response = Response::from_string(format!("Unauthorized: {}", e))
-                            .with_status_code(401);
-                        let _ = request.respond(response);
+                        let _ = request.respond(error_response(
+                            401,
+                            -32600,
+                            format!("Unauthorized: {}", e),
+                        ));
                         continue;
                     }
                 },
                 None => {
                     eprintln!("  ✗ No Authorization header");
-                    let response =
-                        Response::from_string("Unauthorized: Missing Authorization header")
-                            .with_status_code(401);
-                    let _ = request.respond(response);
+                    let _ = request.respond(error_response(
+                        401,
+                        -32600,
+                        "Unauthorized: Missing Authorization header",
+                    ));
                     continue;
                 }
             };
 
-            // Read body
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                eprintln!("  Failed to read body: {}", e);
-                let response = Response::from_string("Bad Request").with_status_code(400);
-                let _ = request.respond(response);
-                continue;
-            }
+            let body = match Self::read_body(&mut request) {
+                Ok(body) => body,
+                Err(rejection) => {
+                    let _ = request.respond(rejection);
+                    continue;
+                }
+            };
 
             eprintln!("  Request: {}", body);
 
             // Process request with auth context
             let mut ctx = context_factory(&claims);
-            match self.process_request(body, &mut ctx) {
-                Ok((response_body, content_type)) => {
-                    eprintln!("  Response ({}): {}", content_type, response_body);
-                    let header = Header::from_bytes("Content-Type", content_type).unwrap();
-                    let response = Response::from_string(response_body).with_header(header);
-                    if let Err(e) = request.respond(response) {
-                        eprintln!("  Failed to send response: {}", e);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  Error: {}", e);
-                    let response = Response::from_string(format!("Internal Error: {}", e))
-                        .with_status_code(500);
-                    let _ = request.respond(response);
-                }
+            let response = self.finish(self.process_request(body, &mut ctx));
+            if let Err(e) = request.respond(response) {
+                eprintln!("  Failed to send response: {}", e);
             }
         }
 
@@ -523,22 +582,35 @@ mod http_server_tests {
         }
     }
 
-    /// Helper to make raw HTTP POST request
-    fn http_post(addr: &str, path: &str, body: &str) -> std::io::Result<(u16, String, String)> {
+    /// Helper to make a raw HTTP request with an arbitrary method and headers
+    fn http_request(
+        addr: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> std::io::Result<(u16, String, String)> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
+        let extra: String = extra_headers
+            .iter()
+            .map(|(k, v)| format!("{}: {}\r\n", k, v))
+            .collect();
+
         let request = format!(
-            "POST {} HTTP/1.1\r\n\
+            "{} {} HTTP/1.1\r\n\
              Host: {}\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
-             Connection: close\r\n\
+             {}Connection: close\r\n\
              \r\n\
              {}",
+            method,
             path,
             addr,
             body.len(),
+            extra,
             body
         );
 
@@ -567,6 +639,167 @@ mod http_server_tests {
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
 
         Ok((status_code, content_type, body))
+    }
+
+    /// Helper to make raw HTTP POST request
+    fn http_post(addr: &str, path: &str, body: &str) -> std::io::Result<(u16, String, String)> {
+        http_request(addr, "POST", path, body, &[])
+    }
+
+    /// Helper to POST with an `Origin` header
+    fn http_post_with_origin(
+        addr: &str,
+        path: &str,
+        body: &str,
+        origin: &str,
+    ) -> std::io::Result<(u16, String, String)> {
+        http_request(addr, "POST", path, body, &[("Origin", origin)])
+    }
+
+    /// Spin up a server on a fresh port with the given origin policy and return
+    /// its address. The server thread is detached; it dies with the test binary.
+    fn spawn_server(policy: OriginPolicy) -> String {
+        let addr = format!("127.0.0.1:{}", next_port());
+
+        let config = ServerConfig {
+            name: "test-server".into(),
+            version: "1.0.0".into(),
+            instructions: None,
+            ..Default::default()
+        };
+
+        let server_addr = addr.clone();
+        thread::spawn(move || {
+            let counter = Arc::new(AtomicI64::new(0));
+            let _ = HttpServer::new(config)
+                .origin_policy(policy)
+                .with_tools(|s: &mut Server<TestContext>| {
+                    s.add_tool(EchoTool)?;
+                    Ok(())
+                })
+                .serve(&server_addr, move || TestContext {
+                    counter: counter.clone(),
+                });
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        addr
+    }
+
+    const PING: &str = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    #[test]
+    fn test_origin_absent_is_allowed() {
+        // Non-browser clients send no Origin at all. They must keep working.
+        let addr = spawn_server(OriginPolicy::Loopback);
+        let (status, _, _) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn test_origin_loopback_allowed() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+        for origin in [
+            "http://localhost",
+            "http://localhost:5173",
+            "http://127.0.0.1:8080",
+            "https://[::1]:3000",
+        ] {
+            let (status, _, body) = http_post_with_origin(&addr, "/mcp", PING, origin).unwrap();
+            assert_eq!(status, 200, "origin {origin} should be allowed: {body}");
+        }
+    }
+
+    #[test]
+    fn test_origin_remote_rejected_with_403() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        // The DNS rebinding shape: attacker page on a public origin.
+        let (status, content_type, body) =
+            http_post_with_origin(&addr, "/mcp", PING, "https://evil.example.com").unwrap();
+
+        assert_eq!(status, 403);
+        assert_eq!(content_type, "application/json");
+
+        // Body is a JSON-RPC error response with no `id`.
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert!(parsed.get("id").is_none());
+        assert_eq!(parsed["error"]["code"], -32600);
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("evil.example.com")
+        );
+    }
+
+    #[test]
+    fn test_origin_lookalike_hostname_rejected() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+        for origin in [
+            "http://localhost.evil.example.com",
+            "http://notlocalhost",
+            "http://192.168.1.10:3000",
+            "null",
+        ] {
+            let (status, _, _) = http_post_with_origin(&addr, "/mcp", PING, origin).unwrap();
+            assert_eq!(status, 403, "origin {origin} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_origin_allowlist_policy() {
+        let addr = spawn_server(OriginPolicy::allowlist(["https://app.example.com"]));
+
+        let (status, _, _) =
+            http_post_with_origin(&addr, "/mcp", PING, "https://app.example.com").unwrap();
+        assert_eq!(status, 200);
+
+        // Loopback is not implicitly allowed once an allowlist is set.
+        let (status, _, _) =
+            http_post_with_origin(&addr, "/mcp", PING, "http://localhost:3000").unwrap();
+        assert_eq!(status, 403);
+    }
+
+    #[test]
+    fn test_origin_any_policy_allows_everything() {
+        let addr = spawn_server(OriginPolicy::Any);
+        let (status, _, _) =
+            http_post_with_origin(&addr, "/mcp", PING, "https://evil.example.com").unwrap();
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn test_origin_checked_before_body_is_read() {
+        // A rejected Origin must not reach tool dispatch.
+        let addr = spawn_server(OriginPolicy::Loopback);
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"message":"pwned"}}}"#;
+        let (status, _, body) =
+            http_post_with_origin(&addr, "/mcp", call, "https://evil.example.com").unwrap();
+
+        assert_eq!(status, 403);
+        assert!(!body.contains("pwned"));
+    }
+
+    #[test]
+    fn test_non_post_methods_rejected_with_405() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+        for method in ["GET", "DELETE", "PUT"] {
+            let (status, _, _) = http_request(&addr, method, "/mcp", "", &[]).unwrap();
+            assert_eq!(status, 405, "{method} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_error_bodies_are_jsonrpc() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let (status, content_type, body) = http_post(&addr, "/nope", PING).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(content_type, "application/json");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["message"], "Not Found");
     }
 
     #[test]

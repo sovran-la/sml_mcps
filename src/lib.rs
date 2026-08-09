@@ -23,7 +23,7 @@ pub mod bridge;
 // Re-export commonly used types
 pub use pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
 pub use server::{LogLevel, PromptDef, Resource, Server, ServerConfig, Tool, ToolEnv};
-pub use transport::{StdioTransport, Transport};
+pub use transport::{OriginPolicy, StdioTransport, Transport};
 pub use types::*;
 
 #[cfg(feature = "http")]
