@@ -8,20 +8,28 @@
 //!
 //! Concurrency here is `std::thread` and a `Condvar`, not a runtime. The work
 //! genuinely runs in parallel with the server loop, so a polling client gets
-//! real answers while a task is in flight. `tasks/result` blocks on the
-//! condvar, which the spec requires ("it **MUST** block the response until the
+//! real answers while a task is in flight. `tasks/result` blocks until the task
+//! finishes, which the spec requires ("it **MUST** block the response until the
 //! task reaches a terminal status").
 //!
-//! ## What this implementation does not do
+//! ## Asking the requestor something mid-task
 //!
-//! The `input_required` status is never produced. Reaching it would mean a
-//! task worker sending an elicitation and waiting for the answer, but nothing
-//! would be reading the transport while it waited - the server loop is a single
-//! thread and `tasks/result` may itself be blocking on that very task. Rather
-//! than deadlock, task workers get a [`ToolEnv`](crate::ToolEnv) that refuses
-//! server-initiated requests outright. Tasks therefore move
-//! `working -> completed | failed | cancelled`, which is a legal subset of the
-//! state machine.
+//! A worker that elicits moves its task to `input_required` for as long as it
+//! waits, then back to `working`. Two things make that possible without
+//! deadlocking:
+//!
+//! - The worker does not read for itself. It writes its request through a
+//!   write handle independent of the one the server loop is blocked on, and
+//!   waits on a channel for whichever thread is reading to hand the answer over.
+//! - `tasks/result` pumps the transport while it blocks, instead of only
+//!   sleeping on the store. Otherwise the one reader would be asleep waiting for
+//!   a task that was waiting for an answer that could not be read.
+//!
+//! Both need a transport that can be split and can bound a read. Where that is
+//! not true - the HTTP transport, notably - task workers are refused
+//! server-initiated requests outright, and tasks move
+//! `working -> completed | failed | cancelled`, a legal subset of the state
+//! machine.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,7 +55,8 @@ pub enum TaskStatus {
     Working,
     /// The receiver needs input from the requestor.
     ///
-    /// Never produced by this implementation - see the module docs.
+    /// Entered while a task worker waits on an elicitation or sampling
+    /// request, and left again as soon as it has an answer.
     InputRequired,
     /// Finished successfully; the result is available.
     Completed,
@@ -366,6 +375,39 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Move a task between non-terminal states, honoring the state machine.
+    ///
+    /// This is how a task reaches `input_required`: a worker that needs an
+    /// answer from the requestor says so before it blocks, and says `working`
+    /// again once it has one. Use [`finish`](Self::finish) for terminal states,
+    /// which carry an outcome.
+    ///
+    /// Returns whether the move happened. An illegal transition is reported
+    /// rather than forced, and a task that has already finished or been
+    /// cancelled stays that way - the worker asking for input has simply not
+    /// noticed yet.
+    pub fn set_status(&self, task_id: &str, status: TaskStatus) -> Result<bool> {
+        if status.is_terminal() {
+            return Err(McpError::Internal(format!(
+                "use finish() to move task {task_id} to a terminal status"
+            )));
+        }
+
+        let mut tasks = self.lock()?;
+        let Some(record) = tasks.get_mut(task_id) else {
+            return Ok(false); // expired and swept while running
+        };
+        if !record.task.status.can_transition_to(status) {
+            return Ok(false);
+        }
+
+        record.task.status = status;
+        record.task.last_updated_at = iso8601(SystemTime::now());
+        drop(tasks);
+        self.changed.notify_all();
+        Ok(true)
+    }
+
     /// Attach a human-readable note without changing status.
     pub fn set_status_message(&self, task_id: &str, message: impl Into<String>) -> Result<()> {
         let mut tasks = self.lock()?;
@@ -411,10 +453,37 @@ impl TaskStore {
         Ok(task)
     }
 
+    /// The task's outcome if it has finished, or `None` while it runs.
+    ///
+    /// The non-blocking half of [`await_result`](Self::await_result), for a
+    /// caller that has something else to do between checks - such as reading
+    /// the transport, so a task waiting on `input_required` can be answered.
+    pub fn try_result(&self, task_id: &str) -> Result<Option<TaskOutcome>> {
+        let mut tasks = self.lock()?;
+        Self::sweep(&mut tasks, SystemTime::now());
+
+        let record = tasks.get(task_id).ok_or_else(|| not_found(task_id))?;
+        if !record.task.status.is_terminal() {
+            return Ok(None);
+        }
+        record
+            .outcome
+            .clone()
+            .ok_or_else(|| {
+                McpError::Internal(format!("task {task_id} is terminal but has no result"))
+            })
+            .map(Some)
+    }
+
     /// Block until the task is terminal, then return its outcome.
     ///
     /// The spec is explicit that `tasks/result` on a non-terminal task
     /// "**MUST** block the response until the task reaches a terminal status."
+    ///
+    /// This blocks on the store alone, so nothing reads the transport while it
+    /// waits - a task that asks for input during it can never be answered. It
+    /// is used only where the transport cannot be pumped; see
+    /// [`try_result`](Self::try_result).
     pub fn await_result(&self, task_id: &str) -> Result<TaskOutcome> {
         let mut tasks = self.lock()?;
         Self::sweep(&mut tasks, SystemTime::now());

@@ -12,13 +12,25 @@
 //! responsibility for everything it pulls off the wire:
 //!
 //! - the response it is waiting for -> returned to the waiter
-//! - a response for some *other* in-flight request -> parked for that waiter
+//! - a response for some *other* in-flight request -> handed to that waiter,
+//!   whichever thread it is on, or parked if it is on this call stack
 //! - anything else (a client request or notification) -> deferred, and
 //!   replayed to the main loop before it reads again
 //!
 //! Nothing is dropped and nothing is delivered twice.
 //!
-//! This works on any bidirectional transport (stdio, Unix socket). It cannot
+//! ## Waiting from a thread that cannot read
+//!
+//! A task worker runs on its own thread, where nothing reads the transport. It
+//! therefore cannot use the loop above. Instead it *registers* as a waiter and
+//! blocks on a channel: it writes its own request (writes need no reader), and
+//! whichever thread is reading hands the response over when it arrives.
+//!
+//! That is what makes `input_required` reachable. It relies on someone actually
+//! reading, which is why `tasks/result` pumps the transport while it blocks
+//! rather than only waiting on the store.
+//!
+//! This all works on any bidirectional transport (stdio, Unix socket). It cannot
 //! work on the HTTP transport, where a request carries exactly one message and
 //! there is no back-channel: the read simply fails and the waiter gets a clear
 //! error instead of hanging.
@@ -27,6 +39,7 @@ use crate::types::{JsonRpcMessage, JsonRpcResponse, McpError, RequestId, Result}
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 /// How many abandoned request ids to remember.
 ///
@@ -47,6 +60,12 @@ pub(crate) struct RequestBroker {
     deferred: Mutex<VecDeque<JsonRpcMessage>>,
     /// Requests nobody is waiting for any more, newest last.
     abandoned: Mutex<VecDeque<RequestId>>,
+    /// Waiters on other threads, by the request each is waiting for.
+    ///
+    /// A response for one of these is handed straight over rather than parked,
+    /// because the waiter is not on the reading thread and will never come back
+    /// to collect it.
+    waiters: Mutex<HashMap<RequestId, SyncSender<JsonRpcResponse>>>,
 }
 
 impl RequestBroker {
@@ -71,6 +90,42 @@ impl RequestBroker {
         self.parked.lock().ok()?.remove(id)
     }
 
+    /// Register a waiter that is not on the reading thread.
+    ///
+    /// The returned receiver yields the response once whoever is reading routes
+    /// it here. The channel holds one message, so the reader hands it over
+    /// without ever blocking.
+    pub(crate) fn register_waiter(&self, id: &RequestId) -> Result<Receiver<JsonRpcResponse>> {
+        let (sender, receiver) = sync_channel(1);
+        self.waiters
+            .lock()
+            .map_err(|_| McpError::Internal("Request broker lock poisoned".into()))?
+            .insert(id.clone(), sender);
+        Ok(receiver)
+    }
+
+    /// Route a response to whoever is waiting for it.
+    ///
+    /// Prefers a registered off-thread waiter, since parking a response for a
+    /// thread that is blocked on a channel would strand it. Falls back to
+    /// parking, which is how a waiter further down this call stack collects it.
+    pub(crate) fn deliver(&self, response: JsonRpcResponse) {
+        let waiter = self
+            .waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| waiters.remove(&response.id));
+
+        match waiter {
+            // A full or disconnected channel means the waiter gave up, so the
+            // response has nowhere useful to go.
+            Some(sender) => {
+                let _ = sender.try_send(response);
+            }
+            None => self.park(response),
+        }
+    }
+
     /// Park a response nobody is currently waiting on this call stack for.
     ///
     /// A response to a request that has since been abandoned is dropped: its
@@ -89,6 +144,9 @@ impl RequestBroker {
     pub(crate) fn abandon(&self, id: &RequestId) {
         if let Ok(mut parked) = self.parked.lock() {
             parked.remove(id);
+        }
+        if let Ok(mut waiters) = self.waiters.lock() {
+            waiters.remove(id);
         }
         if let Ok(mut abandoned) = self.abandoned.lock() {
             abandoned.push_back(id.clone());

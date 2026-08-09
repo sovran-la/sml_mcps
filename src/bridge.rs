@@ -380,6 +380,29 @@ mod tests {
         std::env::temp_dir().join(format!("sml_mcps_bridge_{}_{}_{}", pid, n, suffix))
     }
 
+    /// Create a socket file that is definitely bound to nobody.
+    ///
+    /// Binding and dropping a listener leaves the file behind, which is what a
+    /// crashed daemon leaves too. Teardown is not instantaneous though: under
+    /// load, a connect issued immediately afterwards occasionally still
+    /// succeeds. Since "nothing is listening" is this test's *premise* and not
+    /// its subject, wait for it to actually hold.
+    fn dead_socket(suffix: &str) -> PathBuf {
+        let path = temp_path(suffix);
+        {
+            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if UnixStream::connect(&path).is_err() {
+                return path;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("socket at {} never stopped accepting", path.display());
+    }
+
     // ---- process_alive / pid file ---------------------------------------
 
     #[test]
@@ -664,10 +687,7 @@ mod tests {
         let _ = std::fs::remove_file(&live);
 
         // Bound and then abandoned: the file outlives the listener.
-        let stale = temp_path("sock");
-        {
-            let _listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
-        }
+        let stale = dead_socket("sock");
         assert!(matches!(
             probe_socket(&stale, PROBE_ATTEMPTS, Duration::ZERO),
             Probe::Dead
@@ -760,11 +780,8 @@ mod tests {
 
     #[test]
     fn test_clear_socket_removes_a_confirmed_dead_socket_and_its_pid_file() {
-        let sock = temp_path("sock");
+        let sock = dead_socket("sock");
         let pid = pid_path_for(&sock);
-        {
-            let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        }
         std::fs::write(&pid, "2147483646\n").unwrap();
 
         assert!(clear_socket(&sock, Some(&pid)).is_none());

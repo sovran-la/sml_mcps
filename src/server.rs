@@ -23,9 +23,16 @@ use std::sync::{Arc, Mutex};
 ///
 /// Gives tools access to notifications, progress reporting, and resources.
 pub struct ToolEnv<'a> {
+    /// Where outgoing messages go.
+    ///
     /// `None` when the server was driven without a transport (direct dispatch
     /// in tests, for example). Sending is then a no-op rather than a panic.
+    ///
+    /// Independent of the read handle wherever the transport can be split, so a
+    /// task worker can write while the server loop sits blocked in `read`.
     transport: Option<&'a Arc<Mutex<dyn Transport>>>,
+    /// Where a [`RequestMode::Direct`] waiter reads its own response from.
+    reader: Option<&'a Arc<Mutex<dyn Transport>>>,
     resources: &'a HashMap<String, Arc<dyn Resource>>,
     /// Minimum severity the client asked for via `logging/setLevel`.
     log_level: LogLevel,
@@ -37,15 +44,33 @@ pub struct ToolEnv<'a> {
     client_capabilities: &'a ClientCapabilities,
     /// Routing for server-initiated request/response round trips.
     broker: &'a RequestBroker,
-    /// Whether this environment may block waiting on the client.
-    ///
-    /// False inside task workers: nothing would be reading the transport while
-    /// the worker blocked, so the round trip could never complete.
-    can_request: bool,
+    /// How this environment gets an answer out of the client.
+    mode: RequestMode,
     /// How long a server-initiated request waits before giving up.
     request_timeout: Option<std::time::Duration>,
-    /// Set inside a task worker; flipped when the task is cancelled.
-    cancelled: Option<&'a Arc<AtomicBool>>,
+    /// Set inside a task worker.
+    task: Option<TaskEnv<'a>>,
+}
+
+/// How a [`ToolEnv`] obtains the answer to a server-initiated request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestMode {
+    /// Read the transport directly. Only valid on the thread running the
+    /// server loop, which is the thread that would otherwise be reading.
+    Direct,
+    /// Write the request, then wait for whoever *is* reading to hand the
+    /// response over. Used by task workers, which have no reader of their own.
+    Delegated,
+    /// Impossible here: nothing will ever read the answer.
+    Forbidden,
+}
+
+/// The task a tool is running inside, when it is running inside one.
+struct TaskEnv<'a> {
+    store: &'a Arc<TaskStore>,
+    task_id: &'a str,
+    /// Flipped when the task is cancelled.
+    cancelled: &'a Arc<AtomicBool>,
 }
 
 impl<'a> ToolEnv<'a> {
@@ -160,13 +185,19 @@ impl<'a> ToolEnv<'a> {
     ///
     /// Always `false` outside a task.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled
-            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        self.task
+            .as_ref()
+            .is_some_and(|task| task.cancelled.load(Ordering::SeqCst))
     }
 
     /// Is this tool running inside a task?
     pub fn is_task(&self) -> bool {
-        self.cancelled.is_some()
+        self.task.is_some()
+    }
+
+    /// The id of the task running this tool, if any.
+    pub fn task_id(&self) -> Option<&str> {
+        self.task.as_ref().map(|task| task.task_id)
     }
 
     /// What the client declared it supports during `initialize`.
@@ -211,7 +242,7 @@ impl<'a> ToolEnv<'a> {
         params: Value,
         timeout: Option<std::time::Duration>,
     ) -> Result<Value> {
-        if !self.can_request {
+        if self.mode == RequestMode::Forbidden {
             return Err(McpError::Internal(format!(
                 "`{}` needs a response from the client, which is not possible here: \
                  nothing is reading the transport on this thread",
@@ -229,6 +260,14 @@ impl<'a> ToolEnv<'a> {
         let request = JsonRpcMessage::request(id.clone(), method, Some(params));
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
 
+        // Registered *before* the request goes out: the answer can come back
+        // the instant it lands, and a waiter that had not registered yet would
+        // miss it.
+        let delegated = match self.mode {
+            RequestMode::Delegated => Some(self.broker.register_waiter(&id)?),
+            _ => None,
+        };
+
         {
             let mut guard = transport
                 .lock()
@@ -236,15 +275,29 @@ impl<'a> ToolEnv<'a> {
             guard.write(&request)?;
         }
 
-        let outcome = self.await_response(transport, &id, deadline);
-
-        // However this ended, the transport goes back to blocking reads: the
-        // server loop after us must not inherit a deadline it never asked for.
-        if deadline.is_some() {
-            if let Ok(mut guard) = transport.lock() {
-                let _ = guard.set_read_timeout(None);
+        let outcome = match delegated {
+            // Someone else is reading. Say the task is waiting on the user, then
+            // block until they hand the answer over.
+            Some(receiver) => {
+                let _ = self.set_task_status(TaskStatus::InputRequired);
+                let outcome = self.await_delegated_response(&id, receiver, deadline);
+                let _ = self.set_task_status(TaskStatus::Working);
+                outcome
             }
-        }
+            None => {
+                let reader = self.reader.unwrap_or(transport);
+                let outcome = self.await_response(reader, &id, deadline);
+                // However this ended, the transport goes back to blocking
+                // reads: the server loop after us must not inherit a deadline
+                // it never asked for.
+                if deadline.is_some() {
+                    if let Ok(mut guard) = reader.lock() {
+                        let _ = guard.set_read_timeout(None);
+                    }
+                }
+                outcome
+            }
+        };
 
         if let Err(McpError::Timeout(_)) = &outcome {
             self.broker.abandon(&id);
@@ -260,6 +313,63 @@ impl<'a> ToolEnv<'a> {
         }
 
         outcome
+    }
+
+    /// Wait for the reading thread to hand our response over.
+    ///
+    /// Polled rather than blocked outright so a cancelled task stops waiting on
+    /// an answer whose result will be thrown away regardless.
+    fn await_delegated_response(
+        &self,
+        id: &RequestId,
+        receiver: std::sync::mpsc::Receiver<JsonRpcResponse>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Value> {
+        /// How often to look up from the channel to check for cancellation.
+        const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        loop {
+            if self.is_cancelled() {
+                return Err(McpError::Internal(format!(
+                    "`{id:?}` abandoned: the task was cancelled"
+                )));
+            }
+
+            let wait = match deadline {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(McpError::Timeout(format!("no response to request {id:?}")));
+                    }
+                    left.min(POLL)
+                }
+                None => POLL,
+            };
+
+            match receiver.recv_timeout(wait) {
+                Ok(response) => return RequestBroker::into_result(response),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                // The sender was dropped, which only happens if the broker
+                // handed our slot to someone else - it cannot arrive now.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(McpError::Internal(format!(
+                        "the response to {id:?} can no longer be delivered"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Move the surrounding task between `working` and `input_required`.
+    ///
+    /// A no-op outside a task, and deliberately quiet: failing to announce that
+    /// a task is waiting on input is not a reason to fail the request that is
+    /// waiting.
+    fn set_task_status(&self, status: TaskStatus) -> Result<bool> {
+        match &self.task {
+            Some(task) => task.store.set_status(task.task_id, status),
+            None => Ok(false),
+        }
     }
 
     /// Read until our response turns up, routing everything else on the way.
@@ -307,7 +417,9 @@ impl<'a> ToolEnv<'a> {
                 JsonRpcMessage::Response(response) if response.id == *id => {
                     return RequestBroker::into_result(response);
                 }
-                JsonRpcMessage::Response(response) => self.broker.park(response),
+                // Might belong to a task worker blocked on a channel, which
+                // would never come back to collect a parked response.
+                JsonRpcMessage::Response(response) => self.broker.deliver(response),
                 other => self.broker.defer(other),
             }
         }
@@ -844,6 +956,20 @@ pub struct Server<C> {
     resource_templates: Vec<ResourceTemplate>,
     prompts: HashMap<String, Box<dyn PromptDef>>,
     transport: Option<Arc<Mutex<dyn Transport>>>,
+    /// An independent handle for writing, where the transport can be split.
+    ///
+    /// The read handle is held for the whole of a blocking `read`, so anything
+    /// writing through it waits for the loop to wake - which, for a task worker
+    /// wanting to elicit, is the very thing it is waiting to cause. A separate
+    /// sink removes that circularity. Falls back to `transport` where splitting
+    /// is not possible (HTTP), which is also where nothing needs it.
+    writer: Option<Arc<Mutex<dyn Transport>>>,
+    /// Whether the transport can be pumped while `tasks/result` blocks.
+    ///
+    /// Requires read deadlines: without them the pump could not notice the task
+    /// finishing. False keeps task workers from making requests at all, which
+    /// is the old behaviour and is deadlock-free.
+    can_pump: bool,
     initialized: bool,
     /// Minimum log severity, as last set by `logging/setLevel`.
     log_level: LogLevel,
@@ -858,11 +984,6 @@ pub struct Server<C> {
     /// Present only once [`Server::enable_tasks`] has been called.
     tasks: Option<TaskRuntime<C>>,
 }
-
-/// Task workers cannot make server-initiated requests, so they need no client
-/// capabilities - but `ToolEnv` borrows them, so they need somewhere to point.
-static NO_CLIENT_CAPABILITIES: std::sync::LazyLock<ClientCapabilities> =
-    std::sync::LazyLock::new(ClientCapabilities::default);
 
 /// Everything needed to run tools on a background thread.
 struct TaskRuntime<C> {
@@ -886,6 +1007,8 @@ impl<C: Send + Sync + 'static> Server<C> {
             resource_templates: Vec::new(),
             prompts: HashMap::new(),
             transport: None,
+            writer: None,
+            can_pump: false,
             initialized: false,
             log_level,
             client_capabilities: ClientCapabilities::default(),
@@ -945,16 +1068,18 @@ impl<C: Send + Sync + 'static> Server<C> {
     /// Build the environment handed to a tool for one invocation.
     fn tool_env(&self) -> ToolEnv<'_> {
         ToolEnv {
-            transport: self.transport.as_ref(),
+            transport: self.writer.as_ref().or(self.transport.as_ref()),
+            reader: self.transport.as_ref(),
             resources: &self.resources,
             log_level: self.log_level,
             stderr_logging: self.config.stderr_logging,
             logger: &self.config.name,
             client_capabilities: &self.client_capabilities,
             broker: &self.broker,
-            can_request: true,
+            // This runs on the loop's own thread, so it can read for itself.
+            mode: RequestMode::Direct,
             request_timeout: self.config.request_timeout,
-            cancelled: None,
+            task: None,
         }
     }
 
@@ -1011,7 +1136,22 @@ impl<C: Send + Sync + 'static> Server<C> {
 
     /// Run the server with the given transport and context (for stdio - continuous loop)
     pub fn start<T: Transport + 'static>(&mut self, transport: T, mut context: C) -> Result<()> {
+        let mut transport = transport;
+
+        // A second handle on the same sink, so a task worker can write while
+        // this loop is parked inside `read` holding the read handle.
+        let writer: Option<Arc<Mutex<dyn Transport>>> = transport
+            .try_clone_writer()
+            .map(|w| Arc::new(Mutex::new(w)) as Arc<Mutex<dyn Transport>>);
+
+        // Deadlines are what let `tasks/result` pump instead of blocking, so
+        // they decide whether a task may ask the client anything. Probing with
+        // `None` reports support without arming anything.
+        let honors_deadlines = transport.set_read_timeout(None).unwrap_or(false);
+
         let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(transport));
+        self.can_pump = honors_deadlines && writer.is_some();
+        self.writer = Some(writer.unwrap_or_else(|| transport.clone()));
         self.transport = Some(transport.clone());
 
         eprintln!(
@@ -1039,14 +1179,27 @@ impl<C: Send + Sync + 'static> Server<C> {
 
             // Handle message
             if let Some(response) = self.handle_message(message, &mut context)? {
-                let mut t = transport
-                    .lock()
-                    .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
-                t.write(&response)?;
+                self.write_message(&response)?;
             }
         }
 
         Ok(())
+    }
+
+    /// Send a message to the client.
+    ///
+    /// Everything the server writes goes through here, on one handle behind one
+    /// lock. That matters now that task workers write too: two handles to the
+    /// same socket are two *different* mutexes, so concurrent writes interleave
+    /// and produce a line that is not valid JSON.
+    fn write_message(&self, message: &JsonRpcMessage) -> Result<()> {
+        let Some(writer) = self.writer.as_ref().or(self.transport.as_ref()) else {
+            return Ok(());
+        };
+        writer
+            .lock()
+            .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?
+            .write(message)
     }
 
     /// Process a single request (for HTTP - single request/response)
@@ -1062,7 +1215,12 @@ impl<C: Send + Sync + 'static> Server<C> {
         context: &mut C,
     ) -> Result<()> {
         // Store as dyn Transport for ToolEnv
-        self.transport = Some(transport.clone() as Arc<Mutex<dyn Transport>>);
+        let shared = transport.clone() as Arc<Mutex<dyn Transport>>;
+        // One message in, one message out: there is no back-channel to split
+        // and nothing to pump.
+        self.writer = Some(shared.clone());
+        self.can_pump = false;
+        self.transport = Some(shared);
 
         // Read message
         let message = {
@@ -1074,10 +1232,7 @@ impl<C: Send + Sync + 'static> Server<C> {
 
         // Handle and write response
         if let Some(response) = self.handle_message(message, context)? {
-            let mut t = transport
-                .lock()
-                .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
-            t.write(&response)?;
+            self.write_message(&response)?;
         }
 
         Ok(())
@@ -1098,7 +1253,14 @@ impl<C: Send + Sync + 'static> Server<C> {
                 self.handle_notification(notification)?;
                 Ok(None)
             }
-            JsonRpcMessage::Response(_) => Ok(None),
+            // An answer to something *we* asked. Route it to whoever is
+            // waiting - a task worker on another thread, or a parked slot for a
+            // waiter further down this call stack. Dropping it here used to be
+            // safe only because task workers could not ask anything.
+            JsonRpcMessage::Response(response) => {
+                self.broker.deliver(response);
+                Ok(None)
+            }
         }
     }
 
@@ -1156,7 +1318,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         let store = self.task_store_or_unsupported()?;
         let params: TaskIdParams = parse_params(request)?;
 
-        match store.await_result(&params.task_id)? {
+        match self.await_task(store, &params.task_id)? {
             // "For tasks in a terminal status, receivers MUST return from
             // tasks/result exactly what the underlying request would have
             // returned, whether that is a successful result or a JSON-RPC
@@ -1172,6 +1334,62 @@ impl<C: Send + Sync + 'static> Server<C> {
                 Ok(value)
             }
             TaskOutcome::Error(error) => Err(McpError::Passthrough(error)),
+        }
+    }
+
+    /// Wait for a task to finish, keeping the transport moving while we do.
+    ///
+    /// The spec says `tasks/result` "**MUST** block the response until the task
+    /// reaches a terminal status". Blocking on the store alone satisfies that
+    /// but strands anything the task needs from the client: this thread is the
+    /// only reader, and it is asleep. A task that asked for input would wait for
+    /// an answer that could not arrive, and the client would wait for a result
+    /// that would never come.
+    ///
+    /// So instead of sleeping, this reads. Client traffic is deferred to the
+    /// main loop exactly as it is during any other server-initiated request,
+    /// and responses reach the worker that is waiting on them. Reads are given a
+    /// short deadline so the task finishing is noticed promptly - nothing on the
+    /// wire announces it.
+    ///
+    /// Where the transport cannot do deadlines there is nothing to pump with,
+    /// so this falls back to the plain block. That is safe because such a
+    /// server also refuses task workers any server-initiated request.
+    fn await_task(&self, store: &Arc<TaskStore>, task_id: &str) -> Result<TaskOutcome> {
+        /// How long a pumped read waits before re-checking the task.
+        const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let (Some(transport), true) = (self.transport.as_ref(), self.can_pump) else {
+            return store.await_result(task_id);
+        };
+
+        loop {
+            if let Some(outcome) = store.try_result(task_id)? {
+                return Ok(outcome);
+            }
+
+            let message = {
+                let mut guard = transport
+                    .lock()
+                    .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
+                guard.set_read_timeout(Some(PUMP_INTERVAL))?;
+                let message = guard.read();
+                // Restored before anything else can read, so the main loop does
+                // not inherit a deadline it never asked for.
+                let _ = guard.set_read_timeout(None);
+                message
+            };
+
+            match message {
+                // Nothing arrived in this slice; look at the task again.
+                Err(McpError::Timeout(_)) => continue,
+                // The client hung up. Fall back to waiting on the task alone -
+                // it is still running, and its result may still be wanted.
+                Err(McpError::TransportClosed) => return store.await_result(task_id),
+                Err(e) => return Err(e),
+                Ok(JsonRpcMessage::Response(response)) => self.broker.deliver(response),
+                Ok(other) => self.broker.defer(other),
+            }
         }
     }
 
@@ -1217,13 +1435,23 @@ impl<C: Send + Sync + 'static> Server<C> {
 
         let store = runtime.store.clone();
         let context_factory = runtime.context_factory.clone();
-        let transport = self.transport.clone();
+        // Writes go through the split handle, so the worker never waits on the
+        // server loop's blocking read to release the transport.
+        let transport = self.writer.clone().or_else(|| self.transport.clone());
         let resources = self.resources.clone();
         let broker = self.broker.clone();
         let log_level = self.log_level;
         let stderr_logging = self.config.stderr_logging;
         let logger = self.config.name.clone();
         let request_timeout = self.config.request_timeout;
+        let can_pump = self.can_pump;
+        // A worker that may elicit needs to know what the client supports, or
+        // `elicit` refuses before it ever reaches the broker.
+        let client_capabilities = if can_pump {
+            self.client_capabilities.clone()
+        } else {
+            ClientCapabilities::default()
+        };
         let task_id = task.task_id.clone();
 
         // std::thread, not a runtime: the work really does run alongside the
@@ -1234,19 +1462,31 @@ impl<C: Send + Sync + 'static> Server<C> {
                 let mut context = context_factory();
                 let env = ToolEnv {
                     transport: transport.as_ref(),
+                    // Nothing reads on this thread, so a Direct wait is never
+                    // an option here.
+                    reader: None,
                     resources: &resources,
                     log_level,
                     stderr_logging,
                     logger: &logger,
-                    client_capabilities: &NO_CLIENT_CAPABILITIES,
+                    client_capabilities: &client_capabilities,
                     broker: &broker,
-                    // Nothing is reading the transport on this thread, and the
-                    // server loop may itself be blocked in tasks/result on this
-                    // very task. A round trip from here could never complete,
-                    // so it is refused rather than deadlocked.
-                    can_request: false,
+                    // Delegated where the transport can be pumped: the worker
+                    // writes its own request and waits for whichever thread is
+                    // reading to hand the answer over. Where it cannot be
+                    // pumped, asking would deadlock against `tasks/result`, so
+                    // it is refused outright.
+                    mode: if can_pump {
+                        RequestMode::Delegated
+                    } else {
+                        RequestMode::Forbidden
+                    },
                     request_timeout,
-                    cancelled: Some(&cancelled),
+                    task: Some(TaskEnv {
+                        store: &store,
+                        task_id: &task_id,
+                        cancelled: &cancelled,
+                    }),
                 };
 
                 let (status, outcome) = match tool.execute(arguments, &mut context, &env) {
@@ -2113,15 +2353,16 @@ mod tests {
     ) -> ToolEnv<'a> {
         ToolEnv {
             transport,
+            reader: transport,
             resources,
             log_level,
             stderr_logging,
             logger: "test-logger",
             client_capabilities: &NO_CAPABILITIES,
             broker: &TEST_BROKER,
-            can_request: true,
+            mode: RequestMode::Direct,
             request_timeout: None,
-            cancelled: None,
+            task: None,
         }
     }
 
@@ -4951,10 +5192,11 @@ mod tests {
     }
 
     #[test]
-    fn test_task_worker_cannot_make_server_initiated_requests() {
-        // Nothing would be reading the transport while a worker blocked, and
-        // the server loop may be inside tasks/result on this very task, so a
-        // round trip must fail fast rather than deadlock.
+    fn test_task_worker_cannot_make_server_initiated_requests_without_a_pump() {
+        // Delegating a request needs someone reading the transport, and that
+        // needs read deadlines so `tasks/result` can pump instead of sleeping.
+        // This server has no transport at all, so the round trip must fail fast
+        // rather than deadlock.
         struct EliciterTool;
         impl Tool<TestContext> for EliciterTool {
             fn name(&self) -> &str {
@@ -5004,6 +5246,360 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("refused:"), "{text}");
         assert!(text.contains("nothing is reading the transport"), "{text}");
+    }
+
+    //
+    // input_required: a task asking the client something
+    //
+
+    /// A task-callable tool that elicits once and reports what came back.
+    #[cfg(unix)]
+    struct AskingTool;
+
+    #[cfg(unix)]
+    impl Tool<TestContext> for AskingTool {
+        fn name(&self) -> &str {
+            "asks"
+        }
+        fn description(&self) -> &str {
+            "Elicits from inside a task"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn task_support(&self) -> TaskSupport {
+            TaskSupport::Optional
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            let result = env.elicit_form("your name?", ElicitSchema::new().build())?;
+            let name = result
+                .accepted_content()
+                .and_then(|content| content.get("name").cloned())
+                .and_then(|value| value.as_str().map(String::from))
+                .unwrap_or_else(|| "<none>".to_string());
+            Ok(CallToolResult::text(format!("hello {name}")))
+        }
+    }
+
+    /// A task-enabled server running over one end of a socket pair.
+    ///
+    /// Returns the client end. The server thread ends when the client drops.
+    #[cfg(unix)]
+    fn task_server_on_a_socket() -> (crate::transport::UnixTransport, std::thread::JoinHandle<()>) {
+        use crate::transport::UnixTransport;
+        use std::os::unix::net::UnixStream;
+
+        let (server_end, client_end) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut server = task_server();
+            server.add_tool(AskingTool).unwrap();
+            let _ = server.start(
+                UnixTransport::from_stream(server_end),
+                TestContext { counter: 0 },
+            );
+        });
+
+        let mut client = UnixTransport::from_stream(client_end);
+        // Every read in these tests is bounded, so a regression fails the test
+        // instead of hanging the suite.
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        (client, handle)
+    }
+
+    #[cfg(unix)]
+    fn send(client: &mut crate::transport::UnixTransport, id: i64, method: &str, params: Value) {
+        client
+            .write(&JsonRpcMessage::request(id, method, Some(params)))
+            .unwrap();
+    }
+
+    /// Read until a response to `id` arrives, handing anything else to
+    /// `on_other`.
+    ///
+    /// A finishing task announces itself with `notifications/tasks/status`,
+    /// which can land at any point and is never what a caller is waiting for,
+    /// so it is absorbed here rather than in every handler.
+    #[cfg(unix)]
+    fn read_until_response(
+        client: &mut crate::transport::UnixTransport,
+        id: i64,
+        mut on_other: impl FnMut(&mut crate::transport::UnixTransport, JsonRpcMessage),
+    ) -> JsonRpcResponse {
+        for _ in 0..100 {
+            match client.read().expect("client read") {
+                JsonRpcMessage::Response(r) if r.id == RequestId::Number(id) => return r,
+                JsonRpcMessage::Notification(n) if n.method == "notifications/tasks/status" => {}
+                other => on_other(client, other),
+            }
+        }
+        panic!("no response to request {id}");
+    }
+
+    #[cfg(unix)]
+    fn initialize_with_elicitation(client: &mut crate::transport::UnixTransport) {
+        send(
+            client,
+            1,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "elicitation": { "form": {} } },
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }),
+        );
+        read_until_response(client, 1, |_, other| panic!("unexpected {other:?}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_task_can_elicit_and_reaches_input_required() {
+        let (mut client, _server) = task_server_on_a_socket();
+        initialize_with_elicitation(&mut client);
+
+        send(
+            &mut client,
+            2,
+            "tools/call",
+            serde_json::json!({ "name": "asks", "task": {} }),
+        );
+        let created =
+            read_until_response(&mut client, 2, |_, other| panic!("unexpected {other:?}"));
+        let task_id = created.result.unwrap()["task"]["taskId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The worker's elicitation should arrive without anyone prompting it.
+        let elicitation = loop {
+            match client.read().expect("client read") {
+                JsonRpcMessage::Request(r) if r.method == "elicitation/create" => break r,
+                JsonRpcMessage::Notification(n) if n.method == "notifications/tasks/status" => {}
+                other => panic!("expected an elicitation, got {other:?}"),
+            }
+        };
+
+        // While it is outstanding, the task reports that it is waiting on us.
+        send(
+            &mut client,
+            3,
+            "tasks/get",
+            serde_json::json!({ "taskId": task_id }),
+        );
+        let status = read_until_response(&mut client, 3, |_, other| panic!("unexpected {other:?}"));
+        assert_eq!(
+            status.result.unwrap()["status"],
+            "input_required",
+            "a task blocked on elicitation should say so"
+        );
+
+        // Answer, and the task should finish with what we said.
+        client
+            .write(&JsonRpcMessage::response(
+                elicitation.id,
+                serde_json::json!({ "action": "accept", "content": { "name": "octocat" } }),
+            ))
+            .unwrap();
+
+        send(
+            &mut client,
+            4,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        );
+        let result = read_until_response(&mut client, 4, |_, other| panic!("unexpected {other:?}"));
+        assert_eq!(
+            result.result.unwrap()["content"][0]["text"],
+            "hello octocat"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_tasks_result_pumps_so_an_eliciting_task_can_finish() {
+        // The deadlock this exists to prevent: `tasks/result` blocks, so the
+        // only reader is asleep; the task asks the client something; the answer
+        // can never be read; the task never finishes; `tasks/result` never
+        // returns. Both sides wait forever.
+        //
+        // `tasks/result` therefore reads while it waits, which is what lets the
+        // elicitation below get through at all.
+        let (mut client, _server) = task_server_on_a_socket();
+        initialize_with_elicitation(&mut client);
+
+        send(
+            &mut client,
+            2,
+            "tools/call",
+            serde_json::json!({ "name": "asks", "task": {} }),
+        );
+        let created =
+            read_until_response(&mut client, 2, |_, other| panic!("unexpected {other:?}"));
+        let task_id = created.result.unwrap()["task"]["taskId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Ask for the result immediately, before answering anything.
+        send(
+            &mut client,
+            3,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        );
+
+        // The elicitation must still reach us, and answering it must let
+        // `tasks/result` complete.
+        let result = read_until_response(&mut client, 3, |client, other| match other {
+            JsonRpcMessage::Request(r) if r.method == "elicitation/create" => {
+                client
+                    .write(&JsonRpcMessage::response(
+                        r.id,
+                        serde_json::json!({ "action": "accept", "content": { "name": "nobody" } }),
+                    ))
+                    .unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        });
+
+        assert_eq!(result.result.unwrap()["content"][0]["text"], "hello nobody");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_declined_elicitation_still_finishes_the_task() {
+        // Declining is an answer. The task must come back to `working` and run
+        // to completion rather than sitting in `input_required`.
+        let (mut client, _server) = task_server_on_a_socket();
+        initialize_with_elicitation(&mut client);
+
+        send(
+            &mut client,
+            2,
+            "tools/call",
+            serde_json::json!({ "name": "asks", "task": {} }),
+        );
+        let created =
+            read_until_response(&mut client, 2, |_, other| panic!("unexpected {other:?}"));
+        let task_id = created.result.unwrap()["task"]["taskId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        send(
+            &mut client,
+            3,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        );
+
+        let result = read_until_response(&mut client, 3, |client, other| match other {
+            JsonRpcMessage::Request(r) if r.method == "elicitation/create" => {
+                client
+                    .write(&JsonRpcMessage::response(
+                        r.id,
+                        serde_json::json!({ "action": "decline" }),
+                    ))
+                    .unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        });
+
+        // `accepted_content` withholds content on anything but accept, so the
+        // tool sees no name.
+        assert_eq!(result.result.unwrap()["content"][0]["text"], "hello <none>");
+    }
+
+    #[test]
+    fn test_set_status_honors_the_state_machine() {
+        let store = TaskStore::new(TaskConfig::default());
+        let (task, _cancelled) = store.create(None).unwrap();
+
+        // working -> input_required -> working
+        assert!(
+            store
+                .set_status(&task.task_id, TaskStatus::InputRequired)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get(&task.task_id).unwrap().status,
+            TaskStatus::InputRequired
+        );
+        assert!(
+            store
+                .set_status(&task.task_id, TaskStatus::Working)
+                .unwrap()
+        );
+
+        // Same-status moves are not transitions.
+        assert!(
+            !store
+                .set_status(&task.task_id, TaskStatus::Working)
+                .unwrap()
+        );
+
+        // Terminal states carry an outcome, so they go through finish().
+        assert!(
+            store
+                .set_status(&task.task_id, TaskStatus::Completed)
+                .is_err()
+        );
+
+        // An unknown task is not an error - it may simply have expired.
+        assert!(!store.set_status("nope", TaskStatus::InputRequired).unwrap());
+    }
+
+    #[test]
+    fn test_a_finished_task_cannot_be_moved_back_to_input_required() {
+        let store = TaskStore::new(TaskConfig::default());
+        let (task, _cancelled) = store.create(None).unwrap();
+        store
+            .finish(
+                &task.task_id,
+                TaskStatus::Completed,
+                TaskOutcome::Value(serde_json::json!({})),
+            )
+            .unwrap();
+
+        assert!(
+            !store
+                .set_status(&task.task_id, TaskStatus::InputRequired)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get(&task.task_id).unwrap().status,
+            TaskStatus::Completed
+        );
+    }
+
+    #[test]
+    fn test_try_result_does_not_block() {
+        let store = TaskStore::new(TaskConfig::default());
+        let (task, _cancelled) = store.create(None).unwrap();
+
+        assert!(store.try_result(&task.task_id).unwrap().is_none());
+
+        store
+            .finish(
+                &task.task_id,
+                TaskStatus::Completed,
+                TaskOutcome::Value(serde_json::json!({ "done": true })),
+            )
+            .unwrap();
+
+        let TaskOutcome::Value(value) = store.try_result(&task.task_id).unwrap().unwrap() else {
+            panic!("expected a value");
+        };
+        assert_eq!(value["done"], true);
+
+        // An unknown task is an error, matching await_result.
+        assert!(store.try_result("nope").is_err());
     }
 
     #[test]

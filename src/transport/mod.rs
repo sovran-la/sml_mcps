@@ -97,3 +97,35 @@ pub trait Transport: Send + Sync {
         Ok(false)
     }
 }
+
+/// A boxed transport is a transport.
+///
+/// [`try_clone_writer`](Transport::try_clone_writer) hands back a `Box`, and
+/// this is what lets that box be stored as an `Arc<Mutex<dyn Transport>>`
+/// alongside the original rather than needing a parallel type for write
+/// handles.
+impl Transport for Box<dyn Transport> {
+    fn read(&mut self) -> Result<JsonRpcMessage> {
+        (**self).read()
+    }
+
+    fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
+        (**self).write(message)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        (**self).close()
+    }
+
+    fn close_write(&mut self) -> Result<()> {
+        (**self).close_write()
+    }
+
+    fn try_clone_writer(&self) -> Option<Box<dyn Transport>> {
+        (**self).try_clone_writer()
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        (**self).set_read_timeout(timeout)
+    }
+}
