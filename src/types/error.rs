@@ -38,6 +38,15 @@ pub enum McpError {
     #[error("Transport closed")]
     TransportClosed,
 
+    /// A blocking wait gave up.
+    ///
+    /// Produced by a transport read that outlived its deadline, and by a
+    /// server-initiated request whose client never answered. Distinguishable
+    /// from [`McpError::Internal`] so a caller can retry rather than treat the
+    /// session as broken.
+    #[error("Timed out: {0}")]
+    Timeout(String),
+
     #[error("Invalid message: {0}")]
     InvalidMessage(String),
 
@@ -100,6 +109,9 @@ impl McpError {
             McpError::Passthrough(error) => error.clone(),
             McpError::Io(e) => JsonRpcError::internal_error(e.to_string()),
             McpError::TransportClosed => JsonRpcError::internal_error("Transport closed"),
+            // MCP defines no code for a timeout, and the base set has no better
+            // fit than "something went wrong on our side".
+            McpError::Timeout(msg) => JsonRpcError::internal_error(format!("Timed out: {msg}")),
             #[cfg(feature = "auth")]
             McpError::Auth(msg) => JsonRpcError::new(AUTH_ERROR, format!("Auth error: {}", msg)),
         }

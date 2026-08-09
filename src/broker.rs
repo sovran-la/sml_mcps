@@ -28,6 +28,15 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// How many abandoned request ids to remember.
+///
+/// Each one is a timed-out request whose answer may still turn up. Remembering
+/// them is what stops a late response being parked for a waiter that has gone,
+/// where it would sit until the process ended. The bound keeps a client that
+/// never answers anything from turning that into a slow leak; forgetting the
+/// oldest only costs one parked response.
+const MAX_ABANDONED: usize = 64;
+
 /// Routing state shared between the server loop and in-flight waiters.
 #[derive(Debug, Default)]
 pub(crate) struct RequestBroker {
@@ -36,6 +45,8 @@ pub(crate) struct RequestBroker {
     parked: Mutex<HashMap<RequestId, JsonRpcResponse>>,
     /// Client-originated messages read by a waiter, owed back to the main loop.
     deferred: Mutex<VecDeque<JsonRpcMessage>>,
+    /// Requests nobody is waiting for any more, newest last.
+    abandoned: Mutex<VecDeque<RequestId>>,
 }
 
 impl RequestBroker {
@@ -61,9 +72,43 @@ impl RequestBroker {
     }
 
     /// Park a response nobody is currently waiting on this call stack for.
+    ///
+    /// A response to a request that has since been abandoned is dropped: its
+    /// waiter gave up, so parking it would only fill the map with answers
+    /// nobody will ever collect.
     pub(crate) fn park(&self, response: JsonRpcResponse) {
+        if self.forget_abandoned(&response.id) {
+            return;
+        }
         if let Ok(mut parked) = self.parked.lock() {
             parked.insert(response.id.clone(), response);
+        }
+    }
+
+    /// Stop waiting for `id`, so a late response to it is discarded.
+    pub(crate) fn abandon(&self, id: &RequestId) {
+        if let Ok(mut parked) = self.parked.lock() {
+            parked.remove(id);
+        }
+        if let Ok(mut abandoned) = self.abandoned.lock() {
+            abandoned.push_back(id.clone());
+            while abandoned.len() > MAX_ABANDONED {
+                abandoned.pop_front();
+            }
+        }
+    }
+
+    /// Was `id` abandoned? Removes it if so, since a response only arrives once.
+    fn forget_abandoned(&self, id: &RequestId) -> bool {
+        let Ok(mut abandoned) = self.abandoned.lock() else {
+            return false;
+        };
+        match abandoned.iter().position(|known| known == id) {
+            Some(index) => {
+                abandoned.remove(index);
+                true
+            }
+            None => false,
         }
     }
 
@@ -185,6 +230,77 @@ mod tests {
         assert_eq!(first.method, "a");
         assert_eq!(second.method, "b");
         assert!(broker.next_deferred().is_none());
+    }
+
+    #[test]
+    fn an_abandoned_response_is_dropped_rather_than_parked() {
+        let broker = RequestBroker::new();
+        let id = RequestId::String("sml-0".into());
+
+        broker.abandon(&id);
+        broker.park(response("sml-0"));
+
+        assert!(
+            broker.take_parked(&id).is_none(),
+            "nobody is waiting for this any more"
+        );
+    }
+
+    #[test]
+    fn abandoning_discards_a_response_that_already_arrived() {
+        // The race that motivates this: the response lands between the waiter
+        // deciding it has waited long enough and it saying so.
+        let broker = RequestBroker::new();
+        let id = RequestId::String("sml-0".into());
+
+        broker.park(response("sml-0"));
+        broker.abandon(&id);
+
+        assert!(broker.take_parked(&id).is_none());
+    }
+
+    #[test]
+    fn abandoning_one_request_does_not_affect_another() {
+        let broker = RequestBroker::new();
+        broker.abandon(&RequestId::String("sml-0".into()));
+
+        broker.park(response("sml-1"));
+        assert!(
+            broker
+                .take_parked(&RequestId::String("sml-1".into()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_abandoned_id_is_only_honored_once() {
+        // Ids are never reused, so this is theoretical - but a stale entry that
+        // swallowed a *later* response would be a genuinely confusing bug.
+        let broker = RequestBroker::new();
+        let id = RequestId::String("sml-0".into());
+
+        broker.abandon(&id);
+        broker.park(response("sml-0")); // dropped
+        broker.park(response("sml-0")); // parked normally
+
+        assert!(broker.take_parked(&id).is_some());
+    }
+
+    #[test]
+    fn the_abandoned_list_stays_bounded() {
+        // A client that answers nothing must not grow this without limit.
+        let broker = RequestBroker::new();
+        for i in 0..(MAX_ABANDONED * 4) {
+            broker.abandon(&RequestId::String(format!("sml-{i}")));
+        }
+
+        assert_eq!(broker.abandoned.lock().unwrap().len(), MAX_ABANDONED);
+
+        // The newest are the ones kept, since they are likeliest to still be
+        // answered.
+        let newest = RequestId::String(format!("sml-{}", MAX_ABANDONED * 4 - 1));
+        broker.park(response(&format!("sml-{}", MAX_ABANDONED * 4 - 1)));
+        assert!(broker.take_parked(&newest).is_none());
     }
 
     #[test]

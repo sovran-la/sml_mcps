@@ -42,6 +42,8 @@ pub struct ToolEnv<'a> {
     /// False inside task workers: nothing would be reading the transport while
     /// the worker blocked, so the round trip could never complete.
     can_request: bool,
+    /// How long a server-initiated request waits before giving up.
+    request_timeout: Option<std::time::Duration>,
     /// Set inside a task worker; flipped when the task is cancelled.
     cancelled: Option<&'a Arc<AtomicBool>>,
 }
@@ -186,11 +188,29 @@ impl<'a> ToolEnv<'a> {
     /// transport where a request carries one message and has no back-channel,
     /// this returns an error rather than hanging.
     ///
-    /// There is no timeout: `Transport::read` blocks, and interrupting it
-    /// would need a second thread per call. A client that never answers will
-    /// stall this tool, which is also true of a client that never answers any
-    /// other request.
+    /// Waits up to [`ServerConfig::request_timeout`] (2 minutes by default),
+    /// then gives up with [`McpError::Timeout`]. Use
+    /// [`send_request_with_timeout`](Self::send_request_with_timeout) for a
+    /// different budget on one call.
     pub fn send_request(&self, method: &str, params: Value) -> Result<Value> {
+        self.send_request_with_timeout(method, params, self.request_timeout)
+    }
+
+    /// [`send_request`](Self::send_request) with an explicit deadline.
+    ///
+    /// `None` waits indefinitely, which is only reasonable when something else
+    /// guarantees the client answers.
+    ///
+    /// On expiry the request is abandoned - a late answer is discarded rather
+    /// than mistaken for the next one - and the client is told with
+    /// `notifications/cancelled`, which the spec asks of a party that times
+    /// out. The transport is left exactly as it was found.
+    pub fn send_request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Value> {
         if !self.can_request {
             return Err(McpError::Internal(format!(
                 "`{}` needs a response from the client, which is not possible here: \
@@ -207,6 +227,7 @@ impl<'a> ToolEnv<'a> {
 
         let id = self.broker.next_request_id();
         let request = JsonRpcMessage::request(id.clone(), method, Some(params));
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
 
         {
             let mut guard = transport
@@ -215,23 +236,75 @@ impl<'a> ToolEnv<'a> {
             guard.write(&request)?;
         }
 
-        // We are now the only reader. Everything that comes off the wire is
-        // ours to route: our response, someone else's response, or a client
-        // message the main loop still needs to see.
+        let outcome = self.await_response(transport, &id, deadline);
+
+        // However this ended, the transport goes back to blocking reads: the
+        // server loop after us must not inherit a deadline it never asked for.
+        if deadline.is_some() {
+            if let Ok(mut guard) = transport.lock() {
+                let _ = guard.set_read_timeout(None);
+            }
+        }
+
+        if let Err(McpError::Timeout(_)) = &outcome {
+            self.broker.abandon(&id);
+            // Best-effort: the client SHOULD stop working on something nobody
+            // is waiting for. A failure here changes nothing for us.
+            let _ = self.send_notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({
+                    "requestId": id,
+                    "reason": format!("no response within {:?}", timeout.unwrap_or_default()),
+                })),
+            );
+        }
+
+        outcome
+    }
+
+    /// Read until our response turns up, routing everything else on the way.
+    ///
+    /// We are the only reader while this runs, so everything that comes off the
+    /// wire is ours to place: our response, someone else's response, or a
+    /// client message the main loop still needs to see.
+    fn await_response(
+        &self,
+        transport: &Arc<Mutex<dyn Transport>>,
+        id: &RequestId,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Value> {
         loop {
-            if let Some(response) = self.broker.take_parked(&id) {
+            if let Some(response) = self.broker.take_parked(id) {
                 return RequestBroker::into_result(response);
             }
+
+            // Checked here as well as inside the transport, because a stream of
+            // messages meant for someone else would otherwise keep resetting
+            // the wait.
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(McpError::Timeout(format!("no response to request {id:?}")));
+                    }
+                    Some(left)
+                }
+                None => None,
+            };
 
             let message = {
                 let mut guard = transport
                     .lock()
                     .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
+                // A transport that cannot honor deadlines says so; the loop's
+                // own check still bounds the wait between messages, but a
+                // single read may outlast it.
+                guard.set_read_timeout(remaining)?;
                 guard.read()?
             };
 
             match message {
-                JsonRpcMessage::Response(response) if response.id == id => {
+                JsonRpcMessage::Response(response) if response.id == *id => {
                     return RequestBroker::into_result(response);
                 }
                 JsonRpcMessage::Response(response) => self.broker.park(response),
@@ -711,6 +784,20 @@ pub struct ServerConfig {
     /// Where log records go when the client will not receive them
     /// (default: [`StderrLogging::Fallback`]).
     pub stderr_logging: StderrLogging,
+    /// How long a server-initiated request waits for the client to answer
+    /// (default: 2 minutes). `None` waits forever.
+    ///
+    /// Elicitation and sampling block the tool that started them, so a client
+    /// that never answers holds that tool - and, on a single-threaded stdio
+    /// server, the whole loop - open indefinitely. The spec asks senders to
+    /// "establish timeouts for all sent requests, to prevent hung connections
+    /// and resource exhaustion".
+    ///
+    /// Two minutes is chosen for the harder case: elicitation puts a form in
+    /// front of a person, and people are slow. Sampling usually answers in
+    /// seconds, so tune it per call with
+    /// [`ToolEnv::send_request_with_timeout`] rather than lowering this.
+    pub request_timeout: Option<std::time::Duration>,
 }
 
 impl Default for ServerConfig {
@@ -730,6 +817,7 @@ impl Default for ServerConfig {
                 .collect(),
             default_log_level: LogLevel::Info,
             stderr_logging: StderrLogging::default(),
+            request_timeout: Some(std::time::Duration::from_secs(120)),
         }
     }
 }
@@ -865,6 +953,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             client_capabilities: &self.client_capabilities,
             broker: &self.broker,
             can_request: true,
+            request_timeout: self.config.request_timeout,
             cancelled: None,
         }
     }
@@ -1134,6 +1223,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         let log_level = self.log_level;
         let stderr_logging = self.config.stderr_logging;
         let logger = self.config.name.clone();
+        let request_timeout = self.config.request_timeout;
         let task_id = task.task_id.clone();
 
         // std::thread, not a runtime: the work really does run alongside the
@@ -1155,6 +1245,7 @@ impl<C: Send + Sync + 'static> Server<C> {
                     // very task. A round trip from here could never complete,
                     // so it is refused rather than deadlocked.
                     can_request: false,
+                    request_timeout,
                     cancelled: Some(&cancelled),
                 };
 
@@ -2029,6 +2120,7 @@ mod tests {
             client_capabilities: &NO_CAPABILITIES,
             broker: &TEST_BROKER,
             can_request: true,
+            request_timeout: None,
             cancelled: None,
         }
     }
@@ -3447,6 +3539,392 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    //
+    // Server-initiated request timeouts
+    //
+
+    /// What a scripted client does on each read.
+    enum Step {
+        /// Say nothing until the deadline runs out.
+        Silence,
+        /// Answer the `n`th request the server wrote (0-based).
+        Answer(usize, Value),
+        /// Hang up.
+        Close,
+    }
+
+    /// A client whose every read is scripted, and which honors deadlines.
+    struct TimeoutTransport {
+        steps: VecDeque<Step>,
+        written: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        /// The deadline currently in force.
+        timeout: Arc<Mutex<Option<std::time::Duration>>>,
+        /// Every deadline this transport was handed, in order.
+        seen: Arc<Mutex<Vec<Option<std::time::Duration>>>>,
+        /// Whether to claim deadline support.
+        honors_timeouts: bool,
+    }
+
+    impl TimeoutTransport {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: steps.into(),
+                written: Arc::new(Mutex::new(Vec::new())),
+                timeout: Arc::new(Mutex::new(None)),
+                seen: Arc::new(Mutex::new(Vec::new())),
+                honors_timeouts: true,
+            }
+        }
+
+        /// A transport that ignores deadlines, like HTTP or a custom one that
+        /// never implemented them.
+        fn without_timeout_support(mut self) -> Self {
+            self.honors_timeouts = false;
+            self
+        }
+
+        fn request_id(&self, index: usize) -> RequestId {
+            self.written
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| match m {
+                    JsonRpcMessage::Request(r) => Some(r.id.clone()),
+                    _ => None,
+                })
+                .nth(index)
+                .expect("no such request")
+        }
+    }
+
+    impl Transport for TimeoutTransport {
+        fn read(&mut self) -> Result<JsonRpcMessage> {
+            match self.steps.pop_front() {
+                Some(Step::Silence) | None => {
+                    let timeout = *self.timeout.lock().unwrap();
+                    match timeout {
+                        Some(t) => {
+                            std::thread::sleep(t);
+                            Err(McpError::Timeout(format!("no message within {t:?}")))
+                        }
+                        // No deadline and nothing to say. A real transport
+                        // would block here; a test must not.
+                        None => Err(McpError::TransportClosed),
+                    }
+                }
+                Some(Step::Answer(index, result)) => {
+                    Ok(JsonRpcMessage::Response(JsonRpcResponse {
+                        jsonrpc: Default::default(),
+                        id: self.request_id(index),
+                        result: Some(result),
+                        error: None,
+                    }))
+                }
+                Some(Step::Close) => Err(McpError::TransportClosed),
+            }
+        }
+
+        fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
+            self.written.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_read_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<bool> {
+            self.seen.lock().unwrap().push(timeout);
+            if self.honors_timeouts {
+                *self.timeout.lock().unwrap() = timeout;
+            }
+            Ok(self.honors_timeouts)
+        }
+    }
+
+    /// A server wired to a `TimeoutTransport`, plus the handles a test needs to
+    /// see what the transport was told.
+    struct TimeoutFixture {
+        server: Server<TestContext>,
+        /// Everything the server wrote.
+        written: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        /// The deadline currently in force on the transport.
+        timeout: Arc<Mutex<Option<std::time::Duration>>>,
+        /// Every deadline the transport was handed, in order.
+        seen: Arc<Mutex<Vec<Option<std::time::Duration>>>>,
+    }
+
+    /// Wire a `TimeoutTransport` to a server with elicitation negotiated.
+    fn timeout_server(transport: TimeoutTransport) -> TimeoutFixture {
+        let written = transport.written.clone();
+        let timeout = transport.timeout.clone();
+        let seen = transport.seen.clone();
+
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.transport = Some(Arc::new(Mutex::new(transport)));
+        server.client_capabilities =
+            serde_json::from_value(serde_json::json!({ "elicitation": { "form": {} } })).unwrap();
+
+        TimeoutFixture {
+            server,
+            written,
+            timeout,
+            seen,
+        }
+    }
+
+    #[test]
+    fn test_the_default_request_timeout_is_two_minutes() {
+        assert_eq!(
+            ServerConfig::default().request_timeout,
+            Some(std::time::Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn test_a_silent_client_times_out_instead_of_stalling_the_tool() {
+        let TimeoutFixture { server, .. } =
+            timeout_server(TimeoutTransport::new(vec![Step::Silence]));
+
+        let env = server.tool_env();
+        let started = std::time::Instant::now();
+        let result = env.send_request_with_timeout(
+            "elicitation/create",
+            serde_json::json!({}),
+            Some(std::time::Duration::from_millis(50)),
+        );
+
+        assert!(matches!(result, Err(McpError::Timeout(_))), "{result:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_a_timeout_tells_the_client_to_stop() {
+        // The spec asks a party that times out to issue a cancellation, so the
+        // peer is not left working on an answer nobody wants.
+        let TimeoutFixture {
+            server, written, ..
+        } = timeout_server(TimeoutTransport::new(vec![Step::Silence]));
+
+        let env = server.tool_env();
+        let _ = env.send_request_with_timeout(
+            "elicitation/create",
+            serde_json::json!({}),
+            Some(std::time::Duration::from_millis(30)),
+        );
+
+        let request_id = written
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|m| match m {
+                JsonRpcMessage::Request(r) => Some(r.id.clone()),
+                _ => None,
+            })
+            .expect("a request should have gone out");
+
+        let cancelled = written
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|m| match m {
+                JsonRpcMessage::Notification(n) if n.method == "notifications/cancelled" => {
+                    Some(n.params.clone())
+                }
+                _ => None,
+            })
+            .expect("a cancellation should follow the timeout");
+
+        let params = cancelled.expect("cancellation carries params");
+        assert_eq!(
+            params["requestId"],
+            serde_json::to_value(&request_id).unwrap()
+        );
+        assert!(params["reason"].as_str().unwrap().contains("30ms"));
+    }
+
+    #[test]
+    fn test_a_client_that_hangs_up_is_a_close_not_a_timeout() {
+        // A disconnect is final; retrying would be pointless, and the caller
+        // needs to be able to tell the two apart.
+        let TimeoutFixture { server, .. } =
+            timeout_server(TimeoutTransport::new(vec![Step::Close]));
+
+        let env = server.tool_env();
+        let result = env.send_request_with_timeout(
+            "elicitation/create",
+            serde_json::json!({}),
+            Some(std::time::Duration::from_secs(30)),
+        );
+
+        assert!(
+            matches!(result, Err(McpError::TransportClosed)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_timeout_leaves_the_transport_blocking_again() {
+        // The server loop reads next, and it never asked for a deadline. One
+        // left armed would turn its idle wait into a spurious failure.
+        let TimeoutFixture {
+            server, timeout, ..
+        } = timeout_server(TimeoutTransport::new(vec![Step::Silence]));
+
+        let env = server.tool_env();
+        let _ = env.send_request_with_timeout(
+            "elicitation/create",
+            serde_json::json!({}),
+            Some(std::time::Duration::from_millis(20)),
+        );
+
+        assert_eq!(*timeout.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn test_a_successful_request_also_clears_the_deadline() {
+        let TimeoutFixture {
+            server, timeout, ..
+        } = timeout_server(TimeoutTransport::new(vec![Step::Answer(
+            0,
+            serde_json::json!({ "action": "decline" }),
+        )]));
+
+        let env = server.tool_env();
+        env.send_request_with_timeout(
+            "elicitation/create",
+            serde_json::json!({}),
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+
+        assert_eq!(*timeout.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn test_a_late_answer_is_not_mistaken_for_the_next_one() {
+        // The first request times out, then its answer finally arrives while a
+        // second request is outstanding. Handing that stale answer to the
+        // second caller would be silent data corruption.
+        let TimeoutFixture { server, .. } = timeout_server(TimeoutTransport::new(vec![
+            Step::Silence,
+            // The late answer to request 0, then the real answer to request 1.
+            Step::Answer(
+                0,
+                serde_json::json!({ "action": "accept", "content": { "n": 1 } }),
+            ),
+            Step::Answer(
+                1,
+                serde_json::json!({ "action": "accept", "content": { "n": 2 } }),
+            ),
+        ]));
+
+        let env = server.tool_env();
+        assert!(matches!(
+            env.send_request_with_timeout(
+                "elicitation/create",
+                serde_json::json!({}),
+                Some(std::time::Duration::from_millis(20)),
+            ),
+            Err(McpError::Timeout(_))
+        ));
+
+        let second = env
+            .send_request_with_timeout(
+                "elicitation/create",
+                serde_json::json!({}),
+                Some(std::time::Duration::from_secs(30)),
+            )
+            .unwrap();
+
+        assert_eq!(second["content"]["n"], 2, "got the abandoned answer");
+    }
+
+    #[test]
+    fn test_no_timeout_means_no_deadline_on_the_transport() {
+        let TimeoutFixture { server, seen, .. } =
+            timeout_server(TimeoutTransport::new(vec![Step::Answer(
+                0,
+                serde_json::json!({ "action": "cancel" }),
+            )]));
+
+        let env = server.tool_env();
+        env.send_request_with_timeout("elicitation/create", serde_json::json!({}), None)
+            .unwrap();
+
+        assert!(
+            seen.lock().unwrap().iter().all(|t| t.is_none()),
+            "an untimed request must not arm a deadline"
+        );
+    }
+
+    #[test]
+    fn test_the_budget_shrinks_across_unrelated_messages() {
+        // Traffic for someone else must not keep resetting the wait, or a busy
+        // session would never time out.
+        let TimeoutFixture { server, seen, .. } = timeout_server(TimeoutTransport::new(vec![
+            Step::Answer(0, serde_json::json!({ "not": "ours" })),
+            Step::Silence,
+        ]));
+
+        // Answer(0) hands back a response with request 0's id, which *is* ours,
+        // so use a second request to make the first answer land elsewhere.
+        let env = server.tool_env();
+        let _ = env.send_request_with_timeout(
+            "elicitation/create",
+            serde_json::json!({}),
+            Some(std::time::Duration::from_millis(60)),
+        );
+
+        let budgets: Vec<_> = seen.lock().unwrap().iter().filter_map(|t| *t).collect();
+        assert!(!budgets.is_empty(), "a deadline should have been armed");
+        for budget in &budgets {
+            assert!(
+                *budget <= std::time::Duration::from_millis(60),
+                "budget {budget:?} exceeds what was asked for"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_transport_without_deadline_support_still_reports_a_timeout() {
+        // It cannot interrupt a read in progress, but the wait between messages
+        // is still bounded - and the caller was told support was missing.
+        let transport =
+            TimeoutTransport::new(vec![Step::Answer(0, serde_json::json!({ "ok": true }))])
+                .without_timeout_support();
+        let TimeoutFixture { server, .. } = timeout_server(transport);
+
+        let env = server.tool_env();
+        // Zero budget: the loop's own check fires before any read happens.
+        let result = env.send_request_with_timeout(
+            "elicitation/create",
+            serde_json::json!({}),
+            Some(std::time::Duration::ZERO),
+        );
+        assert!(matches!(result, Err(McpError::Timeout(_))), "{result:?}");
+    }
+
+    #[test]
+    fn test_elicit_uses_the_configured_timeout() {
+        let TimeoutFixture {
+            mut server, seen, ..
+        } = timeout_server(TimeoutTransport::new(vec![Step::Silence]));
+        server.config.request_timeout = Some(std::time::Duration::from_millis(40));
+
+        let env = server.tool_env();
+        let result = env.elicit_form("pick one", ElicitSchema::new().build());
+
+        assert!(matches!(result, Err(McpError::Timeout(_))), "{result:?}");
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|t| matches!(t, Some(d) if *d <= std::time::Duration::from_millis(40))),
+            "elicit should inherit ServerConfig::request_timeout"
+        );
     }
 
     #[test]

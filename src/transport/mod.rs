@@ -2,6 +2,7 @@
 //!
 //! Abstracts communication between client and server.
 
+mod line;
 mod origin;
 mod stdio;
 
@@ -31,10 +32,16 @@ pub use unix_server::UnixServer;
 pub(crate) use unix_server::pid_path_for;
 
 use crate::types::{JsonRpcMessage, Result};
+use std::time::Duration;
 
 /// Transport trait - sync read/write of JSON-RPC messages
 pub trait Transport: Send + Sync {
     /// Read a single message from the transport
+    ///
+    /// Blocks until a message arrives, the peer hangs up
+    /// ([`McpError::TransportClosed`](crate::McpError::TransportClosed)), or -
+    /// if [`set_read_timeout`](Self::set_read_timeout) armed one - the deadline
+    /// passes ([`McpError::Timeout`](crate::McpError::Timeout)).
     fn read(&mut self) -> Result<JsonRpcMessage>;
 
     /// Write a single message to the transport
@@ -70,5 +77,23 @@ pub trait Transport: Send + Sync {
     /// endpoint. Default: `None`.
     fn try_clone_writer(&self) -> Option<Box<dyn Transport>> {
         None
+    }
+
+    /// Bound how long [`read`](Self::read) may block, or `None` to restore
+    /// indefinite blocking.
+    ///
+    /// A read that expires yields
+    /// [`McpError::Timeout`](crate::McpError::Timeout) and keeps any bytes it
+    /// already had, so the next read resumes mid-message rather than losing
+    /// the connection's framing.
+    ///
+    /// Returns whether the transport can honor deadlines at all. `false` means
+    /// the timeout was ignored and reads still block forever - the caller must
+    /// decide whether that is acceptable rather than assume it was applied.
+    /// Default: `Ok(false)`, since a transport that has not thought about this
+    /// cannot deliver it.
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        let _ = timeout;
+        Ok(false)
     }
 }
