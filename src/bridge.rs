@@ -23,6 +23,7 @@
 
 use crate::transport::{Transport, UnixTransport, pid_path_for};
 use crate::types::{McpError, Result};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,6 +35,16 @@ const STARTUP_GRACE: Duration = Duration::from_secs(2);
 /// How long to wait for a freshly-spawned daemon to start listening.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many times to ask a socket whether anyone is home before unlinking it.
+///
+/// One refusal is not proof: a daemon whose listen backlog is momentarily full
+/// also refuses. Deleting its socket on that basis would cut off a healthy
+/// server, so the answer has to be consistent.
+const PROBE_ATTEMPTS: u32 = 3;
+
+/// Gap between probes, long enough for a backlog to drain.
+const PROBE_GAP: Duration = Duration::from_millis(50);
+
 /// Transparent bidirectional MCP proxy.
 pub struct Bridge;
 
@@ -44,9 +55,14 @@ impl Bridge {
     /// 2. Otherwise reconcile socket + PID-file state:
     ///    - live PID, socket present -> daemon may be starting; wait briefly.
     ///    - dead PID -> stale; remove socket + PID file and restart.
-    ///    - socket but no PID file -> orphaned; remove and restart.
+    ///    - socket but no PID file -> probe it; remove and restart only if
+    ///      nothing is listening.
     /// 3. Spawn `daemon_bin` with `daemon_args` (expected to daemonize).
     /// 4. Poll the socket until the daemon is listening, then connect.
+    ///
+    /// A socket is never unlinked without first confirming nothing answers on
+    /// it, so a daemon that comes up in the middle of this keeps its socket -
+    /// and gets connected to - rather than being orphaned from its own path.
     ///
     /// `daemon_bin` must double-fork (e.g. via
     /// [`UnixServer::serve_daemon`](crate::UnixServer::serve_daemon)) so the
@@ -154,7 +170,9 @@ fn auto_start_inner(
     let pid_path = pid_path_for(socket_path);
 
     if socket_path.exists() {
-        // Socket file present but the connect above failed.
+        // Socket file present but the connect above failed. Whichever way that
+        // is explained, the socket is only ever removed by `clear_socket`,
+        // which refuses to unlink one that turns out to be live.
         match read_pid_file(&pid_path) {
             Some(pid) if process_alive(pid) => {
                 // Daemon may be mid-startup or wedged. Give it a moment.
@@ -162,17 +180,25 @@ fn auto_start_inner(
                     return Ok(t);
                 }
                 // Still not accepting -> treat as dead. Clear and restart.
-                remove_quietly(socket_path);
-                remove_quietly(&pid_path);
+                if let Some(t) = clear_socket(socket_path, Some(&pid_path)) {
+                    return Ok(t);
+                }
             }
             Some(_) => {
                 // PID file points at a dead process -> stale.
-                remove_quietly(socket_path);
-                remove_quietly(&pid_path);
+                if let Some(t) = clear_socket(socket_path, Some(&pid_path)) {
+                    return Ok(t);
+                }
             }
             None => {
-                // Socket with no PID file -> orphaned.
-                remove_quietly(socket_path);
+                // Socket with no PID file. That is what an orphan looks like -
+                // and also what a `UnixServer::serve` daemon looks like, since
+                // only `serve_daemon` writes a PID file. Probing tells them
+                // apart; assuming orphan here used to unlink a live server's
+                // socket, leaving it listening on a path nobody could reach.
+                if let Some(t) = clear_socket(socket_path, None) {
+                    return Ok(t);
+                }
             }
         }
     } else if let Some(pid) = read_pid_file(&pid_path) {
@@ -221,6 +247,79 @@ fn process_alive(pid: i32) -> bool {
         }
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// What a socket path turned out to be.
+enum Probe {
+    /// Something is listening, and this is the connection to it.
+    Live(UnixTransport),
+    /// The path is not a reachable socket: nothing bound, not a socket, or
+    /// gone. Safe to unlink.
+    Dead,
+    /// Neither could be established - a permission problem, or a listener under
+    /// enough pressure to refuse. Not safe to unlink.
+    Unknown,
+}
+
+/// Ask a socket path what it is, insisting on a consistent answer.
+///
+/// A single `ECONNREFUSED` is not enough to condemn a socket: on the BSDs a
+/// listener with a full backlog refuses exactly the same way a socket with no
+/// listener does. Repeating the probe separates the two, because a backlog
+/// drains and an abandoned socket does not.
+fn probe_socket(path: &Path, attempts: u32, gap: Duration) -> Probe {
+    let mut verdict = Probe::Unknown;
+
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            thread::sleep(gap);
+        }
+        match UnixStream::connect(path) {
+            Ok(stream) => return Probe::Live(UnixTransport::from_stream(stream)),
+            Err(e) if is_unreachable(&e) => verdict = Probe::Dead,
+            // Something else is wrong. Say so and stop guessing - one
+            // inconclusive answer outranks any number of confident ones.
+            Err(_) => return Probe::Unknown,
+        }
+    }
+
+    verdict
+}
+
+/// Does this connect error mean "no daemon owns this path"?
+///
+/// `ECONNREFUSED` is a socket nobody is bound to, `ENOENT` is a path that is
+/// already gone, and `ENOTSOCK` is a leftover regular file sitting where the
+/// socket belongs. Anything else - `EACCES`, `EAGAIN` from a saturated backlog
+/// - proves nothing.
+fn is_unreachable(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ECONNREFUSED) | Some(libc::ENOENT) | Some(libc::ENOTSOCK)
+    )
+}
+
+/// Remove a socket that has proven itself dead, and its PID file with it.
+///
+/// Returns a live connection instead if the socket answers while being
+/// examined, which is the whole point: a daemon that finished binding a moment
+/// after the first connect attempt must not have its socket deleted out from
+/// under it. That leaves it listening on an inode with no name, unreachable to
+/// every client, until it idles out.
+fn clear_socket(socket_path: &Path, pid_path: Option<&Path>) -> Option<UnixTransport> {
+    match probe_socket(socket_path, PROBE_ATTEMPTS, PROBE_GAP) {
+        Probe::Live(transport) => return Some(transport),
+        Probe::Dead => {
+            remove_quietly(socket_path);
+            if let Some(pid) = pid_path {
+                remove_quietly(pid);
+            }
+        }
+        // Leave a socket we cannot account for alone. Spawning over it is the
+        // daemon's call to make, not ours.
+        Probe::Unknown => {}
+    }
+    None
 }
 
 /// Poll-connect to the socket until success or the timeout elapses.
@@ -454,15 +553,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_auto_start_connects_to_running_daemon() {
-        let sock = temp_path("sock");
-        let sock_for_server = sock.clone();
-
-        // Stand up a real UnixServer (idle timeout so it eventually exits).
-        let _server = thread::spawn(move || {
+    /// Start a `UnixServer` on `sock` and block until it is accepting.
+    ///
+    /// Waiting here rather than inside the test is what makes the auto_start
+    /// tests deterministic: whether the daemon is up is setup, not the thing
+    /// under test, so it gets a generous deadline and a hard failure.
+    fn start_ping_daemon(sock: &Path) -> thread::JoinHandle<McpResult<()>> {
+        let sock_for_server = sock.to_path_buf();
+        let handle = thread::spawn(move || {
             UnixServer::new(ServerConfig::default())
-                .idle_timeout(Duration::from_secs(10))
+                .idle_timeout(Duration::from_secs(30))
                 .with_tools(|s: &mut Server<PingContext>| {
                     s.add_tool(PingTool)?;
                     Ok(())
@@ -470,24 +570,31 @@ mod tests {
                 .serve(&sock_for_server, |_conn_id| PingContext)
         });
 
-        // auto_start should take the fast path and connect without spawning.
-        // daemon_bin "false" would fail if spawned, proving we didn't.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut transport = None;
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if let Ok(t) = auto_start_inner(
-                &sock,
-                "false",
-                &[],
-                Duration::from_millis(50),
-                Duration::from_millis(200),
-            ) {
-                transport = Some(t);
-                break;
+            if UnixStream::connect(sock).is_ok() {
+                return handle;
             }
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(10));
         }
-        let mut transport = transport.expect("auto_start should connect to the running daemon");
+        panic!("daemon never started listening on {}", sock.display());
+    }
+
+    #[test]
+    fn test_auto_start_connects_to_running_daemon() {
+        let sock = temp_path("sock");
+        let _server = start_ping_daemon(&sock);
+
+        // One call, no retry loop. The daemon is known to be up, so the fast
+        // path must take it; "false" as daemon_bin fails if it is ever spawned.
+        let mut transport = auto_start_inner(
+            &sock,
+            "false",
+            &[],
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+        )
+        .expect("auto_start should connect to the running daemon");
 
         // Drive a request through to prove it's a live connection.
         let req = JsonRpcMessage::request(1i64, "ping", None);
@@ -500,6 +607,169 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_auto_start_never_unlinks_a_live_socket() {
+        // Regression guard for the race that made the test above flake: a
+        // `serve` daemon writes no PID file, so a socket with no PID file used
+        // to be read as an orphan and deleted - even while the daemon was
+        // listening on it. Everything after that failed with ENOENT.
+        let sock = temp_path("sock");
+        let _server = start_ping_daemon(&sock);
+
+        for _ in 0..10 {
+            let transport = auto_start_inner(
+                &sock,
+                "false",
+                &[],
+                Duration::from_millis(50),
+                Duration::from_millis(200),
+            );
+            assert!(transport.is_ok(), "auto_start should keep connecting");
+            assert!(sock.exists(), "a live daemon's socket must survive");
+        }
+
+        // And the daemon is still reachable by a plain connect.
+        assert!(UnixTransport::connect(&sock).is_ok());
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_clear_socket_returns_a_live_daemon_instead_of_deleting_it() {
+        // Same guarantee, exercised directly: the cleanup path itself refuses
+        // to unlink a socket that answers.
+        let sock = temp_path("sock");
+        let _server = start_ping_daemon(&sock);
+
+        let recovered = clear_socket(&sock, None);
+        assert!(
+            recovered.is_some(),
+            "a live socket must come back connected"
+        );
+        assert!(sock.exists(), "a live socket must not be removed");
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_probe_socket_classifies_each_state() {
+        // Live.
+        let live = temp_path("sock");
+        let _server = start_ping_daemon(&live);
+        assert!(matches!(
+            probe_socket(&live, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Live(_)
+        ));
+        let _ = std::fs::remove_file(&live);
+
+        // Bound and then abandoned: the file outlives the listener.
+        let stale = temp_path("sock");
+        {
+            let _listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+        }
+        assert!(matches!(
+            probe_socket(&stale, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Dead
+        ));
+        let _ = std::fs::remove_file(&stale);
+
+        // A regular file squatting on the path (ENOTSOCK).
+        let orphan = temp_path("sock");
+        std::fs::write(&orphan, b"not a socket").unwrap();
+        assert!(matches!(
+            probe_socket(&orphan, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Dead
+        ));
+        let _ = std::fs::remove_file(&orphan);
+
+        // Nothing there at all (ENOENT).
+        let missing = temp_path("sock");
+        assert!(matches!(
+            probe_socket(&missing, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Dead
+        ));
+    }
+
+    #[test]
+    fn test_probe_socket_will_not_condemn_what_it_cannot_reach() {
+        // A path too long for `sockaddr_un` fails before the kernel is asked,
+        // so there is no errno to read and no way to know what is there. The
+        // verdict has to be Unknown - and Unknown never deletes.
+        let long = temp_path(&"x".repeat(120));
+        std::fs::write(&long, b"something").unwrap();
+
+        assert!(matches!(
+            probe_socket(&long, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Unknown
+        ));
+        assert!(clear_socket(&long, None).is_none());
+        assert!(long.exists(), "an unexplained path must be left alone");
+
+        let _ = std::fs::remove_file(&long);
+    }
+
+    #[test]
+    fn test_only_conclusive_errors_condemn_a_socket() {
+        use std::io::Error;
+
+        // Proof that nothing owns the path.
+        for errno in [libc::ECONNREFUSED, libc::ENOENT, libc::ENOTSOCK] {
+            assert!(is_unreachable(&Error::from_raw_os_error(errno)), "{errno}");
+        }
+
+        // Proof of nothing. EACCES is a socket we are not allowed to reach;
+        // EAGAIN on a unix socket is a listener whose backlog is full - both
+        // belong to daemons that are very much alive.
+        for errno in [libc::EACCES, libc::EAGAIN, libc::EINTR, libc::ETIMEDOUT] {
+            assert!(!is_unreachable(&Error::from_raw_os_error(errno)), "{errno}");
+        }
+
+        // An error raised before any syscall carries no errno at all.
+        assert!(!is_unreachable(&Error::other("no syscall happened")));
+    }
+
+    #[test]
+    fn test_probe_socket_needs_a_consistent_answer() {
+        // A socket that refuses once and accepts on a later attempt is a
+        // daemon under load, not a corpse. `probe_socket` returns Live because
+        // any successful connect ends the probe.
+        let sock = temp_path("sock");
+
+        // Nothing listening yet -> the first probe attempt refuses.
+        let sock_for_server = sock.clone();
+        let binder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            let listener = std::os::unix::net::UnixListener::bind(&sock_for_server).unwrap();
+            // Hold it open long enough for the probe to find it.
+            thread::sleep(Duration::from_millis(500));
+            drop(listener);
+        });
+
+        // Bind lands ~60ms in; probing across ~200ms of attempts must find it.
+        let verdict = probe_socket(&sock, 6, Duration::from_millis(40));
+        assert!(
+            matches!(verdict, Probe::Live(_)),
+            "a daemon that binds mid-probe must not be condemned"
+        );
+
+        drop(verdict);
+        binder.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_clear_socket_removes_a_confirmed_dead_socket_and_its_pid_file() {
+        let sock = temp_path("sock");
+        let pid = pid_path_for(&sock);
+        {
+            let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        }
+        std::fs::write(&pid, "2147483646\n").unwrap();
+
+        assert!(clear_socket(&sock, Some(&pid)).is_none());
+        assert!(!sock.exists(), "a dead socket should be removed");
+        assert!(!pid.exists(), "its PID file should go with it");
     }
 
     #[test]
