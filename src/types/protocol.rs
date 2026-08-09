@@ -160,8 +160,16 @@ impl Implementation {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
+    /// The latest version the client supports.
+    ///
+    /// Defaulted rather than required: a sparse `initialize` should be
+    /// negotiated down, not rejected with a parse error. An empty version
+    /// simply fails to match any supported version.
+    #[serde(default)]
     pub protocol_version: String,
+    #[serde(default)]
     pub capabilities: ClientCapabilities,
+    #[serde(default)]
     pub client_info: Implementation,
 }
 
@@ -240,6 +248,9 @@ pub struct ServerCapabilities {
     pub prompts: Option<PromptsCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logging: Option<Value>,
+    /// Which task-augmented requests this server accepts (2025-11-25).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<crate::tasks::TasksCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Value>,
 }
@@ -453,6 +464,10 @@ pub struct CallToolParams {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Value>,
+    /// Present when the client is asking for task-augmented execution
+    /// (2025-11-25). Ignored by servers that have not enabled tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<crate::tasks::TaskParams>,
 }
 
 /// The result of a `tools/call`.

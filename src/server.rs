@@ -4,10 +4,15 @@
 
 use crate::broker::RequestBroker;
 use crate::pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
+use crate::tasks::{
+    CreateTaskResult, ListTasksParams, ListTasksResult, TaskConfig, TaskIdParams, TaskOutcome,
+    TaskParams, TaskStatus, TaskStore, TasksCapability, related_task_meta,
+};
 use crate::transport::Transport;
 use crate::types::*;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 //
@@ -21,7 +26,7 @@ pub struct ToolEnv<'a> {
     /// `None` when the server was driven without a transport (direct dispatch
     /// in tests, for example). Sending is then a no-op rather than a panic.
     transport: Option<&'a Arc<Mutex<dyn Transport>>>,
-    resources: &'a HashMap<String, Box<dyn Resource>>,
+    resources: &'a HashMap<String, Arc<dyn Resource>>,
     /// Minimum severity the client asked for via `logging/setLevel`.
     log_level: LogLevel,
     /// What to do with log records that the client will not see.
@@ -37,6 +42,8 @@ pub struct ToolEnv<'a> {
     /// False inside task workers: nothing would be reading the transport while
     /// the worker blocked, so the round trip could never complete.
     can_request: bool,
+    /// Set inside a task worker; flipped when the task is cancelled.
+    cancelled: Option<&'a Arc<AtomicBool>>,
 }
 
 impl<'a> ToolEnv<'a> {
@@ -141,6 +148,23 @@ impl<'a> ToolEnv<'a> {
     /// Get a resource by URI
     pub fn get_resource(&self, uri: &str) -> Option<&dyn Resource> {
         self.resources.get(uri).map(|r| r.as_ref())
+    }
+
+    /// Has the task running this tool been cancelled?
+    ///
+    /// Cancellation is cooperative: the server flips this flag and moves the
+    /// task to `cancelled`, but only the tool can actually stop. Long-running
+    /// tools should poll this and return early.
+    ///
+    /// Always `false` outside a task.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    /// Is this tool running inside a task?
+    pub fn is_task(&self) -> bool {
+        self.cancelled.is_some()
     }
 
     /// What the client declared it supports during `initialize`.
@@ -680,6 +704,16 @@ impl Default for ServerConfig {
     }
 }
 
+/// Parse a request's params, treating an absent `params` as invalid.
+fn parse_params<T: serde::de::DeserializeOwned>(request: &JsonRpcRequest) -> Result<T> {
+    let params = request
+        .params
+        .as_ref()
+        .ok_or_else(|| McpError::InvalidParams("Missing params".into()))?;
+    serde_json::from_value(params.clone())
+        .map_err(|e| McpError::InvalidParams(format!("Invalid params: {e}")))
+}
+
 //
 // MCP Server
 //
@@ -687,8 +721,8 @@ impl Default for ServerConfig {
 /// MCP Server - generic over context type
 pub struct Server<C> {
     config: ServerConfig,
-    tools: HashMap<String, Box<dyn Tool<C>>>,
-    resources: HashMap<String, Box<dyn Resource>>,
+    tools: HashMap<String, Arc<dyn Tool<C>>>,
+    resources: Arc<HashMap<String, Arc<dyn Resource>>>,
     resource_templates: Vec<ResourceTemplate>,
     prompts: HashMap<String, Box<dyn PromptDef>>,
     transport: Option<Arc<Mutex<dyn Transport>>>,
@@ -703,6 +737,24 @@ pub struct Server<C> {
     client_capabilities: ClientCapabilities,
     /// Routing for server-initiated request/response round trips.
     broker: Arc<RequestBroker>,
+    /// Present only once [`Server::enable_tasks`] has been called.
+    tasks: Option<TaskRuntime<C>>,
+}
+
+/// Task workers cannot make server-initiated requests, so they need no client
+/// capabilities - but `ToolEnv` borrows them, so they need somewhere to point.
+static NO_CLIENT_CAPABILITIES: std::sync::LazyLock<ClientCapabilities> =
+    std::sync::LazyLock::new(ClientCapabilities::default);
+
+/// Everything needed to run tools on a background thread.
+struct TaskRuntime<C> {
+    store: Arc<TaskStore>,
+    /// Builds a fresh context per task.
+    ///
+    /// A worker cannot borrow the `&mut C` the server loop is holding, so it
+    /// makes its own. That also means a task sees no in-flight mutations from
+    /// the request that spawned it - which the stateless model wants anyway.
+    context_factory: Arc<dyn Fn() -> C + Send + Sync>,
 }
 
 impl<C: Send + Sync + 'static> Server<C> {
@@ -712,7 +764,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         Self {
             config,
             tools: HashMap::new(),
-            resources: HashMap::new(),
+            resources: Arc::new(HashMap::new()),
             resource_templates: Vec::new(),
             prompts: HashMap::new(),
             transport: None,
@@ -720,7 +772,44 @@ impl<C: Send + Sync + 'static> Server<C> {
             log_level,
             client_capabilities: ClientCapabilities::default(),
             broker: Arc::new(RequestBroker::new()),
+            tasks: None,
         }
+    }
+
+    /// Enable task-augmented `tools/call`, plus `tasks/get`, `tasks/result`,
+    /// `tasks/list`, and `tasks/cancel`.
+    ///
+    /// Opt-in, because the spec is strict about what declaring the capability
+    /// commits you to: "Receivers that do not declare the task capability for a
+    /// request type **MUST** process requests of that type normally, ignoring
+    /// any task-augmentation metadata if present." A server that never calls
+    /// this behaves exactly as before, ignoring any `task` field it is sent.
+    ///
+    /// `context_factory` builds a fresh context for each task, since a worker
+    /// thread cannot borrow the context the server loop holds.
+    ///
+    /// Individual tools still opt in through [`Tool::task_support`]; enabling
+    /// the runtime alone does not make any tool task-callable.
+    ///
+    /// ```ignore
+    /// let mut server: Server<AppContext> = Server::new(config);
+    /// server.enable_tasks(TaskConfig::default(), || AppContext::new());
+    /// ```
+    pub fn enable_tasks<F>(&mut self, config: TaskConfig, context_factory: F)
+    where
+        F: Fn() -> C + Send + Sync + 'static,
+    {
+        self.tasks = Some(TaskRuntime {
+            store: Arc::new(TaskStore::new(config)),
+            context_factory: Arc::new(context_factory),
+        });
+    }
+
+    /// The task store, once tasks are enabled.
+    ///
+    /// Useful for inspecting state in tests or an admin surface.
+    pub fn task_store(&self) -> Option<&Arc<TaskStore>> {
+        self.tasks.as_ref().map(|runtime| &runtime.store)
     }
 
     /// This server's identity as advertised to clients.
@@ -746,6 +835,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             client_capabilities: &self.client_capabilities,
             broker: &self.broker,
             can_request: true,
+            cancelled: None,
         }
     }
 
@@ -755,7 +845,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         if self.tools.contains_key(&name) {
             return Err(McpError::Internal(format!("Duplicate tool: {}", name)));
         }
-        self.tools.insert(name, Box::new(tool));
+        self.tools.insert(name, Arc::new(tool));
         Ok(())
     }
 
@@ -765,7 +855,9 @@ impl<C: Send + Sync + 'static> Server<C> {
         if self.resources.contains_key(&uri) {
             return Err(McpError::Internal(format!("Duplicate resource: {}", uri)));
         }
-        self.resources.insert(uri, Box::new(resource));
+        // Copy-on-write: the clone only happens if a task worker is already
+        // holding a handle to the map, which is rare and cheap either way.
+        Arc::make_mut(&mut self.resources).insert(uri, Arc::new(resource));
         Ok(())
     }
 
@@ -914,8 +1006,209 @@ impl<C: Send + Sync + 'static> Server<C> {
             "prompts/list" => self.handle_list_prompts(request),
             "prompts/get" => self.handle_get_prompt(request),
             "logging/setLevel" => self.handle_set_level(request),
+            "tasks/get" => self.handle_task_get(request),
+            "tasks/result" => self.handle_task_result(request),
+            "tasks/list" => self.handle_task_list(request),
+            "tasks/cancel" => self.handle_task_cancel(request),
             method => Err(McpError::MethodNotFound(method.to_string())),
         }
+    }
+
+    //
+    // Tasks
+    //
+
+    /// The task store, or `-32601` if tasks were never enabled.
+    fn task_store_or_unsupported(&self) -> Result<&Arc<TaskStore>> {
+        self.task_store().ok_or_else(|| {
+            McpError::MethodNotFound("tasks are not supported by this server".into())
+        })
+    }
+
+    fn handle_task_get(&self, request: &JsonRpcRequest) -> Result<Value> {
+        let store = self.task_store_or_unsupported()?;
+        let params: TaskIdParams = parse_params(request)?;
+        Ok(serde_json::to_value(store.get(&params.task_id)?)?)
+    }
+
+    /// `tasks/result` - block until terminal, then return exactly what the
+    /// underlying request would have returned.
+    fn handle_task_result(&self, request: &JsonRpcRequest) -> Result<Value> {
+        let store = self.task_store_or_unsupported()?;
+        let params: TaskIdParams = parse_params(request)?;
+
+        match store.await_result(&params.task_id)? {
+            // "For tasks in a terminal status, receivers MUST return from
+            // tasks/result exactly what the underlying request would have
+            // returned, whether that is a successful result or a JSON-RPC
+            // error." The related-task metadata is required here specifically,
+            // because the result shape carries no task id of its own.
+            TaskOutcome::Value(mut value) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "_meta".to_string(),
+                        Value::Object(related_task_meta(&params.task_id)),
+                    );
+                }
+                Ok(value)
+            }
+            TaskOutcome::Error(error) => Err(McpError::Passthrough(error)),
+        }
+    }
+
+    fn handle_task_list(&self, request: &JsonRpcRequest) -> Result<Value> {
+        let store = self.task_store_or_unsupported()?;
+        let params: ListTasksParams = match &request.params {
+            Some(p) => serde_json::from_value(p.clone())?,
+            None => ListTasksParams::default(),
+        };
+
+        let all = store.list()?;
+        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size);
+        let (tasks, next_cursor) = paginate(&all, &state);
+
+        Ok(serde_json::to_value(ListTasksResult {
+            tasks,
+            next_cursor,
+        })?)
+    }
+
+    fn handle_task_cancel(&self, request: &JsonRpcRequest) -> Result<Value> {
+        let store = self.task_store_or_unsupported()?;
+        let params: TaskIdParams = parse_params(request)?;
+        Ok(serde_json::to_value(store.cancel(&params.task_id)?)?)
+    }
+
+    /// Start a task-augmented tool call and answer with a `CreateTaskResult`.
+    ///
+    /// The task record is created before the response goes out, so a client
+    /// that polls immediately always finds it.
+    fn start_tool_task(
+        &self,
+        tool: Arc<dyn Tool<C>>,
+        arguments: Value,
+        task_params: TaskParams,
+    ) -> Result<Value> {
+        let runtime = self
+            .tasks
+            .as_ref()
+            .ok_or_else(|| McpError::Internal("tasks are not enabled".into()))?;
+
+        let (task, cancelled) = runtime.store.create(task_params.ttl)?;
+
+        let store = runtime.store.clone();
+        let context_factory = runtime.context_factory.clone();
+        let transport = self.transport.clone();
+        let resources = self.resources.clone();
+        let broker = self.broker.clone();
+        let log_level = self.log_level;
+        let stderr_logging = self.config.stderr_logging;
+        let logger = self.config.name.clone();
+        let task_id = task.task_id.clone();
+
+        // std::thread, not a runtime: the work really does run alongside the
+        // server loop, so polling returns live answers.
+        let spawned = std::thread::Builder::new()
+            .name(format!("sml-task-{}", &task_id[..8.min(task_id.len())]))
+            .spawn(move || {
+                let mut context = context_factory();
+                let env = ToolEnv {
+                    transport: transport.as_ref(),
+                    resources: &resources,
+                    log_level,
+                    stderr_logging,
+                    logger: &logger,
+                    client_capabilities: &NO_CLIENT_CAPABILITIES,
+                    broker: &broker,
+                    // Nothing is reading the transport on this thread, and the
+                    // server loop may itself be blocked in tasks/result on this
+                    // very task. A round trip from here could never complete,
+                    // so it is refused rather than deadlocked.
+                    can_request: false,
+                    cancelled: Some(&cancelled),
+                };
+
+                let (status, outcome) = match tool.execute(arguments, &mut context, &env) {
+                    // "For tool calls specifically, this includes cases where
+                    // the tool call result has isError set to true" -> failed.
+                    Ok(result) if result.is_error => {
+                        let message = result
+                            .content
+                            .first()
+                            .and_then(Content::as_text)
+                            .unwrap_or("tool reported an error")
+                            .to_string();
+                        match serde_json::to_value(result) {
+                            Ok(value) => (TaskStatus::Failed, TaskOutcome::Value(value)),
+                            Err(e) => (
+                                TaskStatus::Failed,
+                                TaskOutcome::Error(JsonRpcError::internal_error(format!(
+                                    "{message} (and the result could not be serialized: {e})"
+                                ))),
+                            ),
+                        }
+                    }
+                    Ok(result) => match serde_json::to_value(result) {
+                        Ok(value) => (TaskStatus::Completed, TaskOutcome::Value(value)),
+                        Err(e) => (
+                            TaskStatus::Failed,
+                            TaskOutcome::Error(JsonRpcError::internal_error(e.to_string())),
+                        ),
+                    },
+                    Err(McpError::ToolError(message)) | Err(McpError::InvalidParams(message)) => {
+                        // Same classification as a synchronous call: a tool
+                        // execution failure is an isError result.
+                        match serde_json::to_value(CallToolResult::error(&message)) {
+                            Ok(value) => (TaskStatus::Failed, TaskOutcome::Value(value)),
+                            Err(e) => (
+                                TaskStatus::Failed,
+                                TaskOutcome::Error(JsonRpcError::internal_error(e.to_string())),
+                            ),
+                        }
+                    }
+                    Err(other) => (
+                        TaskStatus::Failed,
+                        TaskOutcome::Error(other.to_jsonrpc_error()),
+                    ),
+                };
+
+                // Ignored if the task was cancelled or swept meanwhile, which
+                // is exactly the required behavior.
+                let _ = store.finish(&task_id, status, outcome);
+
+                // Optional per the spec, but it lets a client stop polling
+                // early when it is listening.
+                if let Ok(task) = store.get(&task_id) {
+                    if let Some(transport) = &transport {
+                        if let Ok(params) = serde_json::to_value(&task) {
+                            let notification = JsonRpcMessage::notification(
+                                "notifications/tasks/status",
+                                Some(params),
+                            );
+                            if let Ok(mut guard) = transport.lock() {
+                                let _ = guard.write(&notification);
+                            }
+                        }
+                    }
+                }
+            });
+
+        if let Err(e) = spawned {
+            // The task exists but has no worker; fail it rather than leaving
+            // it working forever.
+            let _ = runtime.store.finish(
+                &task.task_id,
+                TaskStatus::Failed,
+                TaskOutcome::Error(JsonRpcError::internal_error(format!(
+                    "failed to spawn task worker: {e}"
+                ))),
+            );
+            return Err(McpError::Internal(format!(
+                "failed to spawn task worker: {e}"
+            )));
+        }
+
+        Ok(serde_json::to_value(CreateTaskResult { task, meta: None })?)
     }
 
     /// `logging/setLevel` - set the minimum severity delivered to this client.
@@ -944,7 +1237,8 @@ impl<C: Send + Sync + 'static> Server<C> {
 
     fn handle_initialize(&mut self, request: &JsonRpcRequest) -> Result<Value> {
         let params: InitializeParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
+            Some(p) => serde_json::from_value(p.clone())
+                .map_err(|e| McpError::InvalidParams(format!("Invalid initialize params: {e}")))?,
             None => InitializeParams::default(),
         };
 
@@ -975,6 +1269,13 @@ impl<C: Send + Sync + 'static> Server<C> {
                 // emit `notifications/message`, and a server that emits them
                 // MUST declare this. We used to emit without declaring.
                 logging: Some(serde_json::json!({})),
+                // Only declared when a runtime is actually installed, since
+                // declaring it commits us to honoring task-augmented requests.
+                tasks: self.tasks.as_ref().map(|_| TasksCapability {
+                    list: Some(serde_json::json!({})),
+                    cancel: Some(serde_json::json!({})),
+                    requests: Some(serde_json::json!({ "tools": { "call": {} } })),
+                }),
                 experimental: None,
             },
             server_info: self.server_info(),
@@ -1021,7 +1322,45 @@ impl<C: Send + Sync + 'static> Server<C> {
         let tool = self
             .tools
             .get(&params.name)
-            .ok_or_else(|| McpError::InvalidParams(format!("Unknown tool: {}", params.name)))?;
+            .ok_or_else(|| McpError::InvalidParams(format!("Unknown tool: {}", params.name)))?
+            .clone();
+
+        // Task-augmentation negotiation happens on two levels: the server
+        // capability, then the per-tool `execution.taskSupport`.
+        let augmented = params.task.is_some();
+        let support = tool.task_support();
+
+        if self.tasks.is_some() {
+            match (augmented, support) {
+                (true, TaskSupport::Forbidden) => {
+                    // "Servers SHOULD return a -32601 error if a client
+                    // attempts to [invoke a forbidden tool as a task]."
+                    return Err(McpError::MethodNotFound(format!(
+                        "tool `{}` cannot be invoked as a task",
+                        params.name
+                    )));
+                }
+                (false, TaskSupport::Required) => {
+                    // "Servers MUST return a -32601 error if a client does not
+                    // [invoke a required tool as a task]."
+                    return Err(McpError::MethodNotFound(format!(
+                        "tool `{}` must be invoked as a task",
+                        params.name
+                    )));
+                }
+                (true, _) => {
+                    return self.start_tool_task(
+                        tool,
+                        params.arguments.unwrap_or(serde_json::json!({})),
+                        params.task.unwrap_or_default(),
+                    );
+                }
+                (false, _) => {}
+            }
+        }
+        // With tasks disabled we "MUST process requests of that type normally,
+        // ignoring any task-augmentation metadata if present" - so the `task`
+        // field simply falls on the floor.
 
         let env = self.tool_env();
 
@@ -1180,6 +1519,7 @@ mod tests {
     use super::*;
     use crate::transport::Transport;
     use std::collections::VecDeque;
+    use std::time::Duration;
 
     // Test context
     struct TestContext {
@@ -1629,7 +1969,7 @@ mod tests {
     /// Build a standalone ToolEnv for direct logging tests.
     fn log_env<'a>(
         transport: Option<&'a Arc<Mutex<dyn Transport>>>,
-        resources: &'a HashMap<String, Box<dyn Resource>>,
+        resources: &'a HashMap<String, Arc<dyn Resource>>,
         log_level: LogLevel,
         stderr_logging: StderrLogging,
     ) -> ToolEnv<'a> {
@@ -1642,12 +1982,13 @@ mod tests {
             client_capabilities: &NO_CAPABILITIES,
             broker: &TEST_BROKER,
             can_request: true,
+            cancelled: None,
         }
     }
 
     #[test]
     fn test_log_respects_threshold() {
-        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
         let recorder = RecordingTransport::default();
         let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
 
@@ -1677,7 +2018,7 @@ mod tests {
 
     #[test]
     fn test_log_emits_spec_shaped_notification() {
-        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
         let recorder = RecordingTransport::default();
         let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
         let env = log_env(
@@ -1701,7 +2042,7 @@ mod tests {
 
     #[test]
     fn test_log_data_carries_structured_payload_and_logger() {
-        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
         let recorder = RecordingTransport::default();
         let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
         let env = log_env(
@@ -1732,7 +2073,7 @@ mod tests {
     fn test_log_never_fails_the_tool() {
         // The whole point of the stderr fallback: logging must not be able to
         // turn a working tool into a failing one.
-        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
 
         // No transport at all.
         let env = log_env(None, &resources, LogLevel::Debug, StderrLogging::Fallback);
@@ -1751,7 +2092,7 @@ mod tests {
 
     #[test]
     fn test_log_enabled_matches_delivery() {
-        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
         let recorder = RecordingTransport::default();
         let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
         let env = log_env(
@@ -1782,7 +2123,7 @@ mod tests {
     #[test]
     fn test_stderr_logging_never_still_delivers_to_client() {
         // StderrLogging::Never suppresses only the *fallback*, not delivery.
-        let resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
         let recorder = RecordingTransport::default();
         let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(recorder.clone()));
         let env = log_env(
@@ -2324,17 +2665,17 @@ mod tests {
 
     #[test]
     fn test_tool_env_list_resources() {
-        let mut resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let mut resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
         resources.insert(
             "test://a".into(),
-            Box::new(TestResource {
+            Arc::new(TestResource {
                 uri: "test://a".into(),
                 data: "a".into(),
             }),
         );
         resources.insert(
             "test://b".into(),
-            Box::new(TestResource {
+            Arc::new(TestResource {
                 uri: "test://b".into(),
                 data: "b".into(),
             }),
@@ -2356,10 +2697,10 @@ mod tests {
 
     #[test]
     fn test_tool_env_get_resource() {
-        let mut resources: HashMap<String, Box<dyn Resource>> = HashMap::new();
+        let mut resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
         resources.insert(
             "test://data".into(),
-            Box::new(TestResource {
+            Arc::new(TestResource {
                 uri: "test://data".into(),
                 data: "hello".into(),
             }),
@@ -3554,6 +3895,616 @@ mod tests {
                 .client_capabilities
                 .supports_elicitation(ElicitationMode::Form)
         );
+    }
+
+    //
+    // Tasks (2025-11-25)
+    //
+
+    /// Tool that blocks until released, so a task can be observed mid-flight.
+    struct SlowTool {
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl SlowTool {
+        fn new() -> (Self, Arc<(Mutex<bool>, std::sync::Condvar)>) {
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            (
+                Self {
+                    release: release.clone(),
+                },
+                release,
+            )
+        }
+
+        fn release(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+        }
+    }
+
+    impl Tool<TestContext> for SlowTool {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn description(&self) -> &str {
+            "Blocks until released"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn task_support(&self) -> TaskSupport {
+            TaskSupport::Optional
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            let (lock, condvar) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released && !env.is_cancelled() {
+                let (guard, timeout) = condvar
+                    .wait_timeout(released, Duration::from_millis(20))
+                    .unwrap();
+                released = guard;
+                if timeout.timed_out() && env.is_cancelled() {
+                    break;
+                }
+            }
+            if env.is_cancelled() {
+                return Ok(CallToolResult::text("stopped early"));
+            }
+            Ok(CallToolResult::text("finished"))
+        }
+    }
+
+    /// Tool that must be invoked as a task.
+    struct TaskOnlyTool;
+
+    impl Tool<TestContext> for TaskOnlyTool {
+        fn name(&self) -> &str {
+            "task_only"
+        }
+        fn description(&self) -> &str {
+            "Only callable as a task"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn task_support(&self) -> TaskSupport {
+            TaskSupport::Required
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            // Proves the worker's environment knows it is inside a task.
+            assert!(env.is_task());
+            Ok(CallToolResult::text("ran as task"))
+        }
+    }
+
+    fn task_server() -> Server<TestContext> {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.enable_tasks(TaskConfig::default(), || TestContext { counter: 0 });
+        server
+    }
+
+    fn dispatch(server: &mut Server<TestContext>, method: &str, params: Value) -> Result<Value> {
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: method.to_string(),
+            params: Some(params),
+        };
+        let mut ctx = TestContext { counter: 0 };
+        server.dispatch_request(&request, &mut ctx)
+    }
+
+    /// Poll tasks/get until the status is terminal, or give up.
+    fn await_terminal(server: &mut Server<TestContext>, task_id: &str) -> Value {
+        for _ in 0..500 {
+            let task = dispatch(
+                server,
+                "tasks/get",
+                serde_json::json!({ "taskId": task_id }),
+            )
+            .expect("tasks/get should succeed");
+            let status = task["status"].as_str().unwrap();
+            if matches!(status, "completed" | "failed" | "cancelled") {
+                return task;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("task {task_id} never reached a terminal status");
+    }
+
+    #[test]
+    fn test_tasks_capability_only_declared_when_enabled() {
+        let mut plain: Server<TestContext> = Server::new(ServerConfig::default());
+        let result = dispatch(&mut plain, "initialize", serde_json::json!({})).unwrap();
+        assert!(result["capabilities"]["tasks"].is_null());
+
+        let mut enabled = task_server();
+        let result = dispatch(&mut enabled, "initialize", serde_json::json!({})).unwrap();
+        let tasks = &result["capabilities"]["tasks"];
+        assert!(!tasks.is_null());
+        assert!(!tasks["list"].is_null());
+        assert!(!tasks["cancel"].is_null());
+        assert!(!tasks["requests"]["tools"]["call"].is_null());
+    }
+
+    #[test]
+    fn test_task_methods_are_method_not_found_when_disabled() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        for method in ["tasks/get", "tasks/result", "tasks/list", "tasks/cancel"] {
+            let err =
+                dispatch(&mut server, method, serde_json::json!({ "taskId": "x" })).unwrap_err();
+            assert_eq!(err.to_jsonrpc_error().code, -32601, "{method}");
+        }
+    }
+
+    #[test]
+    fn test_task_augmentation_ignored_when_tasks_disabled() {
+        // "Receivers that do not declare the task capability for a request type
+        // MUST process requests of that type normally, ignoring any
+        // task-augmentation metadata if present."
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(IncrementTool).unwrap();
+
+        let result = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({
+                "name": "increment",
+                "arguments": { "amount": 2 },
+                "task": { "ttl": 60000 }
+            }),
+        )
+        .unwrap();
+
+        // Ordinary result, not a CreateTaskResult.
+        assert!(result.get("task").is_none());
+        assert!(result["content"][0]["text"].as_str().unwrap().contains('2'));
+    }
+
+    #[test]
+    fn test_task_augmented_call_returns_create_task_result() {
+        let mut server = task_server();
+        let (tool, gate) = SlowTool::new();
+        server.add_tool(tool).unwrap();
+
+        let result = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "slow", "task": { "ttl": 60000 } }),
+        )
+        .unwrap();
+
+        // "Tasks MUST begin in the working status when created."
+        assert_eq!(result["task"]["status"], "working");
+        let task_id = result["task"]["taskId"].as_str().unwrap().to_string();
+        assert_eq!(result["task"]["ttl"], 60000);
+        assert!(result["task"]["createdAt"].is_string());
+        assert!(result["task"]["lastUpdatedAt"].is_string());
+        // The actual result is NOT in the create response.
+        assert!(result.get("content").is_none());
+
+        // The task is visible immediately, before the work is done.
+        let polled = dispatch(
+            &mut server,
+            "tasks/get",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap();
+        assert_eq!(polled["taskId"], task_id.as_str());
+
+        SlowTool::release(&gate);
+        let terminal = await_terminal(&mut server, &task_id);
+        assert_eq!(terminal["status"], "completed");
+    }
+
+    #[test]
+    fn test_task_result_returns_the_underlying_result() {
+        let mut server = task_server();
+        let (tool, gate) = SlowTool::new();
+        server.add_tool(tool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "slow", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        SlowTool::release(&gate);
+        await_terminal(&mut server, &task_id);
+
+        let result = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap();
+
+        assert_eq!(result["content"][0]["text"], "finished");
+        // "The tasks/result operation MUST include this metadata in its
+        // response, as the result structure itself does not contain the task
+        // id."
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
+            task_id.as_str()
+        );
+    }
+
+    #[test]
+    fn test_task_result_blocks_until_the_task_finishes() {
+        let mut server = task_server();
+        let (tool, gate) = SlowTool::new();
+        server.add_tool(tool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "slow", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        // Release from another thread after a delay; tasks/result must wait.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            SlowTool::release(&gate);
+        });
+
+        let started = std::time::Instant::now();
+        let result = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap();
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "tasks/result returned before the task finished"
+        );
+        assert_eq!(result["content"][0]["text"], "finished");
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn test_task_cancel_moves_to_cancelled_and_stops_the_tool() {
+        let mut server = task_server();
+        let (tool, _gate) = SlowTool::new();
+        server.add_tool(tool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "slow", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        let cancelled = dispatch(
+            &mut server,
+            "tasks/cancel",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap();
+
+        // The status moves before the response is sent.
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(
+            dispatch(
+                &mut server,
+                "tasks/get",
+                serde_json::json!({ "taskId": task_id })
+            )
+            .unwrap()["status"],
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn test_cancelling_a_terminal_task_is_invalid_params() {
+        let mut server = task_server();
+        let (tool, gate) = SlowTool::new();
+        server.add_tool(tool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "slow", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        SlowTool::release(&gate);
+        await_terminal(&mut server, &task_id);
+
+        let err = dispatch(
+            &mut server,
+            "tasks/cancel",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_jsonrpc_error().code, -32602);
+    }
+
+    #[test]
+    fn test_unknown_task_ids_are_invalid_params() {
+        let mut server = task_server();
+        for method in ["tasks/get", "tasks/result", "tasks/cancel"] {
+            let err = dispatch(
+                &mut server,
+                method,
+                serde_json::json!({ "taskId": "nonexistent" }),
+            )
+            .unwrap_err();
+            assert_eq!(err.to_jsonrpc_error().code, -32602, "{method}");
+        }
+    }
+
+    #[test]
+    fn test_tasks_list_paginates() {
+        let mut server = Server::new(ServerConfig {
+            page_size: 2,
+            ..Default::default()
+        });
+        server.enable_tasks(TaskConfig::default(), || TestContext { counter: 0 });
+        let (tool, gate) = SlowTool::new();
+        server.add_tool(tool).unwrap();
+
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let created = dispatch(
+                &mut server,
+                "tools/call",
+                serde_json::json!({ "name": "slow", "task": {} }),
+            )
+            .unwrap();
+            ids.push(created["task"]["taskId"].as_str().unwrap().to_string());
+        }
+
+        let page = dispatch(&mut server, "tasks/list", serde_json::json!({})).unwrap();
+        assert_eq!(page["tasks"].as_array().unwrap().len(), 2);
+        assert!(page["nextCursor"].is_string());
+
+        let next = dispatch(
+            &mut server,
+            "tasks/list",
+            serde_json::json!({ "cursor": page["nextCursor"] }),
+        )
+        .unwrap();
+        assert_eq!(next["tasks"].as_array().unwrap().len(), 1);
+        assert!(next["nextCursor"].is_null());
+
+        SlowTool::release(&gate);
+        for id in &ids {
+            await_terminal(&mut server, id);
+        }
+    }
+
+    #[test]
+    fn test_forbidden_tool_rejects_task_augmentation() {
+        // "If execution.taskSupport is not present or forbidden, clients MUST
+        // NOT attempt to invoke the tool as a task. Servers SHOULD return a
+        // -32601 error if a client attempts to do so."
+        let mut server = task_server();
+        server.add_tool(IncrementTool).unwrap();
+
+        let err = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "increment", "task": {} }),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_jsonrpc_error().code, -32601);
+        assert!(err.to_string().contains("cannot be invoked as a task"));
+    }
+
+    #[test]
+    fn test_required_tool_rejects_a_plain_call() {
+        // "If execution.taskSupport is required, clients MUST invoke the tool
+        // as a task. Servers MUST return a -32601 error if a client does not."
+        let mut server = task_server();
+        server.add_tool(TaskOnlyTool).unwrap();
+
+        let err = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "task_only" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_jsonrpc_error().code, -32601);
+        assert!(err.to_string().contains("must be invoked as a task"));
+    }
+
+    #[test]
+    fn test_required_tool_runs_when_augmented() {
+        let mut server = task_server();
+        server.add_tool(TaskOnlyTool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "task_only", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        await_terminal(&mut server, &task_id);
+        let result = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap();
+        assert_eq!(result["content"][0]["text"], "ran as task");
+    }
+
+    #[test]
+    fn test_task_support_appears_in_tools_list() {
+        let mut server = task_server();
+        server.add_tool(TaskOnlyTool).unwrap();
+        server.add_tool(IncrementTool).unwrap();
+
+        let result = dispatch(&mut server, "tools/list", serde_json::json!({})).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+
+        let task_only = tools.iter().find(|t| t["name"] == "task_only").unwrap();
+        assert_eq!(task_only["execution"]["taskSupport"], "required");
+
+        // `forbidden` is the default and stays off the wire.
+        let increment = tools.iter().find(|t| t["name"] == "increment").unwrap();
+        assert!(increment.get("execution").is_none());
+    }
+
+    #[test]
+    fn test_failing_tool_in_a_task_reaches_failed() {
+        // "For tool calls specifically, this includes cases where the tool call
+        // result has isError set to true."
+        struct FailingTaskTool;
+        impl Tool<TestContext> for FailingTaskTool {
+            fn name(&self) -> &str {
+                "fails"
+            }
+            fn description(&self) -> &str {
+                "Always fails"
+            }
+            fn schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn task_support(&self) -> TaskSupport {
+                TaskSupport::Optional
+            }
+            fn execute(
+                &self,
+                _args: Value,
+                _ctx: &mut TestContext,
+                _env: &ToolEnv,
+            ) -> Result<CallToolResult> {
+                Err(McpError::ToolError("upstream exploded".into()))
+            }
+        }
+
+        let mut server = task_server();
+        server.add_tool(FailingTaskTool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "fails", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        let terminal = await_terminal(&mut server, &task_id);
+        assert_eq!(terminal["status"], "failed");
+
+        // tasks/result returns exactly what the call would have returned.
+        let result = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("upstream exploded")
+        );
+    }
+
+    #[test]
+    fn test_task_worker_cannot_make_server_initiated_requests() {
+        // Nothing would be reading the transport while a worker blocked, and
+        // the server loop may be inside tasks/result on this very task, so a
+        // round trip must fail fast rather than deadlock.
+        struct EliciterTool;
+        impl Tool<TestContext> for EliciterTool {
+            fn name(&self) -> &str {
+                "elicits"
+            }
+            fn description(&self) -> &str {
+                "Tries to elicit from inside a task"
+            }
+            fn schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn task_support(&self) -> TaskSupport {
+                TaskSupport::Optional
+            }
+            fn execute(
+                &self,
+                _args: Value,
+                _ctx: &mut TestContext,
+                env: &ToolEnv,
+            ) -> Result<CallToolResult> {
+                match env.send_request("elicitation/create", serde_json::json!({})) {
+                    Ok(_) => Ok(CallToolResult::text("unexpectedly succeeded")),
+                    Err(e) => Ok(CallToolResult::text(format!("refused: {e}"))),
+                }
+            }
+        }
+
+        let mut server = task_server();
+        server.add_tool(EliciterTool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "elicits", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        await_terminal(&mut server, &task_id);
+        let result = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap();
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("refused:"), "{text}");
+        assert!(text.contains("nothing is reading the transport"), "{text}");
+    }
+
+    #[test]
+    fn test_task_ids_are_unpredictable() {
+        let mut server = task_server();
+        let (tool, gate) = SlowTool::new();
+        server.add_tool(tool).unwrap();
+
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let created = dispatch(
+                &mut server,
+                "tools/call",
+                serde_json::json!({ "name": "slow", "task": {} }),
+            )
+            .unwrap();
+            let id = created["task"]["taskId"].as_str().unwrap().to_string();
+            assert_eq!(id.len(), 32, "task ids carry 128 bits of entropy");
+            ids.insert(id);
+        }
+        assert_eq!(ids.len(), 5);
+
+        SlowTool::release(&gate);
+        for id in &ids {
+            await_terminal(&mut server, id);
+        }
     }
 
     #[test]

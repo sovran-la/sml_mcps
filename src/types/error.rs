@@ -27,6 +27,7 @@ pub const RESOURCE_NOT_FOUND: i32 = -32002;
 pub const AUTH_ERROR: i32 = -32003;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum McpError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -58,6 +59,14 @@ pub enum McpError {
     #[error("Prompt not found: {0}")]
     PromptNotFound(String),
 
+    /// A JSON-RPC error to replay exactly as-is.
+    ///
+    /// `tasks/result` "MUST return exactly what the underlying request would
+    /// have returned", so a task that failed with a particular code and message
+    /// has to reproduce them rather than be re-derived into something else.
+    #[error("{}", .0.message)]
+    Passthrough(JsonRpcError),
+
     #[cfg(feature = "auth")]
     #[error("Auth error: {0}")]
     Auth(String),
@@ -88,6 +97,7 @@ impl McpError {
                 JsonRpcError::invalid_params(format!("Prompt not found: {}", name))
                     .with_data(serde_json::json!({ "name": name }))
             }
+            McpError::Passthrough(error) => error.clone(),
             McpError::Io(e) => JsonRpcError::internal_error(e.to_string()),
             McpError::TransportClosed => JsonRpcError::internal_error("Transport closed"),
             #[cfg(feature = "auth")]

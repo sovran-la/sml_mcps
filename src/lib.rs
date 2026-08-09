@@ -13,6 +13,7 @@ mod broker;
 pub mod pagination;
 pub mod schema_check;
 pub mod server;
+pub mod tasks;
 pub mod transport;
 pub mod types;
 
@@ -27,6 +28,7 @@ pub use pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
 pub use server::{
     LogLevel, PromptDef, Resource, Server, ServerConfig, StderrLogging, Tool, ToolEnv,
 };
+pub use tasks::{Task, TaskConfig, TaskStatus, TaskStore};
 pub use transport::{OriginPolicy, StdioTransport, Transport};
 pub use types::*;
 
