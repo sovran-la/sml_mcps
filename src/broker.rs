@@ -96,6 +96,21 @@ impl RequestBroker {
         Self::default()
     }
 
+    /// Every collection here is taken this way.
+    ///
+    /// A queue of messages and a map of channels have no invariant an
+    /// interrupted write can break, so there is nothing to protect by refusing
+    /// to look at one - and refusing turns a single panic anywhere into a
+    /// broker that has quietly stopped routing, which is strictly worse than
+    /// whatever the panic was. Same reasoning as `HttpTransport::buffered` and
+    /// `Sessions::table`, and now the same behaviour: the four locks here used
+    /// to disagree three ways, with `register_waiter` the only one that failed
+    /// *loudly* and `deliver` the only one whose failure stranded a waiter it
+    /// had promised to hand a response to.
+    fn hold<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Allocate an id for a server-initiated request.
     ///
     /// String ids with an `sml-` prefix cannot collide with the numeric ids
@@ -110,7 +125,7 @@ impl RequestBroker {
 
     /// Take a previously parked response for `id`, if one arrived.
     pub(crate) fn take_parked(&self, id: &RequestId) -> Option<JsonRpcResponse> {
-        let mut parked = self.parked.lock().ok()?;
+        let mut parked = Self::hold(&self.parked);
         let at = parked.iter().position(|response| &response.id == id)?;
         parked.remove(at)
     }
@@ -136,13 +151,15 @@ impl RequestBroker {
     /// The returned receiver yields the response once whoever is reading routes
     /// it here. The channel holds one message, so the reader hands it over
     /// without ever blocking.
-    pub(crate) fn register_waiter(&self, id: &RequestId) -> Result<Receiver<JsonRpcResponse>> {
+    ///
+    /// Infallible, and see [`hold`](Self::hold) for why. This used to return
+    /// `Internal` on a poisoned lock while every other method here carried on,
+    /// so one panic anywhere turned every later server-initiated request into
+    /// an error from a broker that was otherwise working fine.
+    pub(crate) fn register_waiter(&self, id: &RequestId) -> Receiver<JsonRpcResponse> {
         let (sender, receiver) = sync_channel(1);
-        self.waiters
-            .lock()
-            .map_err(|_| McpError::Internal("Request broker lock poisoned".into()))?
-            .insert(id.clone(), sender);
-        Ok(receiver)
+        Self::hold(&self.waiters).insert(id.clone(), sender);
+        receiver
     }
 
     /// Route a response to whoever is waiting for it.
@@ -151,11 +168,7 @@ impl RequestBroker {
     /// thread that is blocked on a channel would strand it. Falls back to
     /// parking, which is how a waiter further down this call stack collects it.
     pub(crate) fn deliver(&self, response: JsonRpcResponse) {
-        let waiter = self
-            .waiters
-            .lock()
-            .ok()
-            .and_then(|mut waiters| waiters.remove(&response.id));
+        let waiter = Self::hold(&self.waiters).remove(&response.id);
 
         match waiter {
             // A full or disconnected channel means the waiter gave up, so the
@@ -187,7 +200,8 @@ impl RequestBroker {
         if self.forget_abandoned(&response.id) {
             return;
         }
-        if let Ok(mut parked) = self.parked.lock() {
+        {
+            let mut parked = Self::hold(&self.parked);
             // Ids are never reused, so a duplicate is a peer answering twice.
             // The newer answer replaces the older in place rather than queuing
             // behind it, since `take_parked` would only ever return the first.
@@ -204,25 +218,19 @@ impl RequestBroker {
 
     /// Stop waiting for `id`, so a late response to it is discarded.
     pub(crate) fn abandon(&self, id: &RequestId) {
-        if let Ok(mut parked) = self.parked.lock() {
-            parked.retain(|response| &response.id != id);
-        }
-        if let Ok(mut waiters) = self.waiters.lock() {
-            waiters.remove(id);
-        }
-        if let Ok(mut abandoned) = self.abandoned.lock() {
-            abandoned.push_back(id.clone());
-            while abandoned.len() > MAX_ABANDONED {
-                abandoned.pop_front();
-            }
+        Self::hold(&self.parked).retain(|response| &response.id != id);
+        Self::hold(&self.waiters).remove(id);
+
+        let mut abandoned = Self::hold(&self.abandoned);
+        abandoned.push_back(id.clone());
+        while abandoned.len() > MAX_ABANDONED {
+            abandoned.pop_front();
         }
     }
 
     /// Was `id` abandoned? Removes it if so, since a response only arrives once.
     fn forget_abandoned(&self, id: &RequestId) -> bool {
-        let Ok(mut abandoned) = self.abandoned.lock() else {
-            return false;
-        };
+        let mut abandoned = Self::hold(&self.abandoned);
         match abandoned.iter().position(|known| known == id) {
             Some(index) => {
                 abandoned.remove(index);
@@ -241,9 +249,7 @@ impl RequestBroker {
     /// backpressure signal immediately instead of after an hour of queueing.
     #[allow(clippy::result_large_err)] // The `Err` *is* the message handed back.
     pub(crate) fn defer(&self, message: JsonRpcMessage) -> std::result::Result<(), JsonRpcMessage> {
-        let Ok(mut deferred) = self.deferred.lock() else {
-            return Err(message);
-        };
+        let mut deferred = Self::hold(&self.deferred);
         if deferred.len() >= MAX_DEFERRED {
             return Err(message);
         }
@@ -256,7 +262,7 @@ impl RequestBroker {
     /// The main loop calls this before reading, so messages that arrived while
     /// a tool was awaiting a response are handled in arrival order.
     pub(crate) fn next_deferred(&self) -> Option<JsonRpcMessage> {
-        self.deferred.lock().ok()?.pop_front()
+        Self::hold(&self.deferred).pop_front()
     }
 
     /// How many off-thread waiters are registered.
@@ -265,10 +271,7 @@ impl RequestBroker {
     /// "did that exit path clean up?" is a question worth being able to ask.
     #[cfg(test)]
     pub(crate) fn waiter_count(&self) -> usize {
-        self.waiters
-            .lock()
-            .map(|waiters| waiters.len())
-            .unwrap_or(0)
+        Self::hold(&self.waiters).len()
     }
 
     /// Turn a client's response into the result value, or the error it carried.
@@ -611,5 +614,37 @@ mod tests {
             RequestBroker::into_result(response),
             Err(McpError::InvalidMessage(_))
         ));
+    }
+
+    #[test]
+    fn a_poisoned_waiters_lock_does_not_end_the_broker() {
+        // Every other lock here degrades: `deliver`, `park`, `abandon`, `defer`
+        // and `next_deferred` all take the map anyway, because a map of
+        // channels has no invariant an interrupted write can break. This was
+        // the one that refused, so one panic *anywhere* used to make every
+        // later server-initiated request an `Internal` while the rest of the
+        // broker carried on working normally.
+        let broker = std::sync::Arc::new(broker_awaiting(1));
+
+        let poisoner = std::sync::Arc::clone(&broker);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner
+                .waiters
+                .lock()
+                .expect("the lock is not poisoned yet");
+            panic!("poison the waiters lock on purpose");
+        });
+        assert!(panicked.join().is_err());
+        assert!(broker.waiters.is_poisoned(), "the lock did not poison");
+
+        // Registering still works, and a response still routes to it.
+        let id = RequestId::String("sml-0".into());
+        let waiter = broker.register_waiter(&id);
+        broker.deliver(response("sml-0"));
+
+        let answer = waiter
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the response reached the waiter");
+        assert_eq!(answer.id, id);
     }
 }

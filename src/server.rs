@@ -335,7 +335,7 @@ impl<'a> ToolEnv<'a> {
         // the instant it lands, and a waiter that had not registered yet would
         // miss it.
         let delegated = match self.mode {
-            RequestMode::Delegated => Some(self.broker.register_waiter(&id)?),
+            RequestMode::Delegated => Some(self.broker.register_waiter(&id)),
             _ => None,
         };
 

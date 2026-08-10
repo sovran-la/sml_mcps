@@ -482,6 +482,32 @@ enum Processed {
     Accepted,
 }
 
+/// What one request produced, from what its transport buffered.
+///
+/// **The order of the two questions is the rule, not a detail.** "If the input
+/// consists solely of (any number of) JSON-RPC *responses* or *notifications*
+/// ... If the server accepts the input, the server **MUST** return HTTP status
+/// code 202 Accepted with no body." Whether the input was one of those is
+/// answered by whether a response came back, and nothing the server happened to
+/// emit while handling it changes that.
+///
+/// Asking `has_notifications` first - which is what this used to do - turned
+/// that `202` into a `200 text/event-stream` for any notification-handling path
+/// that wrote so much as a log line. No path in `server.rs` writes on one
+/// today, so it was latent; "latent" here means one handler away.
+fn answer_from(transport: &mut HttpTransport) -> Processed {
+    let Some(response) = transport.take_response() else {
+        return Processed::Accepted;
+    };
+
+    // A response *and* something else needs a stream to carry both.
+    if transport.has_notifications() {
+        return Processed::Body(transport.take_sse_response(), "text/event-stream");
+    }
+
+    Processed::Body(response, "application/json")
+}
+
 /// Build an error response whose body is a JSON-RPC error object.
 ///
 /// The spec permits (and dual-era clients benefit from) HTTP error responses
@@ -1408,20 +1434,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             .lock()
             .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
 
-        if transport_guard.has_notifications() {
-            return Ok(Processed::Body(
-                transport_guard.take_sse_response(),
-                "text/event-stream",
-            ));
-        }
-
-        // Nothing written means the input was a notification or a response,
-        // which is the 202 case. It used to be answered `200 {}`, and `{}` is
-        // not a JSON-RPC message.
-        match transport_guard.take_response() {
-            Some(body) => Ok(Processed::Body(body, "application/json")),
-            None => Ok(Processed::Accepted),
-        }
+        Ok(answer_from(&mut transport_guard))
     }
 }
 
@@ -1473,6 +1486,73 @@ mod tests {
         assert!(sse.contains("data: "));
         assert!(sse.contains("notifications/message"));
         assert!(sse.contains("\"result\":\"done\""));
+    }
+
+    #[test]
+    fn a_notification_input_is_202_whatever_the_server_wrote_while_handling_it() {
+        // "If the input consists solely of (any number of) JSON-RPC responses
+        // or notifications ... the server MUST return HTTP status code 202
+        // Accepted with no body." A notification handler that emits a
+        // notification of its own - a log line, a progress update, a task
+        // status - has still been handed an input that gets a `202`, and
+        // testing the buffer before the response turned that into a
+        // `200 text/event-stream`.
+        let mut transport =
+            HttpTransport::new(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.into());
+        transport
+            .write(&JsonRpcMessage::notification(
+                "notifications/message",
+                Some(serde_json::json!({"level": "info", "data": "handled"})),
+            ))
+            .unwrap();
+
+        assert!(
+            transport.has_notifications(),
+            "the setup is only meaningful with something buffered"
+        );
+        assert!(
+            matches!(answer_from(&mut transport), Processed::Accepted),
+            "a notification input was answered with a body"
+        );
+    }
+
+    #[test]
+    fn a_request_that_produced_only_a_response_is_plain_json() {
+        let mut transport =
+            HttpTransport::new(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.into());
+        transport
+            .write(&JsonRpcMessage::response(1i64, serde_json::json!({})))
+            .unwrap();
+
+        match answer_from(&mut transport) {
+            Processed::Body(body, "application/json") => assert!(body.contains("\"result\"")),
+            Processed::Body(_, other) => panic!("answered as {other}"),
+            Processed::Accepted => panic!("a response was answered 202"),
+        }
+    }
+
+    #[test]
+    fn a_request_that_produced_both_needs_a_stream_to_carry_them() {
+        let mut transport =
+            HttpTransport::new(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.into());
+        transport
+            .write(&JsonRpcMessage::notification(
+                "notifications/message",
+                Some(serde_json::json!({"level": "info", "data": "on the way"})),
+            ))
+            .unwrap();
+        transport
+            .write(&JsonRpcMessage::response(1i64, serde_json::json!({})))
+            .unwrap();
+
+        match answer_from(&mut transport) {
+            Processed::Body(body, "text/event-stream") => {
+                assert!(body.contains("notifications/message"), "{body}");
+                assert!(body.contains("\"result\""), "{body}");
+            }
+            Processed::Body(_, other) => panic!("answered as {other}"),
+            Processed::Accepted => panic!("a response was answered 202"),
+        }
     }
 
     #[test]
