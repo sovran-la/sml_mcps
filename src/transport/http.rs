@@ -178,7 +178,9 @@ fn error_response(status: u16, code: i32, message: impl AsRef<str>) -> HttpRespo
 ///     })
 ///     .serve_with_auth(
 ///         "127.0.0.1:3001",
-///         JwtValidator::hs256(SECRET),
+///         // Bound to this server's resource: a token minted for anyone else
+///         // MUST be rejected, and an unbound validator is refused at startup.
+///         JwtValidator::hs256(SECRET).for_resource(&resource),
 ///         |claims| AuthContext {
 ///             user_id: claims.user_id().to_string(),
 ///             tenant_id: claims.tenant_id().to_string(),
@@ -194,6 +196,9 @@ pub struct HttpServer<C> {
     /// `WWW-Authenticate` challenge on a 401.
     #[cfg(feature = "auth")]
     protected_resource: Option<ProtectedResourceMetadata>,
+    /// Scopes every authenticated request must carry.
+    #[cfg(feature = "auth")]
+    required_scopes: Vec<String>,
 }
 
 impl<C: Send + Sync + 'static> HttpServer<C> {
@@ -209,6 +214,8 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             origin_policy: OriginPolicy::default(),
             #[cfg(feature = "auth")]
             protected_resource: None,
+            #[cfg(feature = "auth")]
+            required_scopes: Vec::new(),
         }
     }
 
@@ -261,6 +268,54 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     pub fn protected_resource(mut self, metadata: ProtectedResourceMetadata) -> Self {
         self.protected_resource = Some(metadata);
         self
+    }
+
+    /// Require these scopes on every authenticated request.
+    ///
+    /// A token missing any of them is answered with `403` and a
+    /// `WWW-Authenticate: Bearer error="insufficient_scope"` challenge naming
+    /// what would have been enough - RFC 6750 §3.1, and the spec's own
+    /// "principle of least privilege" guidance.
+    ///
+    /// ```ignore
+    /// HttpServer::new(config)
+    ///     .require_scopes(["files:read"])
+    ///     .serve_with_auth(addr, validator, ..)?;
+    /// ```
+    #[cfg(feature = "auth")]
+    pub fn require_scopes<I, S>(mut self, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// A 403 for a token that authenticated but is not permitted here.
+    #[cfg(feature = "auth")]
+    fn forbidden(&self, missing: &[&str]) -> HttpResponse {
+        let response = error_response(
+            403,
+            -32600,
+            format!("Forbidden: missing scope(s): {}", missing.join(" ")),
+        );
+
+        // The challenge names the metadata document, so it can only be built
+        // where one is published.
+        let challenge = self.protected_resource.as_ref().and_then(|metadata| {
+            let url = metadata.resource_uri().ok()?.metadata_url();
+            Some(crate::auth::insufficient_scope_challenge(
+                &url,
+                &self.required_scopes,
+                Some("the token does not carry the scopes this request needs"),
+            ))
+        });
+
+        match challenge.and_then(|c| Header::from_bytes("WWW-Authenticate", c).ok()) {
+            Some(header) => response.with_header(header),
+            None => response,
+        }
     }
 
     /// The `WWW-Authenticate` challenge to attach to a 401, if metadata is
@@ -486,6 +541,19 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     where
         F: Fn(&Claims) -> C,
     {
+        // "MCP servers MUST validate that access tokens were issued
+        // specifically for them as the intended audience" - so a validator that
+        // checks no audience cannot protect anything, and starting with one
+        // would quietly accept tokens minted for other services.
+        if !validator.binds_audience() {
+            return Err(McpError::Internal(
+                "serve_with_auth needs a validator bound to an audience: MCP servers MUST \
+                 reject tokens that do not name them in the `aud` claim. Use \
+                 `.for_resource(&resource)` (preferred) or `.with_audience(..)`."
+                    .into(),
+            ));
+        }
+
         let http_server = TinyServer::http(addr)
             .map_err(|e| McpError::Internal(format!("Failed to start HTTP server: {}", e)))?;
 
@@ -528,6 +596,14 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
                     continue;
                 }
             };
+
+            // Authenticated is not authorized.
+            let missing = claims.missing_scopes(&self.required_scopes);
+            if !missing.is_empty() {
+                eprintln!("  ✗ Missing scope(s): {}", missing.join(" "));
+                let _ = request.respond(self.forbidden(&missing));
+                continue;
+            }
 
             let body = match Self::read_body(&mut request) {
                 Ok(body) => body,
@@ -1510,11 +1586,25 @@ mod http_server_tests {
         }
 
         fn make_token(user_id: &str, tenant_id: &str) -> String {
+            make_token_with(user_id, tenant_id, Some(RESOURCE), None)
+        }
+
+        /// A token for this server, with optional audience and scopes.
+        fn make_token_with(
+            user_id: &str,
+            tenant_id: &str,
+            audience: Option<&str>,
+            scope: Option<&str>,
+        ) -> String {
             #[derive(Serialize)]
             struct Claims {
                 sub: String,
                 tenant_id: String,
                 exp: u64,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                aud: Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                scope: Option<String>,
             }
 
             let claims = Claims {
@@ -1525,6 +1615,8 @@ mod http_server_tests {
                     .unwrap()
                     .as_secs()
                     + 3600,
+                aud: audience.map(String::from),
+                scope: scope.map(String::from),
             };
 
             encode(
@@ -1533,6 +1625,12 @@ mod http_server_tests {
                 &EncodingKey::from_secret(SECRET),
             )
             .unwrap()
+        }
+
+        /// A validator bound to this server's resource, which is the only kind
+        /// `serve_with_auth` will start with.
+        fn bound_validator() -> JwtValidator {
+            JwtValidator::hs256(SECRET).for_resource(&ResourceUri::parse(RESOURCE).unwrap())
         }
 
         fn http_post_with_auth(
@@ -1606,10 +1704,8 @@ mod http_server_tests {
                         s.add_tool(WhoamiTool)?;
                         Ok(())
                     })
-                    .serve_with_auth(&server_addr, JwtValidator::hs256(SECRET), |claims| {
-                        AuthContext {
-                            user_id: claims.user_id().to_string(),
-                        }
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
                     });
             });
 
@@ -1643,10 +1739,8 @@ mod http_server_tests {
                         s.add_tool(WhoamiTool)?;
                         Ok(())
                     })
-                    .serve_with_auth(&server_addr, JwtValidator::hs256(SECRET), |claims| {
-                        AuthContext {
-                            user_id: claims.user_id().to_string(),
-                        }
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
                     });
             });
 
@@ -1735,6 +1829,110 @@ mod http_server_tests {
 
             thread::sleep(Duration::from_millis(100));
             addr
+        }
+
+        #[test]
+        fn test_serve_with_auth_refuses_an_unbound_validator() {
+            // "MCP servers MUST validate that access tokens were issued
+            // specifically for them as the intended audience." A validator with
+            // no audience cannot, so it cannot protect anything - and the crate
+            // used to document exactly this call as the way to do it.
+            let addr = format!("127.0.0.1:{}", next_port());
+            let error = HttpServer::new(ServerConfig::default())
+                .with_tools(|s: &mut Server<AuthContext>| {
+                    s.add_tool(WhoamiTool)?;
+                    Ok(())
+                })
+                .serve_with_auth(&addr, JwtValidator::hs256(SECRET), |claims| AuthContext {
+                    user_id: claims.user_id().to_string(),
+                })
+                .unwrap_err();
+
+            assert!(error.to_string().contains("aud"), "{error}");
+
+            // Nothing is listening: it refused before binding.
+            assert!(TcpStream::connect(&addr).is_err());
+        }
+
+        #[test]
+        fn test_missing_scopes_are_403_with_an_insufficient_scope_challenge() {
+            let addr = format!("127.0.0.1:{}", next_port());
+            let server_addr = addr.clone();
+
+            thread::spawn(move || {
+                let _ = HttpServer::new(ServerConfig::default())
+                    .protected_resource(metadata())
+                    .require_scopes(["files:write"])
+                    .with_tools(|s: &mut Server<AuthContext>| {
+                        s.add_tool(WhoamiTool)?;
+                        Ok(())
+                    })
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
+                    });
+            });
+            thread::sleep(Duration::from_millis(100));
+
+            // Authenticated, but read-only.
+            let token = make_token_with("alice", "t", Some(RESOURCE), Some("files:read"));
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                addr,
+                token,
+                body.len(),
+                body
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            let challenge = response
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("www-authenticate:"))
+                .expect("403 must say what would have been enough");
+            assert!(
+                challenge.contains("error=\"insufficient_scope\""),
+                "{challenge}"
+            );
+            assert!(challenge.contains("scope=\"files:write\""), "{challenge}");
+
+            // With the scope, the same request goes through.
+            let token =
+                make_token_with("alice", "t", Some(RESOURCE), Some("files:read files:write"));
+            let (status, _, _) = http_post_with_auth(&addr, "/mcp", body, Some(&token)).unwrap();
+            assert_eq!(status, 200);
+        }
+
+        #[test]
+        fn test_a_lowercase_bearer_scheme_is_accepted() {
+            let addr = spawn_protected_server();
+            let token = make_token("alice", "tenant-1");
+
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: bearer {}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                addr,
+                token,
+                body.len(),
+                body
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         }
 
         #[test]
@@ -1854,10 +2052,8 @@ mod http_server_tests {
                         s.add_tool(WhoamiTool)?;
                         Ok(())
                     })
-                    .serve_with_auth(&server_addr, JwtValidator::hs256(SECRET), |claims| {
-                        AuthContext {
-                            user_id: claims.user_id().to_string(),
-                        }
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
                     });
             });
             thread::sleep(Duration::from_millis(100));
@@ -1892,10 +2088,8 @@ mod http_server_tests {
                         s.add_tool(WhoamiTool)?;
                         Ok(())
                     })
-                    .serve_with_auth(&server_addr, JwtValidator::hs256(SECRET), |claims| {
-                        AuthContext {
-                            user_id: claims.user_id().to_string(),
-                        }
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
                     });
             });
 

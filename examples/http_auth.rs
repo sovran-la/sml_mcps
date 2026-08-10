@@ -4,7 +4,8 @@
 
 use serde_json::Value;
 use sml_mcps::{
-    CallToolResult, HttpServer, LogLevel, Result, ServerConfig, Tool, ToolEnv, auth::JwtValidator,
+    CallToolResult, HttpServer, LogLevel, Result, ServerConfig, Tool, ToolEnv,
+    auth::{JwtValidator, ResourceUri},
 };
 
 // For demo: generate test tokens
@@ -75,11 +76,17 @@ impl Tool<AuthContext> for EchoTool {
     }
 }
 
+/// The canonical URI clients are told to ask for tokens for, and the one this
+/// server accepts tokens for. RFC 8707: a token minted for anything else MUST
+/// be rejected.
+const RESOURCE: &str = "http://127.0.0.1:3001/mcp";
+
 fn generate_test_token(user_id: &str, tenant_id: &str) -> String {
     #[derive(Serialize)]
     struct TestClaims {
         sub: String,
         exp: u64,
+        aud: String,
         tenant_id: String,
         scope: String,
     }
@@ -91,6 +98,7 @@ fn generate_test_token(user_id: &str, tenant_id: &str) -> String {
             .unwrap()
             .as_secs()
             + 3600,
+        aud: RESOURCE.to_string(),
         tenant_id: tenant_id.to_string(),
         scope: "read write".to_string(),
     };
@@ -125,14 +133,23 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    let resource = ResourceUri::parse(RESOURCE)
+        .map_err(|e| sml_mcps::McpError::Internal(format!("bad resource URI: {e}")))?;
+
     HttpServer::new(config)
         .with_tools(|server| {
             server.add_tool(WhoamiTool)?;
             server.add_tool(EchoTool)?;
             Ok(())
         })
-        .serve_with_auth(addr, JwtValidator::hs256(SECRET), |claims| AuthContext {
-            user_id: claims.user_id().to_string(),
-            tenant_id: claims.tenant_id().to_string(),
-        })
+        .serve_with_auth(
+            addr,
+            // Bound to this server: `serve_with_auth` refuses to start with a
+            // validator that would accept tokens minted for someone else.
+            JwtValidator::hs256(SECRET).for_resource(&resource),
+            |claims| AuthContext {
+                user_id: claims.user_id().to_string(),
+                tenant_id: claims.tenant_id().to_string(),
+            },
+        )
 }

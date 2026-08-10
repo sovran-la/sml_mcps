@@ -144,25 +144,58 @@ impl Claims {
 }
 
 /// JWT Validator configuration
+///
+/// # Audience is not optional
+///
+/// The authorization spec is blunt: MCP servers "**MUST** validate that access
+/// tokens were issued specifically for them as the intended audience" and
+/// "**MUST** reject tokens that do not include them in the audience claim".
+/// A validator built without [`for_resource`](JwtValidator::for_resource) or
+/// [`with_audience`](JwtValidator::with_audience) therefore cannot be used to
+/// protect a server - [`HttpServer::serve_with_auth`](crate::HttpServer) refuses
+/// to start with one.
+///
+/// The audience check is done here rather than delegated to `jsonwebtoken`,
+/// whose semantics are the wrong way round for this purpose: with `aud`
+/// configured it *ignores* a token that carries no `aud` at all, and with none
+/// configured it *rejects* every token that has one - which is every RFC 8707
+/// conformant token.
 pub struct JwtValidator {
     decoding_key: DecodingKey,
     validation: Validation,
-    /// Set by [`JwtValidator::for_resource`]; enforced after decoding.
+    /// Set by [`JwtValidator::for_resource`]; reported by
+    /// [`resource`](JwtValidator::resource).
     resource: Option<ResourceUri>,
+    /// Audiences a token must name at least one of. Empty means unbound.
+    audiences: Vec<String>,
+}
+
+/// Validation settings shared by every constructor.
+///
+/// `validate_nbf` is off by default in `jsonwebtoken`, which accepts a
+/// not-yet-valid token. `validate_aud` is deliberately off because the audience
+/// check lives in [`JwtValidator::validate`]; see the type docs.
+fn base_validation(algorithm: Algorithm) -> Validation {
+    let mut validation = Validation::new(algorithm);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.validate_aud = false;
+    validation
 }
 
 impl JwtValidator {
     /// Create a validator for HS256 (symmetric) tokens
     ///
     /// Use this for development/testing. In production, prefer RS256.
+    ///
+    /// Bind it to your resource before serving:
+    /// `JwtValidator::hs256(secret).for_resource(&resource)`.
     pub fn hs256(secret: &[u8]) -> Self {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-
         Self {
             decoding_key: DecodingKey::from_secret(secret),
-            validation,
+            validation: base_validation(Algorithm::HS256),
             resource: None,
+            audiences: Vec::new(),
         }
     }
 
@@ -170,25 +203,21 @@ impl JwtValidator {
     ///
     /// Use this in production with your OAuth provider's public key.
     pub fn rs256_pem(public_key_pem: &[u8]) -> Result<Self, JwtError> {
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-
         Ok(Self {
             decoding_key: DecodingKey::from_rsa_pem(public_key_pem)?,
-            validation,
+            validation: base_validation(Algorithm::RS256),
             resource: None,
+            audiences: Vec::new(),
         })
     }
 
     /// Create a validator for RS256 using JWKS components (n, e)
     pub fn rs256_components(n: &str, e: &str) -> Result<Self, JwtError> {
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-
         Ok(Self {
             decoding_key: DecodingKey::from_rsa_components(n, e)?,
-            validation,
+            validation: base_validation(Algorithm::RS256),
             resource: None,
+            audiences: Vec::new(),
         })
     }
 
@@ -198,9 +227,14 @@ impl JwtValidator {
         self
     }
 
-    /// Require a specific audience
+    /// Require a specific audience.
+    ///
+    /// A token is accepted only if its `aud` names this value. Prefer
+    /// [`for_resource`](JwtValidator::for_resource), which takes a validated
+    /// canonical URI; this exists for servers whose audience is not expressed
+    /// as one.
     pub fn with_audience(mut self, audience: &str) -> Self {
-        self.validation.set_audience(&[audience]);
+        self.audiences.push(audience.to_string());
         self
     }
 
@@ -210,12 +244,8 @@ impl JwtValidator {
     /// accepted only if its `aud` names this exact resource. Without it the
     /// server would accept tokens minted for other services, which "breaks a
     /// fundamental OAuth security boundary."
-    ///
-    /// Prefer this over [`JwtValidator::with_audience`], which takes an
-    /// unvalidated string and does not enforce canonical-URI rules.
     pub fn for_resource(mut self, resource: &ResourceUri) -> Self {
-        self.validation.set_audience(&[resource.as_str()]);
-        self.validation.validate_aud = true;
+        self.audiences.push(resource.as_str().to_string());
         self.resource = Some(resource.clone());
         self
     }
@@ -225,11 +255,29 @@ impl JwtValidator {
         self.resource.as_ref()
     }
 
+    /// Does this validator enforce an audience at all?
+    ///
+    /// `false` means it accepts tokens minted for anyone, which is the MUST
+    /// violation `serve_with_auth` refuses to start with.
+    pub fn binds_audience(&self) -> bool {
+        !self.audiences.is_empty()
+    }
+
     /// Extract token from Authorization header
+    ///
+    /// The scheme is matched case-insensitively: RFC 7235 §2.1, "The scheme
+    /// name is case-insensitive", so `bearer <token>` is as valid as
+    /// `Bearer <token>`.
     pub fn extract_token(auth_header: &str) -> Result<&str, JwtError> {
-        auth_header
-            .strip_prefix("Bearer ")
-            .ok_or(JwtError::InvalidFormat)
+        let (scheme, token) = auth_header.split_once(' ').ok_or(JwtError::InvalidFormat)?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return Err(JwtError::InvalidFormat);
+        }
+        let token = token.trim_start();
+        if token.is_empty() {
+            return Err(JwtError::InvalidFormat);
+        }
+        Ok(token)
     }
 
     /// Validate a token and return claims
@@ -237,13 +285,16 @@ impl JwtValidator {
         let token_data: TokenData<Claims> = decode(token, &self.decoding_key, &self.validation)?;
         let claims = token_data.claims;
 
-        // `jsonwebtoken` only compares the audience when the claim is present,
-        // so a token with no `aud` at all passes its check. That is exactly the
-        // token the spec says to refuse: servers "MUST reject tokens that do
-        // not include them in the audience claim". Enforce it ourselves rather
-        // than depend on the library's edge-case semantics.
-        if let Some(resource) = &self.resource {
-            if !claims.is_for_resource(resource) {
+        // An absent `aud` is the token the spec says to refuse, and it is the
+        // one `jsonwebtoken` waves through. Checked here, where "no audience
+        // configured" is the only way to opt out - and that is refused at the
+        // point of use.
+        if !self.audiences.is_empty() {
+            let named = claims
+                .aud
+                .as_ref()
+                .is_some_and(|aud| self.audiences.iter().any(|want| aud.contains(want)));
+            if !named {
                 return Err(JwtError::InvalidAudience);
             }
         }
@@ -450,7 +501,8 @@ mod tests {
 
     #[test]
     fn test_unbound_validator_ignores_audience() {
-        // Without for_resource, audience is not this validator's business.
+        // An unbound validator checks no audience, which is why
+        // `serve_with_auth` refuses to start with one.
         let secret = b"secret";
         let validator = JwtValidator::hs256(secret);
 
@@ -460,6 +512,100 @@ mod tests {
                 .is_ok()
         );
         assert!(validator.resource().is_none());
+        assert!(!validator.binds_audience());
+    }
+
+    #[test]
+    fn test_an_unbound_validator_no_longer_rejects_conformant_tokens() {
+        // `Validation::new` leaves `validate_aud: true, aud: None`, which
+        // `jsonwebtoken` turns into a hard `InvalidAudience` for any token that
+        // *has* an `aud` - i.e. every RFC 8707 conformant one. Backwards: it
+        // refused the good tokens and accepted the bad.
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret);
+
+        let conformant = create_test_token(
+            &claims_with(Some(Audience::One("https://mcp.example.com/mcp".into()))),
+            secret,
+        );
+        assert!(validator.validate(&conformant).is_ok());
+    }
+
+    #[test]
+    fn test_with_audience_enforces_the_audience_it_names() {
+        // `set_audience` alone does not do this: jsonwebtoken's
+        // `(NotPresent, Some(_))` case falls through, so an `aud`-less token
+        // used to sail past `with_audience` too.
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret).with_audience("https://mcp.example.com/mcp");
+        assert!(validator.binds_audience());
+
+        assert!(matches!(
+            validator.validate(&create_test_token(&claims_with(None), secret)),
+            Err(JwtError::InvalidAudience)
+        ));
+        assert!(matches!(
+            validator.validate(&create_test_token(
+                &claims_with(Some(Audience::One("https://elsewhere.example.com".into()))),
+                secret
+            )),
+            Err(JwtError::InvalidAudience)
+        ));
+        assert!(
+            validator
+                .validate(&create_test_token(
+                    &claims_with(Some(Audience::One("https://mcp.example.com/mcp".into()))),
+                    secret
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_a_not_yet_valid_token_is_rejected() {
+        // `validate_nbf` is off by default in jsonwebtoken, so a token that
+        // does not become valid until next week was accepted today.
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret).for_resource(&resource());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "user-123",
+                "aud": resource().as_str(),
+                "exp": now + 7200,
+                "nbf": now + 3600,
+            }),
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            validator.validate(&token),
+            Err(JwtError::ValidationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn test_bearer_scheme_is_case_insensitive() {
+        // RFC 7235 §2.1: "The scheme name is case-insensitive."
+        for header in ["Bearer abc.def", "bearer abc.def", "BEARER abc.def"] {
+            assert_eq!(JwtValidator::extract_token(header).unwrap(), "abc.def");
+        }
+
+        for header in ["Basic abc.def", "Bearer", "Bearer ", ""] {
+            assert!(
+                matches!(
+                    JwtValidator::extract_token(header),
+                    Err(JwtError::InvalidFormat)
+                ),
+                "{header:?} should not yield a token"
+            );
+        }
     }
 
     #[test]

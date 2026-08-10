@@ -1,0 +1,22 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Coverage
+*.profraw
+*.profdata
+lcov.info
+coverage/
+
+# AI semantic search index
+.ai-index/
