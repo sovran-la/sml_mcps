@@ -3,6 +3,8 @@
 //! Validates tokens and extracts claims. Does NOT issue tokens -
 //! that's the job of your OAuth provider (Auth0, Cognito, etc).
 
+use crate::IDENTITY_SEPARATOR;
+use crate::auth::ResourceUri;
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, decode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,6 +28,58 @@ pub enum JwtError {
 
     #[error("Invalid audience")]
     InvalidAudience,
+
+    /// A claim carrying a character this server composes keys out of.
+    ///
+    /// See [`JwtValidator::validate`].
+    #[error("A claim contains a character that cannot appear in one")]
+    MalformedClaim,
+}
+
+impl JwtError {
+    /// What failed, in words this server chose.
+    ///
+    /// `Display` on a [`ValidationFailed`](Self::ValidationFailed) quotes the
+    /// offending part of the token back verbatim - and a JOSE header is decoded
+    /// **before** the signature is verified, so an unauthenticated peer picks
+    /// that text, newlines and all. Interpolating it into a log line is log
+    /// forgery: one arbitrary record per request, unbounded, attributed to a
+    /// server that never emitted it.
+    ///
+    /// So anything that reaches a log gets this instead - a fixed set, one of
+    /// which is always true, none of which the peer wrote. The detail is still
+    /// worth having behind a debug gate, and still goes back to the client in
+    /// the `401` body, where it is JSON-escaped and the reader is the attacker.
+    pub fn summary(&self) -> &'static str {
+        use jsonwebtoken::errors::ErrorKind;
+
+        match self {
+            JwtError::MissingHeader => "missing header",
+            JwtError::InvalidFormat => "malformed header",
+            JwtError::Expired => "expired",
+            JwtError::InvalidIssuer => "bad issuer",
+            JwtError::InvalidAudience => "bad audience",
+            JwtError::MalformedClaim => "a claim this server cannot use",
+            JwtError::ValidationFailed(inner) => match inner.kind() {
+                ErrorKind::InvalidToken => "malformed token",
+                ErrorKind::InvalidSignature => "invalid signature",
+                ErrorKind::ExpiredSignature => "expired",
+                ErrorKind::ImmatureSignature => "not valid yet",
+                ErrorKind::InvalidIssuer => "bad issuer",
+                ErrorKind::InvalidAudience => "bad audience",
+                ErrorKind::InvalidSubject => "bad subject",
+                ErrorKind::MissingRequiredClaim(_) => "a required claim is missing",
+                ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => {
+                    "unacceptable algorithm"
+                }
+                ErrorKind::Base64(_) | ErrorKind::Utf8(_) | ErrorKind::Json(_) => "malformed token",
+                // The remainder are this server's key or provider being wrong,
+                // not the peer's token - and `ErrorKind` is `non_exhaustive`,
+                // so the wildcard is also whatever a later version adds.
+                _ => "the validator could not run",
+            },
+        }
+    }
 }
 
 /// Standard JWT claims plus custom fields for multi-tenancy
@@ -45,9 +99,13 @@ pub struct Claims {
     #[serde(default)]
     pub iss: Option<String>,
 
-    /// Audience
-    #[serde(default)]
-    pub aud: Option<String>,
+    /// Audience: the resource(s) this token was minted for.
+    ///
+    /// RFC 7519 allows either a single string or an array, and a token issued
+    /// for several resources uses the array form - so this must accept both or
+    /// multi-audience tokens fail to deserialize before validation even runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aud: Option<Audience>,
 
     /// Tenant ID for multi-tenancy (custom claim)
     #[serde(default)]
@@ -58,7 +116,67 @@ pub struct Claims {
     pub scope: Option<String>,
 }
 
+/// A JWT `aud` claim: one audience or several.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Audience {
+    /// The audiences, however they were expressed.
+    pub fn values(&self) -> &[String] {
+        match self {
+            Audience::One(value) => std::slice::from_ref(value),
+            Audience::Many(values) => values,
+        }
+    }
+
+    /// Does this token name `resource` as an intended audience?
+    pub fn contains(&self, resource: &str) -> bool {
+        self.values().iter().any(|value| value == resource)
+    }
+}
+
 impl Claims {
+    /// The audiences this token was issued for.
+    pub fn audiences(&self) -> &[String] {
+        self.aud.as_ref().map(Audience::values).unwrap_or(&[])
+    }
+
+    /// Was this token issued for `resource`?
+    ///
+    /// The check that stops a token minted for another service being replayed
+    /// here: "MCP servers MUST only accept tokens specifically intended for
+    /// themselves and MUST reject tokens that do not include them in the
+    /// audience claim."
+    pub fn is_for_resource(&self, resource: &ResourceUri) -> bool {
+        self.aud
+            .as_ref()
+            .is_some_and(|aud| aud.contains(resource.as_str()))
+    }
+
+    /// Every scope on this token.
+    pub fn scopes(&self) -> Vec<&str> {
+        self.scope
+            .as_deref()
+            .map(|s| s.split_whitespace().collect())
+            .unwrap_or_default()
+    }
+
+    /// Which of `required` this token is missing.
+    ///
+    /// An empty result means the request is authorized; anything else is what
+    /// belongs in the `scope` parameter of an `insufficient_scope` challenge.
+    pub fn missing_scopes<'a>(&self, required: &'a [String]) -> Vec<&'a str> {
+        required
+            .iter()
+            .map(String::as_str)
+            .filter(|scope| !self.has_scope(scope))
+            .collect()
+    }
+
     /// Get the user ID (subject)
     pub fn user_id(&self) -> &str {
         &self.sub
@@ -79,22 +197,58 @@ impl Claims {
 }
 
 /// JWT Validator configuration
+///
+/// # Audience is not optional
+///
+/// The authorization spec is blunt: MCP servers "**MUST** validate that access
+/// tokens were issued specifically for them as the intended audience" and
+/// "**MUST** reject tokens that do not include them in the audience claim".
+/// A validator built without [`for_resource`](JwtValidator::for_resource) or
+/// [`with_audience`](JwtValidator::with_audience) therefore cannot be used to
+/// protect a server - [`HttpServer::serve_with_auth`](crate::HttpServer) refuses
+/// to start with one.
+///
+/// The audience check is done here rather than delegated to `jsonwebtoken`,
+/// whose semantics are the wrong way round for this purpose: with `aud`
+/// configured it *ignores* a token that carries no `aud` at all, and with none
+/// configured it *rejects* every token that has one - which is every RFC 8707
+/// conformant token.
 pub struct JwtValidator {
     decoding_key: DecodingKey,
     validation: Validation,
+    /// Set by [`JwtValidator::for_resource`]; reported by
+    /// [`resource`](JwtValidator::resource).
+    resource: Option<ResourceUri>,
+    /// Audiences a token must name at least one of. Empty means unbound.
+    audiences: Vec<String>,
+}
+
+/// Validation settings shared by every constructor.
+///
+/// `validate_nbf` is off by default in `jsonwebtoken`, which accepts a
+/// not-yet-valid token. `validate_aud` is deliberately off because the audience
+/// check lives in [`JwtValidator::validate`]; see the type docs.
+fn base_validation(algorithm: Algorithm) -> Validation {
+    let mut validation = Validation::new(algorithm);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.validate_aud = false;
+    validation
 }
 
 impl JwtValidator {
     /// Create a validator for HS256 (symmetric) tokens
     ///
     /// Use this for development/testing. In production, prefer RS256.
+    ///
+    /// Bind it to your resource before serving:
+    /// `JwtValidator::hs256(secret).for_resource(&resource)`.
     pub fn hs256(secret: &[u8]) -> Self {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-
         Self {
             decoding_key: DecodingKey::from_secret(secret),
-            validation,
+            validation: base_validation(Algorithm::HS256),
+            resource: None,
+            audiences: Vec::new(),
         }
     }
 
@@ -102,23 +256,21 @@ impl JwtValidator {
     ///
     /// Use this in production with your OAuth provider's public key.
     pub fn rs256_pem(public_key_pem: &[u8]) -> Result<Self, JwtError> {
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-
         Ok(Self {
             decoding_key: DecodingKey::from_rsa_pem(public_key_pem)?,
-            validation,
+            validation: base_validation(Algorithm::RS256),
+            resource: None,
+            audiences: Vec::new(),
         })
     }
 
     /// Create a validator for RS256 using JWKS components (n, e)
     pub fn rs256_components(n: &str, e: &str) -> Result<Self, JwtError> {
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-
         Ok(Self {
             decoding_key: DecodingKey::from_rsa_components(n, e)?,
-            validation,
+            validation: base_validation(Algorithm::RS256),
+            resource: None,
+            audiences: Vec::new(),
         })
     }
 
@@ -128,23 +280,99 @@ impl JwtValidator {
         self
     }
 
-    /// Require a specific audience
+    /// Require a specific audience.
+    ///
+    /// A token is accepted only if its `aud` names this value. Prefer
+    /// [`for_resource`](JwtValidator::for_resource), which takes a validated
+    /// canonical URI; this exists for servers whose audience is not expressed
+    /// as one.
     pub fn with_audience(mut self, audience: &str) -> Self {
-        self.validation.set_audience(&[audience]);
+        self.audiences.push(audience.to_string());
         self
     }
 
+    /// Bind this validator to the server's canonical resource URI.
+    ///
+    /// This is the RFC 8707 audience check the spec makes a MUST: a token is
+    /// accepted only if its `aud` names this exact resource. Without it the
+    /// server would accept tokens minted for other services, which "breaks a
+    /// fundamental OAuth security boundary."
+    pub fn for_resource(mut self, resource: &ResourceUri) -> Self {
+        self.audiences.push(resource.as_str().to_string());
+        self.resource = Some(resource.clone());
+        self
+    }
+
+    /// The resource this validator is bound to, if any.
+    pub fn resource(&self) -> Option<&ResourceUri> {
+        self.resource.as_ref()
+    }
+
+    /// Does this validator enforce an audience at all?
+    ///
+    /// `false` means it accepts tokens minted for anyone, which is the MUST
+    /// violation `serve_with_auth` refuses to start with.
+    pub fn binds_audience(&self) -> bool {
+        !self.audiences.is_empty()
+    }
+
     /// Extract token from Authorization header
+    ///
+    /// The scheme is matched case-insensitively: RFC 7235 §2.1, "The scheme
+    /// name is case-insensitive", so `bearer <token>` is as valid as
+    /// `Bearer <token>`.
     pub fn extract_token(auth_header: &str) -> Result<&str, JwtError> {
-        auth_header
-            .strip_prefix("Bearer ")
-            .ok_or(JwtError::InvalidFormat)
+        let (scheme, token) = auth_header.split_once(' ').ok_or(JwtError::InvalidFormat)?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return Err(JwtError::InvalidFormat);
+        }
+        let token = token.trim_start();
+        if token.is_empty() {
+            return Err(JwtError::InvalidFormat);
+        }
+        Ok(token)
     }
 
     /// Validate a token and return claims
+    ///
+    /// # The separator stays a separator
+    ///
+    /// `sub` and `tenant_id` are composed with `\u{1}` between them to key
+    /// sessions and tasks - which is what security_best_practices §Session
+    /// Hijacking asks for, and only works while the separator cannot appear in
+    /// what it separates. A `sub` of `a\u{1}b` with no tenant and a `sub` of `a`
+    /// with tenant `b` would otherwise be one identity.
+    ///
+    /// The issuer controls both claims and a signature is required to get here,
+    /// so this is a belt over braces. It is also one comparison.
     pub fn validate(&self, token: &str) -> Result<Claims, JwtError> {
         let token_data: TokenData<Claims> = decode(token, &self.decoding_key, &self.validation)?;
-        Ok(token_data.claims)
+        let claims = token_data.claims;
+
+        if claims.sub.contains(IDENTITY_SEPARATOR)
+            || claims
+                .tenant_id
+                .as_deref()
+                .is_some_and(|tenant| tenant.contains(IDENTITY_SEPARATOR))
+        {
+            return Err(JwtError::MalformedClaim);
+        }
+
+        // An absent `aud` is the token the spec says to refuse, and it is the
+        // one `jsonwebtoken` waves through. Checked here, where "no audience
+        // configured" is the only way to opt out - and that is refused at the
+        // point of use.
+        if !self.audiences.is_empty() {
+            let named = claims
+                .aud
+                .as_ref()
+                .is_some_and(|aud| self.audiences.iter().any(|want| aud.contains(want)));
+            if !named {
+                return Err(JwtError::InvalidAudience);
+            }
+        }
+
+        Ok(claims)
     }
 
     /// Validate from Authorization header value
@@ -232,6 +460,249 @@ mod tests {
         assert!(result.is_err());
     }
 
+    //
+    // RFC 8707 audience binding
+    //
+
+    fn resource() -> ResourceUri {
+        ResourceUri::parse("https://mcp.example.com/mcp").unwrap()
+    }
+
+    fn claims_with(aud: Option<Audience>) -> Claims {
+        Claims {
+            sub: "user-123".into(),
+            exp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+            iat: 0,
+            iss: None,
+            aud,
+            tenant_id: None,
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn test_audience_accepts_string_and_array_forms() {
+        // RFC 7519 allows either; a multi-audience token must still parse.
+        let single: Claims =
+            serde_json::from_value(serde_json::json!({ "sub": "u", "exp": 0, "aud": "https://a" }))
+                .unwrap();
+        assert_eq!(single.audiences(), ["https://a"]);
+
+        let many: Claims = serde_json::from_value(
+            serde_json::json!({ "sub": "u", "exp": 0, "aud": ["https://a", "https://b"] }),
+        )
+        .unwrap();
+        assert_eq!(many.audiences(), ["https://a", "https://b"]);
+
+        let none: Claims =
+            serde_json::from_value(serde_json::json!({ "sub": "u", "exp": 0 })).unwrap();
+        assert!(none.audiences().is_empty());
+    }
+
+    #[test]
+    fn test_is_for_resource_matches_exactly() {
+        let target = resource();
+
+        assert!(claims_with(Some(Audience::One(target.as_str().into()))).is_for_resource(&target));
+        assert!(
+            claims_with(Some(Audience::Many(vec![
+                "https://other.example.com".into(),
+                target.as_str().into(),
+            ])))
+            .is_for_resource(&target)
+        );
+
+        assert!(!claims_with(None).is_for_resource(&target));
+        assert!(
+            !claims_with(Some(Audience::One("https://other.example.com/mcp".into())))
+                .is_for_resource(&target)
+        );
+        // A prefix is not a match; a token for the host is not a token for us.
+        assert!(
+            !claims_with(Some(Audience::One("https://mcp.example.com".into())))
+                .is_for_resource(&target)
+        );
+    }
+
+    #[test]
+    fn test_validator_rejects_a_token_for_another_resource() {
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret).for_resource(&resource());
+
+        let foreign = create_test_token(
+            &claims_with(Some(Audience::One("https://other.example.com/mcp".into()))),
+            secret,
+        );
+        assert!(matches!(
+            validator.validate(&foreign),
+            Err(JwtError::ValidationFailed(_)) | Err(JwtError::InvalidAudience)
+        ));
+    }
+
+    #[test]
+    fn test_validator_rejects_a_token_with_no_audience() {
+        // jsonwebtoken skips its audience check when the claim is absent, so
+        // this is the case the explicit check exists for.
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret).for_resource(&resource());
+
+        let token = create_test_token(&claims_with(None), secret);
+        assert!(matches!(
+            validator.validate(&token),
+            Err(JwtError::InvalidAudience)
+        ));
+    }
+
+    #[test]
+    fn test_validator_accepts_a_token_for_this_resource() {
+        let secret = b"secret";
+        let target = resource();
+        let validator = JwtValidator::hs256(secret).for_resource(&target);
+
+        let token = create_test_token(
+            &claims_with(Some(Audience::One(target.as_str().into()))),
+            secret,
+        );
+        let validated = validator.validate(&token).unwrap();
+        assert_eq!(validated.user_id(), "user-123");
+        assert_eq!(validator.resource().unwrap().as_str(), target.as_str());
+    }
+
+    #[test]
+    fn test_unbound_validator_ignores_audience() {
+        // An unbound validator checks no audience, which is why
+        // `serve_with_auth` refuses to start with one.
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret);
+
+        assert!(
+            validator
+                .validate(&create_test_token(&claims_with(None), secret))
+                .is_ok()
+        );
+        assert!(validator.resource().is_none());
+        assert!(!validator.binds_audience());
+    }
+
+    #[test]
+    fn test_an_unbound_validator_no_longer_rejects_conformant_tokens() {
+        // `Validation::new` leaves `validate_aud: true, aud: None`, which
+        // `jsonwebtoken` turns into a hard `InvalidAudience` for any token that
+        // *has* an `aud` - i.e. every RFC 8707 conformant one. Backwards: it
+        // refused the good tokens and accepted the bad.
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret);
+
+        let conformant = create_test_token(
+            &claims_with(Some(Audience::One("https://mcp.example.com/mcp".into()))),
+            secret,
+        );
+        assert!(validator.validate(&conformant).is_ok());
+    }
+
+    #[test]
+    fn test_with_audience_enforces_the_audience_it_names() {
+        // `set_audience` alone does not do this: jsonwebtoken's
+        // `(NotPresent, Some(_))` case falls through, so an `aud`-less token
+        // used to sail past `with_audience` too.
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret).with_audience("https://mcp.example.com/mcp");
+        assert!(validator.binds_audience());
+
+        assert!(matches!(
+            validator.validate(&create_test_token(&claims_with(None), secret)),
+            Err(JwtError::InvalidAudience)
+        ));
+        assert!(matches!(
+            validator.validate(&create_test_token(
+                &claims_with(Some(Audience::One("https://elsewhere.example.com".into()))),
+                secret
+            )),
+            Err(JwtError::InvalidAudience)
+        ));
+        assert!(
+            validator
+                .validate(&create_test_token(
+                    &claims_with(Some(Audience::One("https://mcp.example.com/mcp".into()))),
+                    secret
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_a_not_yet_valid_token_is_rejected() {
+        // `validate_nbf` is off by default in jsonwebtoken, so a token that
+        // does not become valid until next week was accepted today.
+        let secret = b"secret";
+        let validator = JwtValidator::hs256(secret).for_resource(&resource());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "user-123",
+                "aud": resource().as_str(),
+                "exp": now + 7200,
+                "nbf": now + 3600,
+            }),
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            validator.validate(&token),
+            Err(JwtError::ValidationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn test_bearer_scheme_is_case_insensitive() {
+        // RFC 7235 §2.1: "The scheme name is case-insensitive."
+        for header in ["Bearer abc.def", "bearer abc.def", "BEARER abc.def"] {
+            assert_eq!(JwtValidator::extract_token(header).unwrap(), "abc.def");
+        }
+
+        for header in ["Basic abc.def", "Bearer", "Bearer ", ""] {
+            assert!(
+                matches!(
+                    JwtValidator::extract_token(header),
+                    Err(JwtError::InvalidFormat)
+                ),
+                "{header:?} should not yield a token"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scope_helpers() {
+        let mut claims = claims_with(None);
+        claims.scope = Some("files:read files:write".into());
+
+        assert_eq!(claims.scopes(), ["files:read", "files:write"]);
+        assert!(
+            claims
+                .missing_scopes(&["files:read".to_string()])
+                .is_empty()
+        );
+        assert_eq!(
+            claims.missing_scopes(&["files:read".to_string(), "admin".to_string()]),
+            ["admin"]
+        );
+
+        // No scope claim at all means everything is missing.
+        let bare = claims_with(None);
+        assert!(bare.scopes().is_empty());
+        assert_eq!(bare.missing_scopes(&["any".to_string()]), ["any"]);
+    }
+
     #[test]
     fn test_tenant_id_fallback() {
         let claims = Claims {
@@ -246,5 +717,125 @@ mod tests {
 
         // Should fall back to user_id
         assert_eq!(claims.tenant_id(), "user-123");
+    }
+
+    /// A token with `exp` an hour out, so only the thing under test can fail
+    /// it.
+    fn live_claims(sub: &str, tenant: Option<&str>) -> Claims {
+        Claims {
+            sub: sub.to_string(),
+            exp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+            iat: 0,
+            iss: None,
+            aud: None,
+            tenant_id: tenant.map(str::to_string),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn a_separator_in_a_claim_is_refused_so_two_identities_stay_two() {
+        // Sessions and tasks are keyed `<user>␁<tenant>␁<id>`, which only tells
+        // identities apart while `␁` cannot appear in what it separates. These
+        // two compose to the same owner: `a␁b` with no tenant falls back to the
+        // subject and yields `a␁b␁a␁b`, and subject `a` with tenant `b` also
+        // starts `a␁b`. One is refused, so the collision cannot be built.
+        let secret = b"super-secret-key-for-testing";
+        let validator = JwtValidator::hs256(secret);
+
+        let smuggled = create_test_token(&live_claims("a\u{1}b", None), secret);
+        assert!(
+            matches!(validator.validate(&smuggled), Err(JwtError::MalformedClaim)),
+            "a subject carrying the separator was accepted"
+        );
+
+        let smuggled = create_test_token(&live_claims("a", Some("b\u{1}c")), secret);
+        assert!(
+            matches!(validator.validate(&smuggled), Err(JwtError::MalformedClaim)),
+            "a tenant carrying the separator was accepted"
+        );
+
+        // And the ordinary token this is not allowed to cost anything.
+        let ordinary = create_test_token(&live_claims("user-123", Some("tenant-456")), secret);
+        assert!(validator.validate(&ordinary).is_ok());
+    }
+
+    #[test]
+    fn an_auth_failure_summary_is_never_the_peers_text() {
+        // Log forgery. `Display` on a `ValidationFailed` quotes the offending
+        // part of the token back, and the JOSE header is decoded *before* the
+        // signature is checked - so an unauthenticated peer writes whatever it
+        // likes, newlines included, into the server's stderr once per request.
+        //
+        // The header below is `{"alg":"HS256\ninjected-log-line: ...","typ":"JWT"}`,
+        // base64url, with a body and signature that are never reached.
+        let forged = "eyJhbGciOiJIUzI1NlxuaW5qZWN0ZWQtbG9nLWxpbmU6IHRoZS1zZXJ2ZXItd2FzLXB3bmVkIiwidHlwIjoiSldUIn0\
+                      .eyJzdWIiOiJ4IiwiZXhwIjo5OTk5OTk5OTk5fQ.c2ln";
+        let validator = JwtValidator::hs256(b"super-secret-key-for-testing");
+
+        let error = validator.validate(forged).expect_err("a forged header");
+        assert!(
+            error.to_string().contains("injected-log-line"),
+            "this test is only meaningful while `Display` still echoes the \
+             peer: {error}"
+        );
+
+        let summary = error.summary();
+        assert!(
+            !summary.contains("injected-log-line"),
+            "the summary echoed the peer: {summary}"
+        );
+        assert!(
+            !summary.contains('\n') && !summary.contains('\r'),
+            "the summary can forge a log line: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn every_auth_failure_summarises_to_one_safe_line() {
+        // The property, not the cases: whatever a peer manages to produce, what
+        // reaches a log is one line of text this server wrote.
+        let secret = b"super-secret-key-for-testing";
+        let validator = JwtValidator::hs256(secret);
+        let expired = create_test_token(
+            &Claims {
+                exp: 1,
+                ..live_claims("user-123", None)
+            },
+            secret,
+        );
+
+        let failures = [
+            JwtError::MissingHeader,
+            JwtError::InvalidFormat,
+            JwtError::Expired,
+            JwtError::InvalidIssuer,
+            JwtError::InvalidAudience,
+            JwtError::MalformedClaim,
+            validator.validate("not-a-token").unwrap_err(),
+            validator.validate(&expired).unwrap_err(),
+            validator
+                .validate(&create_test_token(
+                    &live_claims("x", None),
+                    b"a-different-key",
+                ))
+                .unwrap_err(),
+            JwtValidator::extract_token("Basic nope").unwrap_err(),
+        ];
+
+        for failure in &failures {
+            let summary = failure.summary();
+            assert!(!summary.is_empty(), "{failure:?} summarised to nothing");
+            assert!(
+                summary
+                    .bytes()
+                    .all(|b| b == b' ' || (0x21..0x7f).contains(&b)),
+                "{failure:?} summarised to something a log cannot hold: {summary:?}"
+            );
+        }
     }
 }

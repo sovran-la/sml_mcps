@@ -2,10 +2,15 @@
 //!
 //! Abstracts communication between client and server.
 
+mod line;
+mod origin;
 mod stdio;
 
 #[cfg(feature = "http")]
 mod http;
+
+#[cfg(feature = "http")]
+mod http1;
 
 #[cfg(unix)]
 mod unix;
@@ -13,6 +18,8 @@ mod unix;
 #[cfg(unix)]
 mod unix_server;
 
+pub use line::MAX_MESSAGE_BYTES;
+pub use origin::OriginPolicy;
 pub use stdio::StdioTransport;
 
 #[cfg(feature = "http")]
@@ -29,10 +36,16 @@ pub use unix_server::UnixServer;
 pub(crate) use unix_server::pid_path_for;
 
 use crate::types::{JsonRpcMessage, Result};
+use std::time::Duration;
 
 /// Transport trait - sync read/write of JSON-RPC messages
 pub trait Transport: Send + Sync {
     /// Read a single message from the transport
+    ///
+    /// Blocks until a message arrives, the peer hangs up
+    /// ([`McpError::TransportClosed`](crate::McpError::TransportClosed)), or -
+    /// if [`set_read_timeout`](Self::set_read_timeout) armed one - the deadline
+    /// passes ([`McpError::Timeout`](crate::McpError::Timeout)).
     fn read(&mut self) -> Result<JsonRpcMessage>;
 
     /// Write a single message to the transport
@@ -68,5 +81,75 @@ pub trait Transport: Send + Sync {
     /// endpoint. Default: `None`.
     fn try_clone_writer(&self) -> Option<Box<dyn Transport>> {
         None
+    }
+
+    /// Bound how long [`read`](Self::read) may block, or `None` to restore
+    /// indefinite blocking.
+    ///
+    /// A read that expires yields
+    /// [`McpError::Timeout`](crate::McpError::Timeout) and keeps any bytes it
+    /// already had, so the next read resumes mid-message rather than losing
+    /// the connection's framing.
+    ///
+    /// Returns whether the transport can honor deadlines at all. `false` means
+    /// the timeout was ignored and reads still block forever - the caller must
+    /// decide whether that is acceptable rather than assume it was applied.
+    /// Default: `Ok(false)`, since a transport that has not thought about this
+    /// cannot deliver it.
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        let _ = timeout;
+        Ok(false)
+    }
+
+    /// Bound how many bytes one incoming message may occupy.
+    ///
+    /// A message over the limit is reported as
+    /// [`McpError::InvalidMessage`](crate::McpError::InvalidMessage) and the
+    /// framing resynchronizes, so the connection survives an oversized message
+    /// rather than dying with it.
+    ///
+    /// [`Server`](crate::Server) pushes
+    /// [`ServerConfig::max_message_bytes`](crate::ServerConfig::max_message_bytes)
+    /// down through this, which is what makes the knob real for a transport the
+    /// caller constructed. Default: ignored, for transports whose framing is
+    /// bounded by something else (HTTP's `Content-Length`, say).
+    fn set_max_message_bytes(&mut self, max: usize) {
+        let _ = max;
+    }
+}
+
+/// A boxed transport is a transport.
+///
+/// [`try_clone_writer`](Transport::try_clone_writer) hands back a `Box`, and
+/// this is what lets that box be stored as an `Arc<Mutex<dyn Transport>>`
+/// alongside the original rather than needing a parallel type for write
+/// handles.
+impl Transport for Box<dyn Transport> {
+    fn read(&mut self) -> Result<JsonRpcMessage> {
+        (**self).read()
+    }
+
+    fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
+        (**self).write(message)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        (**self).close()
+    }
+
+    fn close_write(&mut self) -> Result<()> {
+        (**self).close_write()
+    }
+
+    fn try_clone_writer(&self) -> Option<Box<dyn Transport>> {
+        (**self).try_clone_writer()
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        (**self).set_read_timeout(timeout)
+    }
+
+    fn set_max_message_bytes(&mut self, max: usize) {
+        (**self).set_max_message_bytes(max)
     }
 }

@@ -3,7 +3,44 @@
 use crate::types::JsonRpcError;
 use thiserror::Error;
 
+//
+// MCP-defined JSON-RPC error codes
+//
+// The base JSON-RPC codes (-32700 parse, -32600 invalid request, -32601 method
+// not found, -32602 invalid params, -32603 internal) live on `JsonRpcError`.
+// These are the codes MCP layers on top.
+//
+
+/// Resource not found (`resources/read` against an unknown URI).
+///
+/// This is the *only* code in the implementation-defined `-32000..=-32099`
+/// range that MCP assigns a meaning to, so nothing else may use it. The `data`
+/// object carries the requested `uri`.
+pub const RESOURCE_NOT_FOUND: i32 = -32002;
+
+/// Server-side auth failure surfaced over a transport with no HTTP status.
+///
+/// MCP handles authorization at the HTTP layer (401/403), so the spec defines
+/// no JSON-RPC code for it. This is a local extension, kept at its historical
+/// value so existing clients keep recognizing it.
+#[cfg(feature = "auth")]
+pub const AUTH_ERROR: i32 = -32003;
+
+/// `error.data.reason` marking an internal error that is really a timeout.
+///
+/// MCP assigns no code to "we stopped waiting", so it shares `-32603` with
+/// every other server-side failure. This lets a client tell them apart.
+pub const TIMEOUT_REASON: &str = "timeout";
+
+/// `error.data.reason` marking a request refused because the server is full.
+///
+/// Also `-32603`, and also worth telling apart: a client that sees this knows
+/// the request was never attempted and can retry it, where a generic internal
+/// error says nothing about whether retrying is sane.
+pub const OVERLOADED_REASON: &str = "overloaded";
+
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum McpError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -14,8 +51,33 @@ pub enum McpError {
     #[error("Transport closed")]
     TransportClosed,
 
+    /// A blocking wait gave up.
+    ///
+    /// Produced by a transport read that outlived its deadline, and by a
+    /// server-initiated request whose client never answered. Distinguishable
+    /// from [`McpError::Internal`] so a caller can retry rather than treat the
+    /// session as broken.
+    #[error("Timed out: {0}")]
+    Timeout(String),
+
     #[error("Invalid message: {0}")]
     InvalidMessage(String),
+
+    /// [`InvalidMessage`](Self::InvalidMessage) for a request whose id was
+    /// readable even though the rest of it was not.
+    ///
+    /// Base protocol §Error Responses: "Error responses **MUST** include the
+    /// same ID as the request they correspond to (except in error cases where
+    /// the ID could not be read due a malformed request)." A client that omits
+    /// `jsonrpc`, or sends `"method": 123`, has still said which request it
+    /// meant - answering with `id: null` leaves it unable to match the error to
+    /// anything and waiting out its own timeout instead of failing fast.
+    #[error("Invalid message: {message}")]
+    InvalidRequest {
+        /// The id to answer with.
+        id: crate::types::RequestId,
+        message: String,
+    },
 
     #[error("Method not found: {0}")]
     MethodNotFound(String),
@@ -35,6 +97,14 @@ pub enum McpError {
     #[error("Prompt not found: {0}")]
     PromptNotFound(String),
 
+    /// A JSON-RPC error to replay exactly as-is.
+    ///
+    /// `tasks/result` "MUST return exactly what the underlying request would
+    /// have returned", so a task that failed with a particular code and message
+    /// has to reproduce them rather than be re-derived into something else.
+    #[error("{}", .0.message)]
+    Passthrough(JsonRpcError),
+
     #[cfg(feature = "auth")]
     #[error("Auth error: {0}")]
     Auth(String),
@@ -45,22 +115,38 @@ impl McpError {
         match self {
             McpError::Json(e) => JsonRpcError::parse_error(e.to_string()),
             McpError::InvalidMessage(msg) => JsonRpcError::invalid_request(msg),
+            McpError::InvalidRequest { message, .. } => JsonRpcError::invalid_request(message),
             McpError::MethodNotFound(method) => {
                 JsonRpcError::method_not_found(format!("Method not found: {}", method))
             }
             McpError::InvalidParams(msg) => JsonRpcError::invalid_params(msg),
             McpError::Internal(msg) => JsonRpcError::internal_error(msg),
             McpError::ToolError(msg) => JsonRpcError::new(-32000, msg),
+            // MCP assigns -32002 to resource-not-found, and carries the URI in
+            // `data` so clients can report which resource was missing.
             McpError::ResourceNotFound(uri) => {
-                JsonRpcError::new(-32001, format!("Resource not found: {}", uri))
+                JsonRpcError::new(RESOURCE_NOT_FOUND, format!("Resource not found: {}", uri))
+                    .with_data(serde_json::json!({ "uri": uri }))
             }
+            // The spec classifies an unknown prompt name as invalid params, not
+            // as its own code. It used to be reported as -32002 here, which
+            // collided with resource-not-found and made a modern client read
+            // "prompt not found" as "resource not found".
             McpError::PromptNotFound(name) => {
-                JsonRpcError::new(-32002, format!("Prompt not found: {}", name))
+                JsonRpcError::invalid_params(format!("Prompt not found: {}", name))
+                    .with_data(serde_json::json!({ "name": name }))
             }
+            McpError::Passthrough(error) => error.clone(),
             McpError::Io(e) => JsonRpcError::internal_error(e.to_string()),
             McpError::TransportClosed => JsonRpcError::internal_error("Transport closed"),
+            // MCP defines no code for a timeout, and the base set has no better
+            // fit than "something went wrong on our side" - so the distinction
+            // a client actually needs, "we gave up waiting on you" rather than
+            // "we broke", goes in `data` where it can be recognized.
+            McpError::Timeout(msg) => JsonRpcError::internal_error(format!("Timed out: {msg}"))
+                .with_data(serde_json::json!({ "reason": TIMEOUT_REASON })),
             #[cfg(feature = "auth")]
-            McpError::Auth(msg) => JsonRpcError::new(-32003, format!("Auth error: {}", msg)),
+            McpError::Auth(msg) => JsonRpcError::new(AUTH_ERROR, format!("Auth error: {}", msg)),
         }
     }
 }
@@ -141,7 +227,10 @@ mod tests {
         let err = McpError::ResourceNotFound("file://missing".into());
         assert!(err.to_string().contains("file://missing"));
         let rpc_err = err.to_jsonrpc_error();
-        assert_eq!(rpc_err.code, -32001); // custom error
+        // MCP's one implementation-defined code with an assigned meaning.
+        assert_eq!(rpc_err.code, RESOURCE_NOT_FOUND);
+        assert_eq!(rpc_err.code, -32002);
+        assert_eq!(rpc_err.data.unwrap()["uri"], "file://missing");
     }
 
     #[test]
@@ -149,7 +238,48 @@ mod tests {
         let err = McpError::PromptNotFound("missing-prompt".into());
         assert!(err.to_string().contains("missing-prompt"));
         let rpc_err = err.to_jsonrpc_error();
-        assert_eq!(rpc_err.code, -32002); // custom error
+        // Invalid params, per the prompts spec.
+        assert_eq!(rpc_err.code, -32602);
+        assert_eq!(rpc_err.data.unwrap()["name"], "missing-prompt");
+    }
+
+    #[test]
+    fn test_prompt_not_found_does_not_collide_with_resource_not_found() {
+        // Regression guard for the -32002 collision: a client that maps -32002
+        // to "resource not found" must never see it for a missing prompt.
+        let prompt = McpError::PromptNotFound("p".into()).to_jsonrpc_error();
+        let resource = McpError::ResourceNotFound("r".into()).to_jsonrpc_error();
+
+        assert_ne!(prompt.code, resource.code);
+        assert_ne!(prompt.code, RESOURCE_NOT_FOUND);
+        assert_eq!(resource.code, RESOURCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn test_error_codes_are_distinct() {
+        // Variants that mean different things to a client must not share a
+        // code. (PromptNotFound is deliberately absent: the spec folds it into
+        // the same -32602 that InvalidParams uses.)
+        let codes = [
+            McpError::ResourceNotFound("r".into())
+                .to_jsonrpc_error()
+                .code,
+            McpError::ToolError("t".into()).to_jsonrpc_error().code,
+            McpError::MethodNotFound("m".into()).to_jsonrpc_error().code,
+            McpError::InvalidParams("p".into()).to_jsonrpc_error().code,
+            McpError::Internal("i".into()).to_jsonrpc_error().code,
+            McpError::InvalidMessage("m".into()).to_jsonrpc_error().code,
+        ];
+
+        let mut deduped = codes.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            codes.len(),
+            "duplicate error codes: {:?}",
+            codes
+        );
     }
 
     #[cfg(feature = "auth")]
@@ -158,7 +288,23 @@ mod tests {
         let err = McpError::Auth("invalid token".into());
         assert!(err.to_string().contains("invalid token"));
         let rpc_err = err.to_jsonrpc_error();
-        assert_eq!(rpc_err.code, -32003); // custom error
+        assert_eq!(rpc_err.code, AUTH_ERROR);
+        assert_eq!(rpc_err.code, -32003);
+    }
+
+    #[test]
+    fn test_timeout_is_distinguishable_from_a_generic_internal_error() {
+        let timeout = McpError::Timeout("no response to sml-0".into()).to_jsonrpc_error();
+        assert_eq!(timeout.code, -32603);
+        assert_eq!(timeout.data.unwrap()["reason"], TIMEOUT_REASON);
+
+        // A real internal error carries no such marker.
+        assert!(
+            McpError::Internal("broke".into())
+                .to_jsonrpc_error()
+                .data
+                .is_none()
+        );
     }
 
     #[test]

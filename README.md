@@ -24,9 +24,10 @@ sml_mcps gives us a clean, sync MCP server that we control.
 [features]
 default = ["schema"]
 schema = ["dep:schemars"]     # JSON Schema generation for tools
-http = ["dep:tiny_http"]       # Streamable HTTP transport (with SSE)
+http = ["dep:httparse"]        # Streamable HTTP transport (with SSE)
 auth = ["dep:jsonwebtoken"]    # JWT validation for hosted
 hosted = ["http", "auth"]      # Both HTTP and auth
+tls = ["http", "dep:rustls", "dep:rustls-pemfile"]  # HTTPS, via rustls
 ```
 
 ## Usage (Stdio)
@@ -149,7 +150,39 @@ See `examples/unix_server.rs` for a complete single-binary daemon + shim.
 
 ## HTTP Transport (Streamable HTTP with SSE)
 
-With the `http` feature, `HttpServer` handles all the HTTP boilerplate for you:
+With the `http` feature, `HttpServer` handles all the HTTP boilerplate for you.
+The HTTP/1.1 layer is ours, on `std::net`, with `httparse` for the request
+grammar — one crate, no transitive dependencies. Requests are served
+concurrently, one thread per connection, so a client blocked in `tasks/result`
+cannot hold up anybody else. The context factory is called per request, on that
+request's own thread, so it must be `Send + Sync`.
+
+Everything a peer controls has a ceiling, and each one is a knob:
+
+| Knob | Default | Bounds |
+|---|---|---|
+| `HttpServer::max_connections` | 512 | live connections, and so threads |
+| `HttpServer::read_timeout` | 30s | a whole request — head *and* body, from its first byte |
+| `HttpServer::idle_timeout` | 2m | a kept-alive connection between requests |
+| `ServerConfig::max_message_bytes` | 8 MiB | a request body |
+
+`read_timeout` is an aggregate, not a per-read deadline, and that distinction is
+the difference between bounding a peer that has *stopped* talking and bounding
+one that is talking *slowly*. A per-read deadline is renewed by every byte that
+arrives, so a request dribbled a byte at a time never meets one — and a few
+bytes a second, times `max_connections` sockets, is a server nobody else can
+reach. A request still unfinished when its budget runs out is answered `408` and
+its connection is closed. The trade is that a client on a slow enough link
+cannot deliver a large body; size this against `max_message_bytes` and the
+slowest link you intend to serve.
+
+A connection arriving when `max_connections` are already live is answered `503`
+and closed — by a thread of its own, never the accept loop. A body over the
+ceiling is answered `413` without being read or drained, and its connection is
+closed rather than left half-framed.
+
+This is safe to expose directly. Behind a reverse proxy, terminate TLS there
+and bind to loopback.
 
 ```rust
 use sml_mcps::{HttpServer, ServerConfig, Tool, ToolEnv, CallToolResult, Result};
@@ -206,7 +239,7 @@ See `examples/http_server.rs` for a complete example.
 With the `hosted` feature (enables both `http` and `auth`), add JWT validation:
 
 ```rust
-use sml_mcps::{HttpServer, ServerConfig, auth::JwtValidator};
+use sml_mcps::{HttpServer, ServerConfig, auth::{JwtValidator, ResourceUri}};
 
 struct AuthContext {
     user_id: String,
@@ -220,14 +253,19 @@ fn main() -> Result<()> {
         instructions: None,
     };
 
+    // The canonical URI clients ask for tokens for, and the only audience
+    // this server accepts one from.
+    let resource = ResourceUri::parse("https://mcp.example.com/mcp")?;
+
     HttpServer::new(config)
         .with_tools(|server| {
             server.add_tool(WhoamiTool)?;
             Ok(())
         })
+        .require_scopes(["mcp:use"])   // optional: 403 + insufficient_scope
         .serve_with_auth(
             "127.0.0.1:3001",
-            JwtValidator::hs256(b"your-secret-key"),
+            JwtValidator::hs256(b"your-secret-key").for_resource(&resource),
             |claims| AuthContext {
                 user_id: claims.user_id().to_string(),
                 tenant_id: claims.tenant_id().to_string(),
@@ -236,14 +274,18 @@ fn main() -> Result<()> {
 }
 ```
 
+`for_resource` is not optional. MCP servers **MUST** reject tokens that do not
+name them in the `aud` claim (RFC 8707), so `serve_with_auth` refuses to start
+with a validator that enforces no audience.
+
 The validator supports both HS256 (symmetric) and RS256 (asymmetric) algorithms:
 
 ```rust
 // HS256 (symmetric)
-let validator = JwtValidator::hs256(b"your-secret-key");
+let validator = JwtValidator::hs256(b"your-secret-key").for_resource(&resource);
 
-// RS256 (asymmetric)  
-let validator = JwtValidator::rs256(&public_key_pem)?;
+// RS256 (asymmetric)
+let validator = JwtValidator::rs256_pem(&public_key_pem)?.for_resource(&resource);
 ```
 
 See `examples/http_auth.rs` for a complete authenticated server.
@@ -256,7 +298,9 @@ During tool execution, `ToolEnv` provides:
 // Send log notification
 env.log(LogLevel::Info, "Processing...")?;
 
-// Send progress update
+// Send progress update against the token the client asked for
+env.report_progress(0.5, Some(1.0))?;
+// ...or quote a token explicitly (string or number)
 env.send_progress("token", 0.5, Some(1.0))?;
 
 // Access resources
@@ -289,13 +333,36 @@ if t.has_notifications() {
 
 ## Protocol Version
 
-Implements MCP protocol version `2025-03-26` (Streamable HTTP).
+Implements MCP protocol version `2025-11-25`, and negotiates down to
+`2025-06-18` or `2025-03-26` for older clients.
+
+Supported across those revisions:
+
+- **Tools** with `outputSchema` / `structuredContent`, titles, icons, and
+  annotations
+- **Resources** and resource templates; **Prompts**
+- **Logging** with `logging/setLevel` and a stderr fallback
+- **Elicitation**, both form and URL mode, with a schema builder
+- **Sampling**, including tool calling (`tools` / `toolChoice`)
+- **Roots**
+- **Tasks** - task-augmented `tools/call`, polling, and cooperative
+  cancellation, opt-in via `Server::enable_tasks`
+- **Streamable HTTP** with `Origin` validation, `MCP-Protocol-Version`
+  handling, and per-session state keyed on `Mcp-Session-Id`
+- **Authorization** as an OAuth 2.1 resource server: RFC 8707 audience
+  validation and RFC 9728 Protected Resource Metadata (`auth` feature)
+
+See [docs/2025-11-25-migration-notes.md](docs/2025-11-25-migration-notes.md)
+for the decision log and the breaking changes from 0.5.x.
 
 ## What's NOT Included
 
 - **Client implementation** - this is a server SDK
-- **Sampling/LLM callbacks** - not needed for tool servers  
 - **Async anything** - by design
+- **`completion/complete`**, resource subscriptions, and `listChanged`
+  notifications - all optional, and none are declared as capabilities
+- **SSE resumability** (`Last-Event-ID`) - a response is one buffered body, so
+  there is no long-lived stream to resume
 
 ## License
 

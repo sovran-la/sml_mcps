@@ -21,9 +21,12 @@
 //!
 //! Unix-only: gated behind `#[cfg(unix)]`.
 
+use crate::server::{error_id, is_malformed};
 use crate::transport::{Transport, UnixTransport, pid_path_for};
-use crate::types::{McpError, Result};
+use crate::types::{JsonRpcMessage, McpError, Result};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +36,16 @@ const STARTUP_GRACE: Duration = Duration::from_secs(2);
 
 /// How long to wait for a freshly-spawned daemon to start listening.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many times to ask a socket whether anyone is home before unlinking it.
+///
+/// One refusal is not proof: a daemon whose listen backlog is momentarily full
+/// also refuses. Deleting its socket on that basis would cut off a healthy
+/// server, so the answer has to be consistent.
+const PROBE_ATTEMPTS: u32 = 3;
+
+/// Gap between probes, long enough for a backlog to drain.
+const PROBE_GAP: Duration = Duration::from_millis(50);
 
 /// Transparent bidirectional MCP proxy.
 pub struct Bridge;
@@ -44,9 +57,14 @@ impl Bridge {
     /// 2. Otherwise reconcile socket + PID-file state:
     ///    - live PID, socket present -> daemon may be starting; wait briefly.
     ///    - dead PID -> stale; remove socket + PID file and restart.
-    ///    - socket but no PID file -> orphaned; remove and restart.
+    ///    - socket but no PID file -> probe it; remove and restart only if
+    ///      nothing is listening.
     /// 3. Spawn `daemon_bin` with `daemon_args` (expected to daemonize).
     /// 4. Poll the socket until the daemon is listening, then connect.
+    ///
+    /// A socket is never unlinked without first confirming nothing answers on
+    /// it, so a daemon that comes up in the middle of this keeps its socket -
+    /// and gets connected to - rather than being orphaned from its own path.
     ///
     /// `daemon_bin` must double-fork (e.g. via
     /// [`UnixServer::serve_daemon`](crate::UnixServer::serve_daemon)) so the
@@ -87,28 +105,33 @@ impl Bridge {
         let mut client = client;
         let mut upstream = upstream;
 
-        let mut client_writer = client.try_clone_writer().ok_or_else(|| {
+        // Shared, because each direction answers unreadable input on the sink
+        // the *other* direction owns.
+        let client_sink = SharedWriter::new(client.try_clone_writer().ok_or_else(|| {
             McpError::Internal("client transport cannot be split for proxying".into())
-        })?;
-        let upstream_writer = upstream.try_clone_writer().ok_or_else(|| {
+        })?);
+        let upstream_sink = SharedWriter::new(upstream.try_clone_writer().ok_or_else(|| {
             McpError::Internal("upstream transport cannot be split for proxying".into())
-        })?;
+        })?);
 
         // client -> upstream (requests). Detached: ends when the client hits
         // EOF, at which point it half-closes the upstream so the daemon can
         // finish up. If the daemon vanished while the client is still talking,
         // this thread outlives `run` and dies when the process exits.
+        let mut to_upstream = upstream_sink.clone();
+        let mut to_client = client_sink.clone();
         let _c2u = thread::spawn(move || {
-            let mut writer = upstream_writer;
-            let _ = pump(&mut client, writer.as_mut());
-            let _ = writer.close_write();
+            let _ = pump(&mut client, &mut to_upstream, &mut to_client);
+            let _ = to_upstream.close_write();
         });
 
         // upstream -> client (responses). Joined: its completion means the
         // upstream connection has drained and closed - the definitive
         // end-of-session signal.
-        let result = pump(&mut upstream, client_writer.as_mut());
-        let _ = client_writer.close_write();
+        let mut to_client = client_sink;
+        let mut to_upstream = upstream_sink;
+        let result = pump(&mut upstream, &mut to_client, &mut to_upstream);
+        let _ = to_client.close_write();
         result
     }
 
@@ -127,12 +150,78 @@ impl Bridge {
     }
 }
 
+/// A write sink both pump directions can reach.
+///
+/// One lock per sink keeps two threads from interleaving halves of two
+/// messages into one unparseable line - the same invariant
+/// `Server::write_message` maintains now that task workers write too.
+#[derive(Clone)]
+struct SharedWriter(Arc<Mutex<Box<dyn Transport>>>);
+
+impl SharedWriter {
+    fn new(writer: Box<dyn Transport>) -> Self {
+        Self(Arc::new(Mutex::new(writer)))
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut dyn Transport) -> Result<T>) -> Result<T> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| McpError::Internal("Bridge writer lock poisoned".into()))?;
+        f(guard.as_mut())
+    }
+}
+
+impl Transport for SharedWriter {
+    /// Write-only by construction: the reads belong to the two owned handles.
+    fn read(&mut self) -> Result<JsonRpcMessage> {
+        Err(McpError::Internal(
+            "a bridge write handle cannot be read from".into(),
+        ))
+    }
+
+    fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
+        self.with(|writer| writer.write(message))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.with(|writer| writer.close())
+    }
+
+    fn close_write(&mut self) -> Result<()> {
+        self.with(|writer| writer.close_write())
+    }
+}
+
 /// Forward every message from `reader` to `writer` until end-of-stream.
-fn pump(reader: &mut dyn Transport, writer: &mut dyn Transport) -> Result<()> {
+///
+/// `back` is the way home to whoever sent the unreadable thing: a message the
+/// shim cannot parse is answered with a JSON-RPC error on the reader's own side
+/// and the pump continues, exactly as the server does. Tearing down instead
+/// meant one malformed line from the client half-closed the upstream, the
+/// daemon saw EOF, the response pump ended, and `Bridge::run` returned
+/// `Ok(())` - the session gone, with no error written and no diagnostic. The
+/// 8 MiB frame cap gave that the same trigger for a *legitimate* message the
+/// shim used to forward verbatim.
+///
+/// Teardown is reserved for the connection actually failing.
+fn pump(
+    reader: &mut dyn Transport,
+    writer: &mut dyn Transport,
+    back: &mut dyn Transport,
+) -> Result<()> {
     loop {
         match reader.read() {
             Ok(msg) => writer.write(&msg)?,
             Err(McpError::TransportClosed) => return Ok(()),
+            Err(e) if is_malformed(&e) => {
+                let answer = JsonRpcMessage::error(error_id(&e), e.to_jsonrpc_error());
+                // A shim that cannot even report the problem has lost the
+                // connection it would report it on; let the next read say so.
+                if back.write(&answer).is_err() {
+                    return Ok(());
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -154,7 +243,9 @@ fn auto_start_inner(
     let pid_path = pid_path_for(socket_path);
 
     if socket_path.exists() {
-        // Socket file present but the connect above failed.
+        // Socket file present but the connect above failed. Whichever way that
+        // is explained, the socket is only ever removed by `clear_socket`,
+        // which refuses to unlink one that turns out to be live.
         match read_pid_file(&pid_path) {
             Some(pid) if process_alive(pid) => {
                 // Daemon may be mid-startup or wedged. Give it a moment.
@@ -162,17 +253,25 @@ fn auto_start_inner(
                     return Ok(t);
                 }
                 // Still not accepting -> treat as dead. Clear and restart.
-                remove_quietly(socket_path);
-                remove_quietly(&pid_path);
+                if let Some(t) = clear_socket(socket_path, Some(&pid_path)) {
+                    return Ok(t);
+                }
             }
             Some(_) => {
                 // PID file points at a dead process -> stale.
-                remove_quietly(socket_path);
-                remove_quietly(&pid_path);
+                if let Some(t) = clear_socket(socket_path, Some(&pid_path)) {
+                    return Ok(t);
+                }
             }
             None => {
-                // Socket with no PID file -> orphaned.
-                remove_quietly(socket_path);
+                // Socket with no PID file. That is what an orphan looks like -
+                // and also what a `UnixServer::serve` daemon looks like, since
+                // only `serve_daemon` writes a PID file. Probing tells them
+                // apart; assuming orphan here used to unlink a live server's
+                // socket, leaving it listening on a path nobody could reach.
+                if let Some(t) = clear_socket(socket_path, None) {
+                    return Ok(t);
+                }
             }
         }
     } else if let Some(pid) = read_pid_file(&pid_path) {
@@ -221,6 +320,79 @@ fn process_alive(pid: i32) -> bool {
         }
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// What a socket path turned out to be.
+enum Probe {
+    /// Something is listening, and this is the connection to it.
+    Live(UnixTransport),
+    /// The path is not a reachable socket: nothing bound, not a socket, or
+    /// gone. Safe to unlink.
+    Dead,
+    /// Neither could be established - a permission problem, or a listener under
+    /// enough pressure to refuse. Not safe to unlink.
+    Unknown,
+}
+
+/// Ask a socket path what it is, insisting on a consistent answer.
+///
+/// A single `ECONNREFUSED` is not enough to condemn a socket: on the BSDs a
+/// listener with a full backlog refuses exactly the same way a socket with no
+/// listener does. Repeating the probe separates the two, because a backlog
+/// drains and an abandoned socket does not.
+fn probe_socket(path: &Path, attempts: u32, gap: Duration) -> Probe {
+    let mut verdict = Probe::Unknown;
+
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            thread::sleep(gap);
+        }
+        match UnixStream::connect(path) {
+            Ok(stream) => return Probe::Live(UnixTransport::from_stream(stream)),
+            Err(e) if is_unreachable(&e) => verdict = Probe::Dead,
+            // Something else is wrong. Say so and stop guessing - one
+            // inconclusive answer outranks any number of confident ones.
+            Err(_) => return Probe::Unknown,
+        }
+    }
+
+    verdict
+}
+
+/// Does this connect error mean "no daemon owns this path"?
+///
+/// `ECONNREFUSED` is a socket nobody is bound to, `ENOENT` is a path that is
+/// already gone, and `ENOTSOCK` is a leftover regular file sitting where the
+/// socket belongs. Anything else - `EACCES`, `EAGAIN` from a saturated backlog
+/// - proves nothing.
+fn is_unreachable(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ECONNREFUSED) | Some(libc::ENOENT) | Some(libc::ENOTSOCK)
+    )
+}
+
+/// Remove a socket that has proven itself dead, and its PID file with it.
+///
+/// Returns a live connection instead if the socket answers while being
+/// examined, which is the whole point: a daemon that finished binding a moment
+/// after the first connect attempt must not have its socket deleted out from
+/// under it. That leaves it listening on an inode with no name, unreachable to
+/// every client, until it idles out.
+fn clear_socket(socket_path: &Path, pid_path: Option<&Path>) -> Option<UnixTransport> {
+    match probe_socket(socket_path, PROBE_ATTEMPTS, PROBE_GAP) {
+        Probe::Live(transport) => return Some(transport),
+        Probe::Dead => {
+            remove_quietly(socket_path);
+            if let Some(pid) = pid_path {
+                remove_quietly(pid);
+            }
+        }
+        // Leave a socket we cannot account for alone. Spawning over it is the
+        // daemon's call to make, not ours.
+        Probe::Unknown => {}
+    }
+    None
 }
 
 /// Poll-connect to the socket until success or the timeout elapses.
@@ -279,6 +451,29 @@ mod tests {
         let n = N.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
         std::env::temp_dir().join(format!("sml_mcps_bridge_{}_{}_{}", pid, n, suffix))
+    }
+
+    /// Create a socket file that is definitely bound to nobody.
+    ///
+    /// Binding and dropping a listener leaves the file behind, which is what a
+    /// crashed daemon leaves too. Teardown is not instantaneous though: under
+    /// load, a connect issued immediately afterwards occasionally still
+    /// succeeds. Since "nothing is listening" is this test's *premise* and not
+    /// its subject, wait for it to actually hold.
+    fn dead_socket(suffix: &str) -> PathBuf {
+        let path = temp_path(suffix);
+        {
+            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if UnixStream::connect(&path).is_err() {
+                return path;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("socket at {} never stopped accepting", path.display());
     }
 
     // ---- process_alive / pid file ---------------------------------------
@@ -361,6 +556,134 @@ mod tests {
         drop(daemon);
         let joined = bridge.join().unwrap();
         assert!(joined.is_ok());
+    }
+
+    #[test]
+    fn test_a_malformed_message_is_answered_and_the_shim_carries_on() {
+        // C1 taught the server to answer unreadable input and keep going; the
+        // shim in front of it was not taught the same thing. One malformed line
+        // ended the request pump, which half-closed the upstream, which made
+        // the daemon EOF, which ended the response pump - so `run` returned
+        // `Ok(())` with the session gone, nothing written, and no diagnostic.
+        let (client_bridge, client_peer) = UnixStream::pair().unwrap();
+        let (upstream_bridge, upstream_peer) = UnixStream::pair().unwrap();
+
+        let daemon = thread::spawn(move || {
+            let mut d = UnixTransport::from_stream(upstream_peer);
+            while let Ok(JsonRpcMessage::Request(req)) = d.read() {
+                d.write(&JsonRpcMessage::response(req.id, serde_json::json!({})))
+                    .unwrap();
+            }
+        });
+
+        let bridge = thread::spawn(move || {
+            Bridge::run(
+                UnixTransport::from_stream(client_bridge),
+                UnixTransport::from_stream(upstream_bridge),
+            )
+        });
+
+        let mut raw = client_peer.try_clone().unwrap();
+        let mut client = UnixTransport::from_stream(client_peer);
+
+        client
+            .write(&JsonRpcMessage::request(1i64, "ping", None))
+            .unwrap();
+        assert!(matches!(
+            client.read().unwrap(),
+            JsonRpcMessage::Response(_)
+        ));
+
+        // Garbage in. The answer comes back from the shim itself.
+        {
+            use std::io::Write;
+            raw.write_all(b"{not json\n").unwrap();
+            raw.flush().unwrap();
+        }
+        let JsonRpcMessage::Response(answered) = client.read().unwrap() else {
+            panic!("the shim must answer, not hang up");
+        };
+        assert_eq!(answered.error.unwrap().code, -32700);
+
+        // And the session is still usable, which is the whole point.
+        client
+            .write(&JsonRpcMessage::request(2i64, "ping", None))
+            .unwrap();
+        let JsonRpcMessage::Response(second) = client.read().unwrap() else {
+            panic!("expected a response");
+        };
+        assert_eq!(second.id, RequestId::Number(2));
+
+        drop(client);
+        drop(raw);
+        let _ = bridge.join().unwrap();
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn test_an_oversized_message_does_not_kill_the_shim() {
+        // S9's 8 MiB cap silently changed the bridge's contract: a message the
+        // shim used to forward verbatim now surfaces as `InvalidMessage`, which
+        // was fatal. It must be answerable like any other unreadable input.
+        let (client_bridge, client_peer) = UnixStream::pair().unwrap();
+        let (upstream_bridge, upstream_peer) = UnixStream::pair().unwrap();
+
+        let daemon = thread::spawn(move || {
+            let mut d = UnixTransport::from_stream(upstream_peer);
+            while let Ok(JsonRpcMessage::Request(req)) = d.read() {
+                d.write(&JsonRpcMessage::response(req.id, serde_json::json!({})))
+                    .unwrap();
+            }
+        });
+
+        let mut client_transport = UnixTransport::from_stream(client_bridge);
+        // A small ceiling, so the test does not have to push 8 MiB to make the
+        // point.
+        client_transport.set_max_message_bytes(256);
+
+        let bridge = thread::spawn(move || {
+            Bridge::run(
+                client_transport,
+                UnixTransport::from_stream(upstream_bridge),
+            )
+        });
+
+        let mut raw = client_peer.try_clone().unwrap();
+        let mut client = UnixTransport::from_stream(client_peer);
+
+        {
+            use std::io::Write;
+            let huge = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "big": "x".repeat(1024) },
+            });
+            raw.write_all(huge.to_string().as_bytes()).unwrap();
+            raw.write_all(b"\n").unwrap();
+            raw.flush().unwrap();
+        }
+
+        let JsonRpcMessage::Response(answered) = client.read().unwrap() else {
+            panic!("the shim must answer, not hang up");
+        };
+        let error = answered.error.unwrap();
+        assert_eq!(error.code, -32600);
+        assert!(error.message.contains("256 byte limit"), "{error:?}");
+
+        // Still alive.
+        client
+            .write(&JsonRpcMessage::request(2i64, "ping", None))
+            .unwrap();
+        assert!(matches!(
+            client.read().unwrap(),
+            JsonRpcMessage::Response(_)
+        ));
+
+        drop(client);
+        drop(raw);
+        let _ = bridge.join().unwrap();
+        daemon.join().unwrap();
     }
 
     #[test]
@@ -454,15 +777,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_auto_start_connects_to_running_daemon() {
-        let sock = temp_path("sock");
-        let sock_for_server = sock.clone();
-
-        // Stand up a real UnixServer (idle timeout so it eventually exits).
-        let _server = thread::spawn(move || {
+    /// Start a `UnixServer` on `sock` and block until it is accepting.
+    ///
+    /// Waiting here rather than inside the test is what makes the auto_start
+    /// tests deterministic: whether the daemon is up is setup, not the thing
+    /// under test, so it gets a generous deadline and a hard failure.
+    fn start_ping_daemon(sock: &Path) -> thread::JoinHandle<McpResult<()>> {
+        let sock_for_server = sock.to_path_buf();
+        let handle = thread::spawn(move || {
             UnixServer::new(ServerConfig::default())
-                .idle_timeout(Duration::from_secs(10))
+                .idle_timeout(Duration::from_secs(30))
                 .with_tools(|s: &mut Server<PingContext>| {
                     s.add_tool(PingTool)?;
                     Ok(())
@@ -470,24 +794,31 @@ mod tests {
                 .serve(&sock_for_server, |_conn_id| PingContext)
         });
 
-        // auto_start should take the fast path and connect without spawning.
-        // daemon_bin "false" would fail if spawned, proving we didn't.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut transport = None;
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if let Ok(t) = auto_start_inner(
-                &sock,
-                "false",
-                &[],
-                Duration::from_millis(50),
-                Duration::from_millis(200),
-            ) {
-                transport = Some(t);
-                break;
+            if UnixStream::connect(sock).is_ok() {
+                return handle;
             }
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(10));
         }
-        let mut transport = transport.expect("auto_start should connect to the running daemon");
+        panic!("daemon never started listening on {}", sock.display());
+    }
+
+    #[test]
+    fn test_auto_start_connects_to_running_daemon() {
+        let sock = temp_path("sock");
+        let _server = start_ping_daemon(&sock);
+
+        // One call, no retry loop. The daemon is known to be up, so the fast
+        // path must take it; "false" as daemon_bin fails if it is ever spawned.
+        let mut transport = auto_start_inner(
+            &sock,
+            "false",
+            &[],
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+        )
+        .expect("auto_start should connect to the running daemon");
 
         // Drive a request through to prove it's a live connection.
         let req = JsonRpcMessage::request(1i64, "ping", None);
@@ -500,6 +831,163 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_auto_start_never_unlinks_a_live_socket() {
+        // Regression guard for the race that made the test above flake: a
+        // `serve` daemon writes no PID file, so a socket with no PID file used
+        // to be read as an orphan and deleted - even while the daemon was
+        // listening on it. Everything after that failed with ENOENT.
+        let sock = temp_path("sock");
+        let _server = start_ping_daemon(&sock);
+
+        for _ in 0..10 {
+            let transport = auto_start_inner(
+                &sock,
+                "false",
+                &[],
+                Duration::from_millis(50),
+                Duration::from_millis(200),
+            );
+            assert!(transport.is_ok(), "auto_start should keep connecting");
+            assert!(sock.exists(), "a live daemon's socket must survive");
+        }
+
+        // And the daemon is still reachable by a plain connect.
+        assert!(UnixTransport::connect(&sock).is_ok());
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_clear_socket_returns_a_live_daemon_instead_of_deleting_it() {
+        // Same guarantee, exercised directly: the cleanup path itself refuses
+        // to unlink a socket that answers.
+        let sock = temp_path("sock");
+        let _server = start_ping_daemon(&sock);
+
+        let recovered = clear_socket(&sock, None);
+        assert!(
+            recovered.is_some(),
+            "a live socket must come back connected"
+        );
+        assert!(sock.exists(), "a live socket must not be removed");
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_probe_socket_classifies_each_state() {
+        // Live.
+        let live = temp_path("sock");
+        let _server = start_ping_daemon(&live);
+        assert!(matches!(
+            probe_socket(&live, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Live(_)
+        ));
+        let _ = std::fs::remove_file(&live);
+
+        // Bound and then abandoned: the file outlives the listener.
+        let stale = dead_socket("sock");
+        assert!(matches!(
+            probe_socket(&stale, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Dead
+        ));
+        let _ = std::fs::remove_file(&stale);
+
+        // A regular file squatting on the path (ENOTSOCK).
+        let orphan = temp_path("sock");
+        std::fs::write(&orphan, b"not a socket").unwrap();
+        assert!(matches!(
+            probe_socket(&orphan, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Dead
+        ));
+        let _ = std::fs::remove_file(&orphan);
+
+        // Nothing there at all (ENOENT).
+        let missing = temp_path("sock");
+        assert!(matches!(
+            probe_socket(&missing, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Dead
+        ));
+    }
+
+    #[test]
+    fn test_probe_socket_will_not_condemn_what_it_cannot_reach() {
+        // A path too long for `sockaddr_un` fails before the kernel is asked,
+        // so there is no errno to read and no way to know what is there. The
+        // verdict has to be Unknown - and Unknown never deletes.
+        let long = temp_path(&"x".repeat(120));
+        std::fs::write(&long, b"something").unwrap();
+
+        assert!(matches!(
+            probe_socket(&long, PROBE_ATTEMPTS, Duration::ZERO),
+            Probe::Unknown
+        ));
+        assert!(clear_socket(&long, None).is_none());
+        assert!(long.exists(), "an unexplained path must be left alone");
+
+        let _ = std::fs::remove_file(&long);
+    }
+
+    #[test]
+    fn test_only_conclusive_errors_condemn_a_socket() {
+        use std::io::Error;
+
+        // Proof that nothing owns the path.
+        for errno in [libc::ECONNREFUSED, libc::ENOENT, libc::ENOTSOCK] {
+            assert!(is_unreachable(&Error::from_raw_os_error(errno)), "{errno}");
+        }
+
+        // Proof of nothing. EACCES is a socket we are not allowed to reach;
+        // EAGAIN on a unix socket is a listener whose backlog is full - both
+        // belong to daemons that are very much alive.
+        for errno in [libc::EACCES, libc::EAGAIN, libc::EINTR, libc::ETIMEDOUT] {
+            assert!(!is_unreachable(&Error::from_raw_os_error(errno)), "{errno}");
+        }
+
+        // An error raised before any syscall carries no errno at all.
+        assert!(!is_unreachable(&Error::other("no syscall happened")));
+    }
+
+    #[test]
+    fn test_probe_socket_needs_a_consistent_answer() {
+        // A socket that refuses once and accepts on a later attempt is a
+        // daemon under load, not a corpse. `probe_socket` returns Live because
+        // any successful connect ends the probe.
+        let sock = temp_path("sock");
+
+        // Nothing listening yet -> the first probe attempt refuses.
+        let sock_for_server = sock.clone();
+        let binder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            let listener = std::os::unix::net::UnixListener::bind(&sock_for_server).unwrap();
+            // Hold it open long enough for the probe to find it.
+            thread::sleep(Duration::from_millis(500));
+            drop(listener);
+        });
+
+        // Bind lands ~60ms in; probing across ~200ms of attempts must find it.
+        let verdict = probe_socket(&sock, 6, Duration::from_millis(40));
+        assert!(
+            matches!(verdict, Probe::Live(_)),
+            "a daemon that binds mid-probe must not be condemned"
+        );
+
+        drop(verdict);
+        binder.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_clear_socket_removes_a_confirmed_dead_socket_and_its_pid_file() {
+        let sock = dead_socket("sock");
+        let pid = pid_path_for(&sock);
+        std::fs::write(&pid, "2147483646\n").unwrap();
+
+        assert!(clear_socket(&sock, Some(&pid)).is_none());
+        assert!(!sock.exists(), "a dead socket should be removed");
+        assert!(!pid.exists(), "its PID file should go with it");
     }
 
     #[test]
