@@ -20,6 +20,10 @@
 /// control character rather than a `:` because it cannot occur in a URI, an
 /// email address, a UUID or any other shape a subject realistically takes, so
 /// refusing one costs no legitimate token anything.
+///
+/// Composed by the HTTP transport and refused by the JWT validator, so it is
+/// only a thing when one of them is here.
+#[cfg(any(feature = "http", feature = "auth"))]
 pub(crate) const IDENTITY_SEPARATOR: char = '\u{1}';
 
 mod broker;
