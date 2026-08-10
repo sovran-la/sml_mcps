@@ -334,6 +334,16 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Whether any task record survives, running or finished.
+    ///
+    /// Sweeps first, so an expired task does not count as one worth keeping a
+    /// session alive for.
+    pub fn is_empty(&self) -> Result<bool> {
+        let mut tasks = self.lock()?;
+        Self::sweep(&mut tasks, SystemTime::now());
+        Ok(tasks.is_empty())
+    }
+
     /// How many tasks are currently running.
     pub fn running(&self) -> Result<usize> {
         let mut tasks = self.lock()?;
@@ -699,6 +709,15 @@ pub fn related_task_meta(task_id: &str) -> crate::types::Meta {
 /// and macOS, `ProcessPrng` on Windows. That makes every target equally strong,
 /// rather than unix being solid and everything else best-effort.
 fn new_task_id() -> String {
+    random_hex_id()
+}
+
+/// 128 bits of platform entropy, hex-encoded.
+///
+/// Shared with the HTTP transport's session ids, which the spec holds to the
+/// same standard: "**SHOULD** be globally unique and cryptographically secure
+/// (e.g., a securely generated UUID, a JWT, or a cryptographic hash)."
+pub(crate) fn random_hex_id() -> String {
     let bytes = random_bytes();
     let mut id = String::with_capacity(32);
     for byte in bytes {

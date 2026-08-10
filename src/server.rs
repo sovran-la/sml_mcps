@@ -1546,6 +1546,21 @@ impl<C: Send + Sync + 'static> Server<C> {
         self.negotiated_version.as_deref()
     }
 
+    /// Has the client completed the `initialize` handshake?
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Restore the handshake state established on an earlier request.
+    ///
+    /// [`ServerConfig::require_initialization`] is per-`Server` state, and a
+    /// transport that rebuilds the server per request has to carry it across or
+    /// the gate never opens: HTTP answered `initialize` and then refused
+    /// everything that followed, for every client, forever.
+    pub fn set_initialized(&mut self, initialized: bool) {
+        self.initialized = initialized;
+    }
+
     /// Restore the revision agreed on an earlier request.
     pub fn set_negotiated_version(&mut self, version: impl Into<String>) {
         self.negotiated_version = Some(version.into());
