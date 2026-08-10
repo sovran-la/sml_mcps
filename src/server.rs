@@ -7697,12 +7697,20 @@ mod tests {
     /// a test can put bytes on the wire that no `Transport` would produce.
     #[cfg(unix)]
     fn server_on_a_raw_socket() -> (std::os::unix::net::UnixStream, std::thread::JoinHandle<()>) {
+        server_on_a_raw_socket_with(ServerConfig::default())
+    }
+
+    /// [`server_on_a_raw_socket`] with the configuration under test.
+    #[cfg(unix)]
+    fn server_on_a_raw_socket_with(
+        config: ServerConfig,
+    ) -> (std::os::unix::net::UnixStream, std::thread::JoinHandle<()>) {
         use crate::transport::UnixTransport;
         use std::os::unix::net::UnixStream;
 
         let (server_end, client_end) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
-            let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+            let mut server: Server<TestContext> = Server::new(config);
             server.add_tool(IncrementTool).unwrap();
             let _ = server.start(
                 UnixTransport::from_stream(server_end),
@@ -7870,6 +7878,55 @@ mod tests {
         let message = JsonRpcMessage::error(RequestId::Null, JsonRpcError::parse_error("bad"));
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"id\":null"), "{json}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_configured_message_cap_reaches_the_transport() {
+        // The knob is only real if it gets to the reader the *caller* built,
+        // which happens after the fact. A hard-coded 8 MiB with no escape hatch
+        // left a server whose clients legitimately send a base64 attachment
+        // with nothing to do but fork.
+        let (mut client, _server) = server_on_a_raw_socket_with(ServerConfig {
+            max_message_bytes: 512,
+            ..Default::default()
+        });
+
+        let oversized = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"increment","arguments":{{"pad":"{}"}}}}}}"#,
+            "x".repeat(1024)
+        );
+        let error = exchange_raw(&mut client, oversized.as_bytes());
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("512 byte limit"),
+            "{error}"
+        );
+
+        // Framing resynchronized, so the connection is still usable.
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_past_the_end_cursor_is_refused_on_tools_list() {
+        // Pagination §Error Handling: "Invalid cursors SHOULD result in error
+        // code -32602". An empty page reads as "that was everything", so a
+        // client whose list shrank under its cursor silently misses whatever
+        // moved.
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let cursor = crate::pagination::encode_cursor_for_test(500);
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"cursor":"{cursor}"}}}}"#
+        );
+        let error = exchange_raw(&mut client, request.as_bytes());
+
+        assert_eq!(error["error"]["code"], -32602, "{error}");
+        assert_still_alive(&mut client);
     }
 
     #[test]
