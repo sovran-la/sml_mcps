@@ -6,8 +6,9 @@ use crate::broker::RequestBroker;
 use crate::pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
 use crate::schema_check::CompiledSchema;
 use crate::tasks::{
-    CreateTaskResult, ListTasksParams, ListTasksResult, RELATED_TASK, TaskConfig, TaskIdParams,
-    TaskOutcome, TaskParams, TaskStatus, TaskStore, TasksCapability, related_task_meta,
+    CreateTaskResult, ListTasksParams, ListTasksResult, MODEL_IMMEDIATE_RESPONSE, RELATED_TASK,
+    TaskConfig, TaskIdParams, TaskOutcome, TaskParams, TaskStatus, TaskStore, TasksCapability,
+    related_task_meta,
 };
 use crate::transport::Transport;
 use crate::types::*;
@@ -51,6 +52,8 @@ pub struct ToolEnv<'a> {
     request_timeout: Option<std::time::Duration>,
     /// Set inside a task worker.
     task: Option<TaskEnv<'a>>,
+    /// The `progressToken` the client attached to this request, if any.
+    progress_token: Option<RequestId>,
 }
 
 /// How a [`ToolEnv`] obtains the answer to a server-initiated request.
@@ -194,16 +197,45 @@ impl<'a> ToolEnv<'a> {
         level >= self.log_level
     }
 
-    /// Send progress update for long-running operations
-    pub fn send_progress(&self, token: &str, progress: f64, total: Option<f64>) -> Result<()> {
+    /// The token this request's progress notifications must quote, if the
+    /// client asked for progress at all.
+    ///
+    /// Read from `params._meta.progressToken`. Without it a tool has to be told
+    /// the token out of band, which in practice means progress is unusable.
+    pub fn progress_token(&self) -> Option<&RequestId> {
+        self.progress_token.as_ref()
+    }
+
+    /// Send a progress update for a long-running operation.
+    ///
+    /// `token` is `string | number` in the schema, and it is the *client* that
+    /// chooses it, so this takes anything that can be one - typically
+    /// [`progress_token`](Self::progress_token).
+    pub fn send_progress(
+        &self,
+        token: impl Into<RequestId>,
+        progress: f64,
+        total: Option<f64>,
+    ) -> Result<()> {
         let mut params = serde_json::json!({
-            "progressToken": token,
+            "progressToken": token.into(),
             "progress": progress
         });
         if let Some(t) = total {
             params["total"] = serde_json::json!(t);
         }
         self.send_notification("notifications/progress", Some(params))
+    }
+
+    /// [`send_progress`](Self::send_progress) quoting the client's own token.
+    ///
+    /// A no-op when the client did not ask for progress, which is the common
+    /// case and not a failure.
+    pub fn report_progress(&self, progress: f64, total: Option<f64>) -> Result<()> {
+        match self.progress_token.clone() {
+            Some(token) => self.send_progress(token, progress, total),
+            None => Ok(()),
+        }
     }
 
     /// List all resource URIs
@@ -782,6 +814,16 @@ pub trait Tool<C>: Send + Sync {
         None
     }
 
+    /// Text to hand the model while this tool runs as a task.
+    ///
+    /// Returned in the `CreateTaskResult`'s `_meta` under
+    /// [`MODEL_IMMEDIATE_RESPONSE`](crate::tasks::MODEL_IMMEDIATE_RESPONSE),
+    /// which the spec offers as non-binding guidance for what the model should
+    /// say while it waits. Default: `None`.
+    fn model_immediate_response(&self) -> Option<String> {
+        None
+    }
+
     /// Execute the tool
     fn execute(&self, args: Value, context: &mut C, env: &ToolEnv) -> Result<CallToolResult>;
 
@@ -974,6 +1016,15 @@ pub struct ServerConfig {
     /// Turn it off for a server whose tools deliberately accept input their
     /// published schema does not describe.
     pub validate_tool_input: bool,
+    /// Refuse everything except `initialize` and `ping` until the client has
+    /// initialized, and refuse a second `initialize` (default: `false`).
+    ///
+    /// The lifecycle rules here are client-side SHOULDs - "the client **SHOULD
+    /// NOT** send requests other than pings before the server has responded to
+    /// the `initialize` request" - so this is hardening rather than
+    /// conformance, and it is off by default because a server that has been
+    /// driven without a handshake (a test harness, a shim) should keep working.
+    pub require_initialization: bool,
 }
 
 impl Default for ServerConfig {
@@ -995,6 +1046,7 @@ impl Default for ServerConfig {
             stderr_logging: StderrLogging::default(),
             request_timeout: Some(std::time::Duration::from_secs(120)),
             validate_tool_input: true,
+            require_initialization: false,
         }
     }
 }
@@ -1420,6 +1472,16 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     /// Build the environment handed to a tool for one invocation.
+    ///
+    /// `progress_token` is whatever the client attached to *this* request.
+    fn tool_env_with(&self, progress_token: Option<RequestId>) -> ToolEnv<'_> {
+        ToolEnv {
+            progress_token,
+            ..self.tool_env()
+        }
+    }
+
+    /// Build the environment handed to a tool for one invocation.
     fn tool_env(&self) -> ToolEnv<'_> {
         ToolEnv {
             transport: self.writer.as_ref().or(self.transport.as_ref()),
@@ -1434,6 +1496,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             mode: RequestMode::Direct,
             request_timeout: self.config.request_timeout,
             task: None,
+            progress_token: None,
         }
     }
 
@@ -1699,6 +1762,27 @@ impl<C: Send + Sync + 'static> Server<C> {
 
     /// Dispatch a request to the appropriate handler
     fn dispatch_request(&mut self, request: &JsonRpcRequest, context: &mut C) -> Result<Value> {
+        if self.config.require_initialization {
+            match request.method.as_str() {
+                // Ping is explicitly exempt: "the client SHOULD NOT send
+                // requests other than pings before the server has responded to
+                // the initialize request."
+                "ping" => {}
+                "initialize" if self.initialized => {
+                    return Err(McpError::InvalidMessage(
+                        "already initialized; the handshake happens once per session".into(),
+                    ));
+                }
+                "initialize" => {}
+                method if !self.initialized => {
+                    return Err(McpError::InvalidMessage(format!(
+                        "`{method}` before `initialize`"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request),
             "ping" => self.handle_ping(),
@@ -1934,6 +2018,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         output: OutputCheck,
         arguments: Value,
         task_params: TaskParams,
+        progress_token: Option<RequestId>,
     ) -> Result<Value> {
         let runtime = self
             .tasks
@@ -1965,6 +2050,8 @@ impl<C: Send + Sync + 'static> Server<C> {
             ClientCapabilities::default()
         };
         let task_id = task.task_id.clone();
+        // Read before the tool moves into the worker.
+        let immediate_response = tool.model_immediate_response();
 
         // Held until this call's `CreateTaskResult` is on the wire. Only
         // installed when there is something to write through: a caller
@@ -2016,6 +2103,7 @@ impl<C: Send + Sync + 'static> Server<C> {
                         task_id: &task_id,
                         cancelled: &cancelled,
                     }),
+                    progress_token: progress_token.clone(),
                 };
 
                 // A panic here used to unwind the thread with `finish` never
@@ -2127,7 +2215,13 @@ impl<C: Send + Sync + 'static> Server<C> {
             )));
         }
 
-        Ok(serde_json::to_value(CreateTaskResult { task, meta: None })?)
+        let meta = immediate_response.map(|text| {
+            let mut meta = Meta::new();
+            meta.insert(MODEL_IMMEDIATE_RESPONSE.to_string(), Value::String(text));
+            meta
+        });
+
+        Ok(serde_json::to_value(CreateTaskResult { task, meta })?)
     }
 
     /// `logging/setLevel` - set the minimum severity delivered to this client.
@@ -2325,7 +2419,8 @@ impl<C: Send + Sync + 'static> Server<C> {
                         tool,
                         output,
                         arguments,
-                        params.task.unwrap_or_default(),
+                        params.task.clone().unwrap_or_default(),
+                        params.progress_token(),
                     );
                 }
                 (false, _) => {}
@@ -2335,7 +2430,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         // ignoring any task-augmentation metadata if present" - so the `task`
         // field simply falls on the floor.
 
-        let env = self.tool_env();
+        let env = self.tool_env_with(params.progress_token());
 
         // A panicking tool is a broken tool, not a broken server. Unwinding
         // from here kills the process on stdio, the connection thread on a
@@ -2936,6 +3031,7 @@ mod tests {
             mode: RequestMode::Direct,
             request_timeout: None,
             task: None,
+            progress_token: None,
         }
     }
 
@@ -6877,6 +6973,212 @@ mod tests {
         .unwrap();
 
         assert!(server.client_capabilities.supports_roots());
+    }
+
+    //
+    // Progress, task metadata, and lifecycle hardening
+    //
+
+    /// A tool that reports progress against whatever token the client chose.
+    struct ProgressTool;
+
+    impl Tool<TestContext> for ProgressTool {
+        fn name(&self) -> &str {
+            "progress"
+        }
+        fn description(&self) -> &str {
+            "Reports progress"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn task_support(&self) -> TaskSupport {
+            TaskSupport::Optional
+        }
+        fn model_immediate_response(&self) -> Option<String> {
+            Some("Working on it...".into())
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            env.report_progress(0.5, Some(1.0))?;
+            Ok(CallToolResult::text(match env.progress_token() {
+                Some(token) => format!("token: {token}"),
+                None => "no token".to_string(),
+            }))
+        }
+    }
+
+    #[test]
+    fn test_a_numeric_progress_token_survives_the_round_trip() {
+        // `ProgressToken` is `string | number` in the schema and the *client*
+        // chooses it, so a server that can only quote strings cannot answer a
+        // client that sent a number.
+        let transport = RecordingTransport::default();
+        let written = transport.written.clone();
+
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(ProgressTool).unwrap();
+        server.transport = Some(Arc::new(Mutex::new(transport)));
+
+        let mut ctx = TestContext { counter: 0 };
+        let request = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(1),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "progress",
+                "_meta": { "progressToken": 42 }
+            })),
+        };
+        let result = server.dispatch_request(&request, &mut ctx).unwrap();
+        assert_eq!(result["content"][0]["text"], "token: 42");
+
+        let progress = written
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|message| match message {
+                JsonRpcMessage::Notification(n) if n.method == "notifications/progress" => {
+                    n.params.clone()
+                }
+                _ => None,
+            })
+            .expect("a progress notification");
+        assert_eq!(progress["progressToken"], 42);
+        assert_eq!(progress["progress"], 0.5);
+    }
+
+    #[test]
+    fn test_a_string_progress_token_works_too() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(ProgressTool).unwrap();
+
+        let result = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "progress", "_meta": { "progressToken": "abc" } }),
+        )
+        .unwrap();
+        assert_eq!(result["content"][0]["text"], "token: abc");
+    }
+
+    #[test]
+    fn test_no_progress_token_is_not_an_error() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(ProgressTool).unwrap();
+
+        let result = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "progress" }),
+        )
+        .unwrap();
+        assert_eq!(result["content"][0]["text"], "no token");
+    }
+
+    #[test]
+    fn test_create_task_result_carries_the_model_immediate_response() {
+        let mut server = task_server();
+        server.add_tool(ProgressTool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "progress", "task": {} }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            created["_meta"][crate::tasks::MODEL_IMMEDIATE_RESPONSE],
+            "Working on it..."
+        );
+        await_terminal(&mut server, created["task"]["taskId"].as_str().unwrap());
+    }
+
+    #[test]
+    fn test_initialization_ordering_is_enforced_when_asked_for() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig {
+            require_initialization: true,
+            ..Default::default()
+        });
+        server.add_tool(IncrementTool).unwrap();
+
+        let error = dispatch(&mut server, "tools/list", serde_json::json!({})).unwrap_err();
+        assert_eq!(error.to_jsonrpc_error().code, -32600, "{error}");
+
+        // Ping is explicitly exempt.
+        assert!(dispatch(&mut server, "ping", serde_json::json!({})).is_ok());
+
+        dispatch(
+            &mut server,
+            "initialize",
+            serde_json::json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": {} }),
+        )
+        .unwrap();
+        assert!(dispatch(&mut server, "tools/list", serde_json::json!({})).is_ok());
+
+        // And the handshake happens once.
+        let error = dispatch(
+            &mut server,
+            "initialize",
+            serde_json::json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": {} }),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_jsonrpc_error().code, -32600, "{error}");
+    }
+
+    #[test]
+    fn test_initialization_ordering_is_off_by_default() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(IncrementTool).unwrap();
+        assert!(dispatch(&mut server, "tools/list", serde_json::json!({})).is_ok());
+    }
+
+    #[test]
+    fn test_everything_new_is_optional_for_a_2025_03_26_client() {
+        // The negotiated revision is recorded but not used to shape responses,
+        // on the grounds that everything the newer revisions added is additive
+        // and optional. This is that claim, written down as a test: a result
+        // set built without the new fields must not emit any of them.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.add_tool(IncrementTool).unwrap();
+
+        let negotiated = dispatch(
+            &mut server,
+            "initialize",
+            serde_json::json!({ "protocolVersion": "2025-03-26", "capabilities": {} }),
+        )
+        .unwrap();
+        assert_eq!(negotiated["protocolVersion"], "2025-03-26");
+        assert_eq!(server.negotiated_version(), Some("2025-03-26"));
+
+        let listed = dispatch(&mut server, "tools/list", serde_json::json!({})).unwrap();
+        let tool = &listed["tools"][0];
+
+        // 2025-03-26 required these three, and they are all present.
+        assert!(tool["name"].is_string());
+        assert!(tool["description"].is_string());
+        assert!(tool["inputSchema"].is_object());
+
+        // Everything the later revisions added is absent unless asked for, so
+        // an old client sees exactly the object it knows.
+        for added in ["icons", "execution", "outputSchema", "_meta", "title"] {
+            assert!(tool[added].is_null(), "`{added}` leaked into {tool}");
+        }
+
+        let called = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "increment" }),
+        )
+        .unwrap();
+        for added in ["structuredContent", "_meta"] {
+            assert!(called[added].is_null(), "`{added}` leaked into {called}");
+        }
     }
 
     //

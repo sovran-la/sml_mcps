@@ -26,6 +26,12 @@ pub const RESOURCE_NOT_FOUND: i32 = -32002;
 #[cfg(feature = "auth")]
 pub const AUTH_ERROR: i32 = -32003;
 
+/// `error.data.reason` marking an internal error that is really a timeout.
+///
+/// MCP assigns no code to "we stopped waiting", so it shares `-32603` with
+/// every other server-side failure. This lets a client tell them apart.
+pub const TIMEOUT_REASON: &str = "timeout";
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum McpError {
@@ -110,8 +116,11 @@ impl McpError {
             McpError::Io(e) => JsonRpcError::internal_error(e.to_string()),
             McpError::TransportClosed => JsonRpcError::internal_error("Transport closed"),
             // MCP defines no code for a timeout, and the base set has no better
-            // fit than "something went wrong on our side".
-            McpError::Timeout(msg) => JsonRpcError::internal_error(format!("Timed out: {msg}")),
+            // fit than "something went wrong on our side" - so the distinction
+            // a client actually needs, "we gave up waiting on you" rather than
+            // "we broke", goes in `data` where it can be recognized.
+            McpError::Timeout(msg) => JsonRpcError::internal_error(format!("Timed out: {msg}"))
+                .with_data(serde_json::json!({ "reason": TIMEOUT_REASON })),
             #[cfg(feature = "auth")]
             McpError::Auth(msg) => JsonRpcError::new(AUTH_ERROR, format!("Auth error: {}", msg)),
         }
@@ -257,6 +266,21 @@ mod tests {
         let rpc_err = err.to_jsonrpc_error();
         assert_eq!(rpc_err.code, AUTH_ERROR);
         assert_eq!(rpc_err.code, -32003);
+    }
+
+    #[test]
+    fn test_timeout_is_distinguishable_from_a_generic_internal_error() {
+        let timeout = McpError::Timeout("no response to sml-0".into()).to_jsonrpc_error();
+        assert_eq!(timeout.code, -32603);
+        assert_eq!(timeout.data.unwrap()["reason"], TIMEOUT_REASON);
+
+        // A real internal error carries no such marker.
+        assert!(
+            McpError::Internal("broke".into())
+                .to_jsonrpc_error()
+                .data
+                .is_none()
+        );
     }
 
     #[test]

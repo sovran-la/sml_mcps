@@ -2,6 +2,7 @@
 //!
 //! Types for MCP initialization, capabilities, tools, resources, and prompts.
 
+use crate::types::RequestId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -521,6 +522,26 @@ pub struct CallToolParams {
     /// (2025-11-25). Ignored by servers that have not enabled tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<crate::tasks::TaskParams>,
+    /// Request metadata. Carries `progressToken` when the client wants
+    /// progress notifications for this call.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+impl CallToolParams {
+    /// The token progress notifications for this call must quote.
+    ///
+    /// "The `progressToken` **MUST** be a string or integer value" and it is
+    /// chosen by the *client*, so a server that cannot read it back out of
+    /// `_meta` cannot report progress the client will accept.
+    pub fn progress_token(&self) -> Option<RequestId> {
+        let token = self.meta.as_ref()?.get("progressToken")?;
+        match token {
+            Value::String(text) => Some(RequestId::String(text.clone())),
+            Value::Number(number) => number.as_i64().map(RequestId::Number),
+            _ => None,
+        }
+    }
 }
 
 /// The result of a `tools/call`.
