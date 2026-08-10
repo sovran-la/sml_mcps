@@ -1327,6 +1327,45 @@ mod tests {
         fn shutdown_write(&self) {}
     }
 
+    /// A socket that hands back at most `chunk` bytes per read.
+    ///
+    /// [`Fake`] is a single `Cursor`, so `BufReader` always fills from it in one
+    /// go and every head arrives whole - which is the one thing a network never
+    /// does. This one splits a head at boundaries nobody chose, which is what
+    /// the incremental parse loop in [`read_head`] exists for.
+    struct Dribble {
+        incoming: std::io::Cursor<Vec<u8>>,
+        outgoing: Arc<Mutex<Vec<u8>>>,
+        chunk: usize,
+    }
+
+    impl Read for Dribble {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let take = buffer.len().min(self.chunk);
+            self.incoming.read(&mut buffer[..take])
+        }
+    }
+
+    impl Write for Dribble {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.outgoing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Socket for Dribble {
+        fn set_read_timeout(&self, _: Option<Duration>) {}
+        fn set_write_timeout(&self, _: Option<Duration>) {}
+        fn shutdown_write(&self) {}
+    }
+
     /// Drive one connection's worth of bytes through the loop and return what
     /// came back.
     fn drive<H>(request: &[u8], limits: Limits, handle: H) -> String
@@ -1337,6 +1376,23 @@ mod tests {
         let socket = Fake {
             incoming: std::io::Cursor::new(request.to_vec()),
             outgoing: Arc::clone(&outgoing),
+        };
+        serve_connection(Box::new(socket), &limits, &handle);
+
+        let written = outgoing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&written).into_owned()
+    }
+
+    /// The same, with the bytes handed over `chunk` at a time.
+    fn drive_dribbled<H>(request: &[u8], chunk: usize, limits: Limits, handle: H) -> String
+    where
+        H: for<'a> Fn(&mut Request<'a>) -> Response,
+    {
+        let outgoing = Arc::new(Mutex::new(Vec::new()));
+        let socket = Dribble {
+            incoming: std::io::Cursor::new(request.to_vec()),
+            outgoing: Arc::clone(&outgoing),
+            chunk,
         };
         serve_connection(Box::new(socket), &limits, &handle);
 
@@ -1416,6 +1472,49 @@ mod tests {
         assert_eq!(answer.matches("HTTP/1.1 200 OK").count(), 2, "{answer}");
         assert!(answer.contains("\r\n\r\none"), "{answer}");
         assert!(answer.ends_with("two"), "{answer}");
+    }
+
+    #[test]
+    fn a_head_split_across_reads_is_still_one_head() {
+        // Every other test here hands the head over whole, because a `Cursor`
+        // fills a `BufReader` in one go. A network does not: it splits a head
+        // mid-token, mid-line and mid-terminator. Each of those rounds must
+        // leave the parse loop asking for more rather than deciding, and the
+        // sizes below straddle the `\r\n` (1), fall inside it (3) and land on
+        // neither boundary (7).
+        for chunk in [1, 3, 7] {
+            let answer = drive_dribbled(&post("hello"), chunk, Limits::default(), echo_body(1024));
+            assert!(
+                answer.starts_with("HTTP/1.1 200 OK\r\n"),
+                "chunk {chunk}: {answer}"
+            );
+            // The body arriving intact is the real assertion: it says the head
+            // ended on the byte `httparse` chose, and that the bytes past it
+            // were left in the reader for the body to find.
+            assert!(answer.ends_with("\r\n\r\nhello"), "chunk {chunk}: {answer}");
+        }
+    }
+
+    #[test]
+    fn a_dribbled_connection_keeps_its_place_between_requests() {
+        // What `consumed` is for. It tracks how much of the head was already
+        // taken out of the reader across rounds, so the last round consumes the
+        // remainder and not the whole head again. An off-by-one there does not
+        // fail the first request - it eats the first bytes of the second, and
+        // the failure surfaces one request later than the mistake.
+        let mut wire = post("one");
+        wire.extend_from_slice(&post("two"));
+
+        for chunk in [1, 3, 7] {
+            let answer = drive_dribbled(&wire, chunk, Limits::default(), echo_body(1024));
+            assert_eq!(
+                answer.matches("HTTP/1.1 200 OK").count(),
+                2,
+                "chunk {chunk}: {answer}"
+            );
+            assert!(answer.contains("\r\n\r\none"), "chunk {chunk}: {answer}");
+            assert!(answer.ends_with("two"), "chunk {chunk}: {answer}");
+        }
     }
 
     #[test]
@@ -1522,6 +1621,69 @@ mod tests {
         let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nX-Thing: one\r\n  two\r\n\r\n";
         let answer = drive(request, Limits::default(), echo_body(1024));
         assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+    }
+
+    #[test]
+    fn a_space_before_a_header_colon_is_refused() {
+        // `X-Thing : v` is a field name a hop in front may read as `X-Thing`
+        // and this server as `X-Thing `, or the reverse - which is how a field
+        // gets past a proxy that is filtering on it. RFC 9112 §5.1 says a
+        // server MUST reject it rather than pick a reading, and rejecting is
+        // the only side that cannot be played off against the hop.
+        let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nX-Thing : v\r\n\r\n";
+        let answer = drive(request, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+        assert!(
+            answer.contains("a header field name that is not a token"),
+            "refused as a name, not as some other 400: {answer}"
+        );
+    }
+
+    #[test]
+    fn a_signed_content_length_is_refused() {
+        // RFC 9112 §6.2 is `1*DIGIT`. `usize::from_str` is looser and would
+        // take the `+` and read 5, while a strict front-end rejects the field
+        // outright - the same "two answers to where the request ends" as the
+        // `Transfer-Encoding` pair above, spelled with one character.
+        let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: +5\r\n\r\nhello";
+        let answer = drive(request, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+        assert!(
+            answer.contains("an unreadable `Content-Length`"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn a_header_value_that_is_not_text_is_refused() {
+        // obs-text (0x80-0xFF) is legal per RFC 9110 §5.5, so `httparse` parses
+        // this head clean and hands the value back as bytes - the refusal is
+        // ours. Nothing downstream has a use for a header that is not text:
+        // every one of them is compared, logged or echoed as text, so a value
+        // that is not gets refused rather than lossily repaired.
+        let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nX-Thing: \xff\r\n\r\n";
+        let answer = drive(request, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+        assert!(
+            answer.contains("a header field value that is not text"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn a_control_character_in_a_header_value_is_refused() {
+        // The other half of the pair above, and a different path to the same
+        // answer: a NUL is not obs-text, so `httparse` refuses the head itself
+        // and never reaches the text check. Both roads end at 400 because a
+        // value a downstream reader might truncate at the NUL is a header two
+        // parties would read differently.
+        let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nX-Thing: a\0b\r\n\r\n";
+        let answer = drive(request, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+        assert!(
+            answer.contains("a header field value that is not text"),
+            "{answer}"
+        );
     }
 
     #[test]
@@ -1683,6 +1845,46 @@ mod tests {
         assert_eq!(parse_chunk_size(""), None);
         assert_eq!(parse_chunk_size("-1"), None);
         assert_eq!(parse_chunk_size("ffffffffffffffffff"), None);
+    }
+
+    #[test]
+    fn a_chunk_size_must_open_with_a_hex_digit() {
+        // The guard in `parse_chunk_size` is load-bearing, and this is the
+        // measurement it was written against: `httparse` reads all three of
+        // these as `0` - *the last chunk* - and not one of them is a chunk size
+        // at all. Ending a body on a blank line while a stricter parser in
+        // front reads that line as malformed is two answers to where the
+        // request ends, which is the whole of request smuggling.
+        for line in ["\r\n", " \r\n", ";x\r\n"] {
+            assert!(
+                matches!(
+                    httparse::parse_chunk_size(line.as_bytes()),
+                    Ok(httparse::Status::Complete((_, 0)))
+                ),
+                "`httparse` no longer reads {line:?} as the last chunk - the \
+                 guard below can be reconsidered, but do not simply delete it"
+            );
+        }
+
+        // What we answer instead. `read_line` has taken the CRLF off by here.
+        assert_eq!(parse_chunk_size(""), None);
+        assert_eq!(parse_chunk_size(" "), None);
+        assert_eq!(parse_chunk_size(";x"), None);
+    }
+
+    #[test]
+    fn a_chunked_body_ending_on_a_blank_line_is_refused() {
+        // The guard above, reached the way an attacker would rather than by
+        // calling it directly. The body here is a blank line where a chunk size
+        // belongs, followed by the blank line that ends the trailers - so
+        // without the guard this is a *well-formed* zero-chunk body and the
+        // answer is 200 with nothing in it. That 200 is the smuggle landing:
+        // this server would have called the request finished here while a hop
+        // in front reads the same bytes as a malformed chunk and keeps going.
+        let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\n\
+                        Transfer-Encoding: chunked\r\n\r\n\r\n\r\n";
+        let answer = drive(request, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
     }
 
     #[test]
