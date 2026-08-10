@@ -91,9 +91,23 @@ impl CompiledSchema {
             return Err("no `structuredContent`".to_string());
         };
 
+        self.check(structured, "structuredContent")
+    }
+
+    /// Check a `tools/call` argument object against this tool's `inputSchema`.
+    ///
+    /// tools §Security Considerations: "Servers **MUST**: Validate all tool
+    /// inputs". Reported the way SEP-1303 asks for - as text a model can act on
+    /// - rather than as a protocol error.
+    pub fn check_arguments(&self, arguments: &Value) -> Result<(), String> {
+        self.check(arguments, "arguments")
+    }
+
+    /// Validate `value`, describing failures relative to `root`.
+    fn check(&self, value: &Value, root: &str) -> Result<(), String> {
         self.schemas
-            .validate(structured, self.index)
-            .map_err(|e| describe(&e))
+            .validate(value, self.index)
+            .map_err(|e| describe(&e, root))
     }
 }
 
@@ -133,9 +147,9 @@ impl UrlLoader for NoLoader {
 /// boon reports a tree: a parent keyword failed *because* its children did.
 /// The leaves are the specific complaints ("want string, but got number"),
 /// which is what a server author needs to see.
-fn describe(error: &ValidationError) -> String {
+fn describe(error: &ValidationError, root: &str) -> String {
     let mut problems = Vec::new();
-    collect_leaves(error, &mut problems);
+    collect_leaves(error, root, &mut problems);
 
     let truncated = problems.len() > MAX_REPORTED;
     problems.truncate(MAX_REPORTED);
@@ -148,26 +162,27 @@ fn describe(error: &ValidationError) -> String {
 }
 
 /// Depth-first walk collecting the most specific complaints.
-fn collect_leaves(error: &ValidationError, into: &mut Vec<String>) {
+fn collect_leaves(error: &ValidationError, root: &str, into: &mut Vec<String>) {
     if error.causes.is_empty() {
         into.push(format!(
             "{} {}",
-            path_of(&error.instance_location.to_string()),
+            path_of(&error.instance_location.to_string(), root),
             error.kind
         ));
         return;
     }
     for cause in &error.causes {
-        collect_leaves(cause, into);
+        collect_leaves(cause, root, into);
     }
 }
 
 /// Turn a JSON Pointer into the dotted path used in error messages.
 ///
-/// `""` -> `structuredContent`, `/a/0/b` -> `structuredContent.a[0].b`. This
-/// reads far better in a log line than a pointer does.
-fn path_of(pointer: &str) -> String {
-    let mut path = String::from("structuredContent");
+/// With `root` = `structuredContent`: `""` -> `structuredContent`, `/a/0/b` ->
+/// `structuredContent.a[0].b`. This reads far better in a log line than a
+/// pointer does.
+fn path_of(pointer: &str, root: &str) -> String {
+    let mut path = String::from(root);
     for token in pointer.split('/').skip(1) {
         let token = token.replace("~1", "/").replace("~0", "~");
         if !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()) {
@@ -618,11 +633,20 @@ mod tests {
 
     #[test]
     fn path_of_renders_pointers_readably() {
-        assert_eq!(path_of(""), "structuredContent");
-        assert_eq!(path_of("/a"), "structuredContent.a");
-        assert_eq!(path_of("/a/0/b"), "structuredContent.a[0].b");
+        assert_eq!(path_of("", "structuredContent"), "structuredContent");
+        assert_eq!(path_of("/a", "structuredContent"), "structuredContent.a");
+        assert_eq!(
+            path_of("/a/0/b", "structuredContent"),
+            "structuredContent.a[0].b"
+        );
         // Escaped tokens: ~1 is `/`, ~0 is `~`.
-        assert_eq!(path_of("/a~1b"), "structuredContent.a/b");
-        assert_eq!(path_of("/a~0b"), "structuredContent.a~b");
+        assert_eq!(
+            path_of("/a~1b", "structuredContent"),
+            "structuredContent.a/b"
+        );
+        assert_eq!(
+            path_of("/a~0b", "structuredContent"),
+            "structuredContent.a~b"
+        );
     }
 }

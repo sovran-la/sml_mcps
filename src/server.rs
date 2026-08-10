@@ -4,6 +4,7 @@
 
 use crate::broker::RequestBroker;
 use crate::pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
+use crate::schema_check::CompiledSchema;
 use crate::tasks::{
     CreateTaskResult, ListTasksParams, ListTasksResult, RELATED_TASK, TaskConfig, TaskIdParams,
     TaskOutcome, TaskParams, TaskStatus, TaskStore, TasksCapability, related_task_meta,
@@ -948,6 +949,17 @@ pub struct ServerConfig {
     /// seconds, so tune it per call with
     /// [`ToolEnv::send_request_with_timeout`] rather than lowering this.
     pub request_timeout: Option<std::time::Duration>,
+    /// Check `tools/call` arguments against the tool's `inputSchema` before
+    /// running it (default: `true`).
+    ///
+    /// tools §Security Considerations: "Servers **MUST**: Validate all tool
+    /// inputs." A failure is returned as a Tool Execution Error
+    /// (`isError: true`), not a protocol error, so the model can correct itself
+    /// - which is what SEP-1303 asks for.
+    ///
+    /// Turn it off for a server whose tools deliberately accept input their
+    /// published schema does not describe.
+    pub validate_tool_input: bool,
 }
 
 impl Default for ServerConfig {
@@ -968,8 +980,31 @@ impl Default for ServerConfig {
             default_log_level: LogLevel::Info,
             stderr_logging: StderrLogging::default(),
             request_timeout: Some(std::time::Duration::from_secs(120)),
+            validate_tool_input: true,
         }
     }
+}
+
+/// Hold a tool to the promise its `outputSchema` made.
+///
+/// "Servers **MUST** provide structured results that conform to this schema."
+/// Nothing in the tasks spec relaxes that, and `tasks/result` has to return
+/// what the request would have returned - so this runs on both paths, not just
+/// the synchronous one.
+///
+/// A result that is already an error is exempt: it carries diagnostic text, not
+/// the structured output the schema describes.
+fn check_output(name: &str, output: &OutputCheck, result: &CallToolResult) -> Result<()> {
+    if result.is_error {
+        return Ok(());
+    }
+    output
+        .check(result.structured_content.as_ref())
+        .map_err(|problem| {
+            McpError::Internal(format!(
+                "Tool `{name}` declares an outputSchema but returned {problem}"
+            ))
+        })
 }
 
 /// Note the task an error response belongs to, in `data`.
@@ -1049,7 +1084,7 @@ fn parse_optional_params<T: serde::de::DeserializeOwned + Default>(
 /// MCP Server - generic over context type
 pub struct Server<C> {
     config: ServerConfig,
-    tools: HashMap<String, Arc<dyn Tool<C>>>,
+    tools: HashMap<String, ToolEntry<C>>,
     resources: Arc<HashMap<String, Arc<dyn Resource>>>,
     resource_templates: Vec<ResourceTemplate>,
     prompts: HashMap<String, Box<dyn PromptDef>>,
@@ -1125,6 +1160,65 @@ impl TaskGate {
             *open = true;
         }
         self.opened.notify_all();
+    }
+}
+
+/// A registered tool, with the schemas it is checked against compiled once.
+///
+/// Compiling parses the schema and builds every `pattern` regex in it, which is
+/// not work to redo on each call.
+struct ToolEntry<C> {
+    tool: Arc<dyn Tool<C>>,
+    /// Compiled `inputSchema`. `None` when it would not compile, in which case
+    /// arguments are not checked - a broken schema constrains nothing.
+    input: Option<Arc<CompiledSchema>>,
+    /// How to check this tool's structured output.
+    output: OutputCheck,
+}
+
+/// What a tool's declared `outputSchema` lets us enforce.
+#[derive(Clone)]
+enum OutputCheck {
+    /// No `outputSchema`: nothing is promised.
+    None,
+    /// Full validation against the compiled schema.
+    Compiled(Arc<CompiledSchema>),
+    /// The schema would not compile, so only the half of the promise that
+    /// survives is checked: `structuredContent` must be present.
+    PresenceOnly,
+}
+
+impl OutputCheck {
+    /// Compile a tool's declared output schema, complaining once if it will
+    /// never be enforceable.
+    fn new(tool_name: &str, schema: Option<Value>) -> Self {
+        let Some(schema) = schema else {
+            return OutputCheck::None;
+        };
+        match CompiledSchema::new(&schema) {
+            Ok(compiled) => OutputCheck::Compiled(Arc::new(compiled)),
+            Err(e) => {
+                // Silently skipping meant a typo in a server's own schema
+                // bought permanent, invisible non-enforcement.
+                eprintln!(
+                    "sml_mcps: tool `{tool_name}` declares an outputSchema that does not \
+                     compile ({e}); structured output cannot be validated against it"
+                );
+                OutputCheck::PresenceOnly
+            }
+        }
+    }
+
+    /// Check a successful result against the promise the tool made.
+    fn check(&self, structured: Option<&Value>) -> std::result::Result<(), String> {
+        match self {
+            OutputCheck::None => Ok(()),
+            OutputCheck::Compiled(schema) => schema.validate(structured),
+            OutputCheck::PresenceOnly => match structured {
+                Some(_) => Ok(()),
+                None => Err("no `structuredContent`".to_string()),
+            },
+        }
     }
 }
 
@@ -1228,12 +1322,45 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     /// Add a tool to the server
+    ///
+    /// Both of the tool's schemas are compiled here rather than per call, and a
+    /// schema that will not compile is reported on stderr once - a typo in a
+    /// server's own schema used to mean permanent, silent non-enforcement.
     pub fn add_tool(&mut self, tool: impl Tool<C> + 'static) -> Result<()> {
         let name = tool.name().to_string();
         if self.tools.contains_key(&name) {
             return Err(McpError::Internal(format!("Duplicate tool: {}", name)));
         }
-        self.tools.insert(name, Arc::new(tool));
+        // The spec's naming rules are SHOULDs, but a name outside them is
+        // rejected by real clients, and finding that out at registration beats
+        // finding it out from a user.
+        if !is_valid_tool_name(&name) {
+            return Err(McpError::Internal(format!(
+                "Invalid tool name `{name}`: 1-128 characters of ASCII letters, digits, \
+                 `_`, `-`, or `.`"
+            )));
+        }
+
+        let input = match CompiledSchema::new(&tool.schema()) {
+            Ok(compiled) => Some(Arc::new(compiled)),
+            Err(e) => {
+                eprintln!(
+                    "sml_mcps: tool `{name}` declares an inputSchema that does not compile \
+                     ({e}); arguments cannot be validated against it"
+                );
+                None
+            }
+        };
+        let output = OutputCheck::new(&name, tool.output_schema());
+
+        self.tools.insert(
+            name,
+            ToolEntry {
+                tool: Arc::new(tool),
+                input,
+                output,
+            },
+        );
         Ok(())
     }
 
@@ -1677,6 +1804,7 @@ impl<C: Send + Sync + 'static> Server<C> {
     fn start_tool_task(
         &self,
         tool: Arc<dyn Tool<C>>,
+        output: OutputCheck,
         arguments: Value,
         task_params: TaskParams,
     ) -> Result<Value> {
@@ -1787,12 +1915,21 @@ impl<C: Send + Sync + 'static> Server<C> {
                                 ),
                             }
                         }
-                        Ok(result) => match serde_json::to_value(result) {
-                            Ok(value) => (TaskStatus::Completed, TaskOutcome::Value(value)),
-                            Err(e) => (
+                        // The same promise the synchronous path enforces:
+                        // `tasks/result` returns what the request would have
+                        // returned, which includes returning its failure.
+                        Ok(result) => match check_output(tool.name(), &output, &result) {
+                            Err(problem) => (
                                 TaskStatus::Failed,
-                                TaskOutcome::Error(JsonRpcError::internal_error(e.to_string())),
+                                TaskOutcome::Error(problem.to_jsonrpc_error()),
                             ),
+                            Ok(()) => match serde_json::to_value(result) {
+                                Ok(value) => (TaskStatus::Completed, TaskOutcome::Value(value)),
+                                Err(e) => (
+                                    TaskStatus::Failed,
+                                    TaskOutcome::Error(JsonRpcError::internal_error(e.to_string())),
+                                ),
+                            },
                         },
                         Err(McpError::ToolError(message))
                         | Err(McpError::InvalidParams(message)) => {
@@ -1962,8 +2099,11 @@ impl<C: Send + Sync + 'static> Server<C> {
         let params: ListToolsParams = parse_optional_params(request)?;
 
         // Collect all tools (sorted for consistent pagination)
-        let mut all_tools: Vec<crate::types::Tool> =
-            self.tools.values().map(|t| t.as_protocol_tool()).collect();
+        let mut all_tools: Vec<crate::types::Tool> = self
+            .tools
+            .values()
+            .map(|entry| entry.tool.as_protocol_tool())
+            .collect();
         all_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Apply pagination
@@ -1982,11 +2122,29 @@ impl<C: Send + Sync + 'static> Server<C> {
         // An unknown tool is a protocol error, and the spec's own example gives
         // it -32602. It is not something a model can fix by retrying with
         // different arguments, so it must not be an `isError` result.
-        let tool = self
+        let entry = self
             .tools
             .get(&params.name)
-            .ok_or_else(|| McpError::InvalidParams(format!("Unknown tool: {}", params.name)))?
-            .clone();
+            .ok_or_else(|| McpError::InvalidParams(format!("Unknown tool: {}", params.name)))?;
+        let tool = entry.tool.clone();
+        let input = entry.input.clone();
+        let output = entry.output.clone();
+
+        let arguments = params.arguments.clone().unwrap_or(serde_json::json!({}));
+
+        // "Servers MUST: Validate all tool inputs." Reported as a Tool
+        // Execution Error rather than a protocol error, per SEP-1303: the model
+        // sees the text and can retry with corrected arguments.
+        if self.config.validate_tool_input {
+            if let Some(schema) = &input {
+                if let Err(problem) = schema.check_arguments(&arguments) {
+                    return Ok(serde_json::to_value(CallToolResult::error(format!(
+                        "Invalid arguments for `{}`: {}",
+                        params.name, problem
+                    )))?);
+                }
+            }
+        }
 
         // Task-augmentation negotiation happens on two levels: the server
         // capability, then the per-tool `execution.taskSupport`.
@@ -2014,7 +2172,8 @@ impl<C: Send + Sync + 'static> Server<C> {
                 (true, _) => {
                     return self.start_tool_task(
                         tool,
-                        params.arguments.unwrap_or(serde_json::json!({})),
+                        output,
+                        arguments,
                         params.task.unwrap_or_default(),
                     );
                 }
@@ -2031,11 +2190,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         // from here kills the process on stdio, the connection thread on a
         // Unix daemon, and the whole accept loop on HTTP.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tool.execute(
-                params.arguments.unwrap_or(serde_json::json!({})),
-                context,
-                &env,
-            )
+            tool.execute(arguments, context, &env)
         }))
         .unwrap_or_else(|payload| {
             Err(McpError::Internal(format!(
@@ -2058,22 +2213,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             Err(other) => return Err(other),
         };
 
-        // Declaring an outputSchema is a promise that every successful result
-        // carries conforming structured content. Catch a broken promise here
-        // rather than shipping malformed data to the client.
-        if !result.is_error {
-            if let Some(schema) = tool.output_schema() {
-                if let Err(problem) = crate::schema_check::validate_structured_output(
-                    &schema,
-                    result.structured_content.as_ref(),
-                ) {
-                    return Err(McpError::Internal(format!(
-                        "Tool `{}` declares an outputSchema but returned {}",
-                        params.name, problem
-                    )));
-                }
-            }
-        }
+        check_output(&params.name, &output, &result)?;
 
         Ok(serde_json::to_value(result)?)
     }
@@ -6521,6 +6661,259 @@ mod tests {
         .unwrap();
 
         assert!(server.client_capabilities.supports_roots());
+    }
+
+    //
+    // Schema validation
+    //
+
+    /// A tool with a required argument and a schema that changes after
+    /// registration, so a per-call recompile would be visible.
+    struct StrictTool {
+        schema_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Tool<TestContext> for StrictTool {
+        fn name(&self) -> &str {
+            "strict"
+        }
+        fn description(&self) -> &str {
+            "Requires a message"
+        }
+        fn schema(&self) -> Value {
+            // The first read - registration - is the strict one. Anything that
+            // recompiles later gets a schema that constrains nothing.
+            let first = self
+                .schema_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0;
+            if first {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "message": { "type": "string" } },
+                    "required": ["message"],
+                    "additionalProperties": false
+                })
+            } else {
+                serde_json::json!({ "type": "object" })
+            }
+        }
+        fn execute(
+            &self,
+            args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            Ok(CallToolResult::text(format!("got {args}")))
+        }
+    }
+
+    #[test]
+    fn test_tool_arguments_are_validated_against_the_input_schema() {
+        // "Servers MUST: Validate all tool inputs." The framework published an
+        // inputSchema per tool and then did nothing with it.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server
+            .add_tool(StrictTool {
+                schema_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .unwrap();
+
+        let rejected = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "strict", "arguments": {} }),
+        )
+        .unwrap();
+
+        // SEP-1303: a Tool Execution Error, not a protocol error, so the model
+        // can see it and retry.
+        assert_eq!(rejected["isError"], true, "{rejected}");
+        let text = rejected["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Invalid arguments"), "{text}");
+        assert!(text.contains("message"), "{text}");
+
+        let accepted = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "strict", "arguments": { "message": "hi" } }),
+        )
+        .unwrap();
+        assert_ne!(accepted["isError"], true, "{accepted}");
+    }
+
+    #[test]
+    fn test_the_input_schema_is_compiled_once_at_registration() {
+        // Recompiling per call rebuilds every `pattern` regex in the schema.
+        // `StrictTool` reports a permissive schema after the first read, so a
+        // recompile would let the bad call through.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server
+            .add_tool(StrictTool {
+                schema_reads: reads.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        for _ in 0..3 {
+            let rejected = dispatch(
+                &mut server,
+                "tools/call",
+                serde_json::json!({ "name": "strict", "arguments": {} }),
+            )
+            .unwrap();
+            assert_eq!(rejected["isError"], true, "{rejected}");
+        }
+
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the schema was read again after registration"
+        );
+    }
+
+    #[test]
+    fn test_input_validation_can_be_turned_off() {
+        let mut server: Server<TestContext> = Server::new(ServerConfig {
+            validate_tool_input: false,
+            ..Default::default()
+        });
+        server
+            .add_tool(StrictTool {
+                schema_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .unwrap();
+
+        let result = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "strict", "arguments": {} }),
+        )
+        .unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+    }
+
+    #[test]
+    fn test_a_tool_name_outside_the_spec_is_refused_at_registration() {
+        struct BadlyNamed;
+        impl Tool<TestContext> for BadlyNamed {
+            fn name(&self) -> &str {
+                "not a valid name!"
+            }
+            fn description(&self) -> &str {
+                "x"
+            }
+            fn schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn execute(
+                &self,
+                _args: Value,
+                _ctx: &mut TestContext,
+                _env: &ToolEnv,
+            ) -> Result<CallToolResult> {
+                Ok(CallToolResult::text("ok"))
+            }
+        }
+
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let error = server.add_tool(BadlyNamed).unwrap_err();
+        assert!(error.to_string().contains("Invalid tool name"), "{error}");
+    }
+
+    #[test]
+    fn test_an_uncompilable_output_schema_degrades_to_a_presence_check() {
+        // A typo in a server's own schema should not fail an otherwise working
+        // tool, but the half of the promise that survives - structured content
+        // must exist - is still enforced. Classified once, at registration.
+        let broken = serde_json::json!({ "type": "object", "properties": { "a": { "$ref": "https://example.com/nope" } } });
+        assert!(matches!(
+            OutputCheck::new("t", Some(broken)),
+            OutputCheck::PresenceOnly
+        ));
+
+        let check = OutputCheck::PresenceOnly;
+        assert!(
+            check
+                .check(Some(&serde_json::json!({ "anything": true })))
+                .is_ok()
+        );
+        assert!(check.check(None).is_err());
+    }
+
+    /// A tool that declares structured output and then does not produce it.
+    struct ForgetfulTool;
+
+    impl Tool<TestContext> for ForgetfulTool {
+        fn name(&self) -> &str {
+            "forgetful"
+        }
+        fn description(&self) -> &str {
+            "Promises structured output and forgets"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Option<Value> {
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": { "n": { "type": "integer" } },
+                "required": ["n"]
+            }))
+        }
+        fn task_support(&self) -> TaskSupport {
+            TaskSupport::Optional
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            Ok(CallToolResult::text("done"))
+        }
+    }
+
+    #[test]
+    fn test_output_schema_is_enforced_on_the_task_path_too() {
+        // "Receivers MUST return from tasks/result exactly what the underlying
+        // request would have returned" - and the synchronous call returns
+        // -32603 here. The task path used to serialize the result straight into
+        // the store with no check at all.
+        let mut server = task_server();
+        server.add_tool(ForgetfulTool).unwrap();
+
+        let sync = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "forgetful" }),
+        )
+        .unwrap_err();
+        assert_eq!(sync.to_jsonrpc_error().code, -32603);
+        assert!(sync.to_string().contains("structuredContent"), "{sync}");
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "forgetful", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+
+        let task = await_terminal(&mut server, &task_id);
+        assert_eq!(task["status"], "failed", "{task}");
+
+        let error = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap_err()
+        .to_jsonrpc_error();
+        assert_eq!(error.code, -32603);
+        assert!(error.message.contains("structuredContent"), "{error:?}");
     }
 
     #[test]
