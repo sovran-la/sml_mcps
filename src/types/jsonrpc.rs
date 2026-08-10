@@ -203,19 +203,24 @@ impl JsonRpcMessage {
             )),
             (true, Some(id)) => {
                 // Read before the parse attempt, because the parse is what
-                // fails and the id is what makes the failure answerable. An id
-                // that is not itself legal - a float, an object - leaves this
-                // `None` and the answer carries `id: null`, which is the case
-                // the spec's exception is actually for.
-                let id = serde_json::from_value::<RequestId>(id.clone()).ok();
+                // fails and the id is what makes the failure answerable.
+                let Ok(id) = serde_json::from_value::<RequestId>(id.clone()) else {
+                    // An id that is not itself legal - a float, an object -
+                    // genuinely could not be read, which is the case the spec's
+                    // `id: null` exception is for. Said plainly: letting the
+                    // whole-struct parse fail instead produced "data did not
+                    // match any variant of untagged enum RequestId", which
+                    // names a private type and tells a client nothing it can
+                    // act on.
+                    return Err(McpError::InvalidMessage(
+                        "request id must be a string or an integer".into(),
+                    ));
+                };
                 serde_json::from_value(value)
                     .map(JsonRpcMessage::Request)
-                    .map_err(|e| match id {
-                        Some(id) => McpError::InvalidRequest {
-                            id,
-                            message: format!("invalid request: {e}"),
-                        },
-                        None => McpError::InvalidMessage(format!("invalid request: {e}")),
+                    .map_err(|e| McpError::InvalidRequest {
+                        id,
+                        message: format!("invalid request: {e}"),
                     })
             }
             (true, None) => serde_json::from_value(value)
@@ -411,6 +416,13 @@ mod tests {
             assert!(
                 matches!(error, McpError::InvalidMessage(_)),
                 "{body} -> {error}"
+            );
+            // And it says what is wrong in terms of the protocol, rather than
+            // naming a private Rust type the client has never heard of.
+            assert_eq!(
+                error.to_string(),
+                "Invalid message: request id must be a string or an integer",
+                "{body}"
             );
         }
     }

@@ -7817,6 +7817,13 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#,
         );
         assert_eq!(error["error"]["code"], -32600, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("request id must be a string or an integer"),
+            "a client can act on this; `untagged enum RequestId` it cannot: {error}"
+        );
 
         assert_still_alive(&mut client);
     }
