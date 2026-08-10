@@ -40,6 +40,11 @@ pub mod auth;
 #[cfg(unix)]
 pub mod bridge;
 
+/// Adds [`Server::serve_daemon`], which needs no import - the module exports
+/// nothing, it only extends `Server`.
+#[cfg(unix)]
+mod daemon;
+
 // Re-export commonly used types
 pub use pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
 pub use server::{

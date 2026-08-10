@@ -1245,7 +1245,9 @@ pub struct Server<C> {
     tools: HashMap<String, ToolEntry<C>>,
     resources: Arc<HashMap<String, Arc<dyn Resource>>>,
     resource_templates: Vec<ResourceTemplate>,
-    prompts: HashMap<String, Box<dyn PromptDef>>,
+    /// `Arc` rather than `Box` so a registration can be handed to a second
+    /// server without the prompt being registered twice - see [`Blueprint`].
+    prompts: HashMap<String, Arc<dyn PromptDef>>,
     transport: Option<Arc<Mutex<dyn Transport>>>,
     /// An independent handle for writing, where the transport can be split.
     ///
@@ -1377,6 +1379,21 @@ struct ToolEntry<C> {
     output: OutputCheck,
 }
 
+/// Every field is a handle, so cloning shares the tool and its compiled schemas
+/// rather than rebuilding them.
+///
+/// Hand-written because `derive(Clone)` would demand `C: Clone`, and `C` is a
+/// context type this entry never holds one of.
+impl<C> Clone for ToolEntry<C> {
+    fn clone(&self) -> Self {
+        Self {
+            tool: self.tool.clone(),
+            input: self.input.clone(),
+            output: self.output.clone(),
+        }
+    }
+}
+
 /// What a tool's declared `outputSchema` lets us enforce.
 #[derive(Clone)]
 enum OutputCheck {
@@ -1420,6 +1437,60 @@ impl OutputCheck {
                 None => Err("no `structuredContent`".to_string()),
             },
         }
+    }
+}
+
+/// Everything registered on a [`Server`], in a form another server can be built
+/// from.
+///
+/// A [`UnixServer`](crate::UnixServer) daemon builds a fresh `Server` per
+/// connection, and [`add_tool`](Server::add_tool) consumes the tool it is
+/// given - so registrations made once, on one server, cannot simply be made
+/// again on the next. Every field here is a handle, so one blueprint reaches N
+/// connections without rebuilding a tool or recompiling a schema.
+///
+/// Carries what a server was *configured* with, not what a session accumulates:
+/// the handshake state, negotiated version, client capabilities and current log
+/// level all belong to one connection and start fresh on the next.
+#[cfg(unix)]
+pub(crate) struct Blueprint<C> {
+    config: ServerConfig,
+    tools: HashMap<String, ToolEntry<C>>,
+    resources: Arc<HashMap<String, Arc<dyn Resource>>>,
+    resource_templates: Vec<ResourceTemplate>,
+    prompts: HashMap<String, Arc<dyn PromptDef>>,
+    tasks: Option<TaskBlueprint<C>>,
+    task_context: TaskContext,
+}
+
+/// A [`TaskRuntime`] minus its store, which is per-connection.
+#[cfg(unix)]
+struct TaskBlueprint<C> {
+    config: TaskConfig,
+    context_factory: Arc<dyn Fn() -> C + Send + Sync>,
+}
+
+#[cfg(unix)]
+impl<C> Blueprint<C> {
+    /// The configuration the server this came from was built with.
+    pub(crate) fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    /// Make every registration on a freshly-built server.
+    pub(crate) fn apply(&self, server: &mut Server<C>) {
+        server.tools = self.tools.clone();
+        server.resources = self.resources.clone();
+        server.resource_templates = self.resource_templates.clone();
+        server.prompts = self.prompts.clone();
+        // A store per connection, not one shared: `tasks/list` under
+        // `SingleRequestor` hands a requestor everything in its store, and one
+        // store across connections would hand each of them the others'.
+        server.tasks = self.tasks.as_ref().map(|tasks| TaskRuntime {
+            store: Arc::new(TaskStore::new(tasks.config.clone())),
+            context_factory: tasks.context_factory.clone(),
+        });
+        server.task_context = self.task_context.clone();
     }
 }
 
@@ -1687,8 +1758,31 @@ impl<C: Send + Sync + 'static> Server<C> {
         if self.prompts.contains_key(&name) {
             return Err(McpError::Internal(format!("Duplicate prompt: {}", name)));
         }
-        self.prompts.insert(name, Box::new(prompt));
+        self.prompts.insert(name, Arc::new(prompt));
         Ok(())
+    }
+
+    /// Trade this server for the registrations made on it.
+    ///
+    /// What [`serve_daemon`](Server::serve_daemon) hands the daemon, so that
+    /// every connection's fresh server gets the same tools, resources, prompts
+    /// and task runtime this one was given.
+    #[cfg(unix)]
+    pub(crate) fn into_blueprint(self) -> Blueprint<C> {
+        Blueprint {
+            config: self.config,
+            tools: self.tools,
+            resources: self.resources,
+            resource_templates: self.resource_templates,
+            prompts: self.prompts,
+            // The store is deliberately left behind: this one belongs to no
+            // connection, and each connection gets its own.
+            tasks: self.tasks.map(|tasks| TaskBlueprint {
+                config: tasks.store.config().clone(),
+                context_factory: tasks.context_factory,
+            }),
+            task_context: self.task_context,
+        }
     }
 
     /// Run the server with the given transport and context (for stdio - continuous loop)

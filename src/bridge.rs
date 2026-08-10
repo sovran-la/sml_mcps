@@ -19,6 +19,10 @@
 //! [`Bridge::auto_start`] connects to an existing daemon, or spawns one and
 //! waits for it to come up - including stale socket / dead-PID recovery.
 //!
+//! [`Server::serve_daemon`](crate::Server::serve_daemon) wires this up for you,
+//! including deciding from `argv` whether this process is the shim or the
+//! daemon it proxies to.
+//!
 //! Unix-only: gated behind `#[cfg(unix)]`.
 
 use crate::server::{error_id, is_malformed};

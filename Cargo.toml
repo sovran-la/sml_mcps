@@ -75,3 +75,7 @@ required-features = ["hosted"]
 # Unix socket daemon/shim example - unix-only, no extra features needed
 [[example]]
 name = "unix_server"
+
+# The same three modes as unix_server, through Server::serve_daemon
+[[example]]
+name = "serve_daemon"

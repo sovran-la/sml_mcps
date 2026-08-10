@@ -91,6 +91,45 @@ fn main() -> Result<()> {
 
 For servers with expensive state (ML models, indexes, agent registries), you don't want every client spawning its own instance. `UnixServer` runs a daemon that multiple clients share via lightweight shims.
 
+**One binary, three modes** — `Server::serve_daemon` reads `argv` and dispatches:
+
+```rust
+use sml_mcps::{Server, ServerConfig, Result};
+use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
+use std::time::Duration;
+
+fn main() -> Result<()> {
+    let mut server: Server<AppContext> = Server::new(config());
+    server.add_tool(PingTool)?;
+
+    // Expensive state lives here, built once, shared by every connection.
+    let counter = Arc::new(AtomicI64::new(0));
+
+    server.serve_daemon(
+        "/tmp/my-daemon/server.sock",
+        Duration::from_secs(300),      // exit after 5min idle
+        move |conn_id| AppContext {
+            conn_id: conn_id.to_string(),
+            counter: counter.clone(),
+        },
+    )
+}
+```
+
+| launched as | what it does |
+|---|---|
+| `my-daemon --daemon` | double-forks, detaches, serves on the socket |
+| `my-daemon --foreground` | serves without detaching (debugging) |
+| `my-daemon` | acts as a shim: starts the daemon if needed, proxies stdio to it |
+
+An MCP client only ever launches the last one. Socket directories are created if
+missing, and every connection gets a fresh `Server` carrying the tools,
+resources, prompts and task runtime you registered. See
+`examples/serve_daemon.rs`.
+
+The two halves are public too, if you want the pieces rather than the pattern:
+
 **Daemon** (one long-lived process):
 
 ```rust
@@ -146,7 +185,8 @@ fn main() -> Result<()> {
 
 `auto_start` connects to a running daemon, or starts one if needed (handling stale sockets and PID files). The shim is a transparent proxy — MCP over stdio on one side, Unix socket on the other.
 
-See `examples/unix_server.rs` for a complete single-binary daemon + shim.
+See `examples/unix_server.rs` for a complete single-binary daemon + shim wired up
+by hand, and `examples/serve_daemon.rs` for the same thing in one call.
 
 ## HTTP Transport (Streamable HTTP with SSE)
 

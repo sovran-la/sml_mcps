@@ -12,6 +12,10 @@
 //! - both honor [`UnixServer::idle_timeout`] - exit after N idle seconds so a
 //!   model-heavy daemon doesn't linger forever after the last client leaves.
 //!
+//! For the whole pattern - this, the shim in front of it, and the `argv`
+//! dispatch that picks between them - in one call, see
+//! [`Server::serve_daemon`](crate::Server::serve_daemon).
+//!
 //! Unix-only: gated behind `#[cfg(unix)]`, no feature flag.
 
 use crate::server::{Server, ServerConfig};
