@@ -2036,6 +2036,74 @@ mod tests {
     }
 
     #[test]
+    fn a_declined_request_does_not_drain_a_body_over_the_ceiling() {
+        // `drain_if_cheap`'s `if declared > limit { return; }`, which deleting
+        // failed zero tests. On the main path it is shadowed - `Body::read`
+        // refuses an over-limit length and sets `started`, so the drain returns
+        // at its first line - but a request rejected *before* the handler read
+        // anything arrives here with `started == false`, and then this `if` is
+        // the only thing between `read_exactly` and a read of a length the peer
+        // chose. That is the `EqualReader` shape this module exists because of,
+        // re-created in our own code.
+        //
+        // The peer below declares 900 MB and sends nothing. If the drain
+        // believes it, the answer waits out the whole deadline instead of going
+        // out now.
+        let wire = b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 900000000\r\n\r\n";
+        let limits = Limits {
+            read_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+
+        let (answer, took) = drive_mute(wire, limits, |_: &mut Request| {
+            Response::new(404).with_body("text/plain", b"no\n".to_vec())
+        });
+
+        assert!(answer.starts_with("HTTP/1.1 404 "), "{answer}");
+        assert!(
+            took < Duration::from_secs(1),
+            "the drain believed a peer-declared length and waited {took:?}"
+        );
+        // Not drained means not finished, which means the connection ends -
+        // the right outcome, and the same one `body_finished` enforces.
+        assert!(answer.contains("Connection: close"), "{answer}");
+    }
+
+    #[test]
+    fn a_body_cannot_be_read_twice() {
+        // `Body::read`'s `if self.started` guard, which deleting also failed
+        // zero tests. No in-tree handler reads twice; one that did would
+        // consume the *next* pipelined request as this one's body and then set
+        // `finished = true`, so the connection would be reused from the wrong
+        // byte - a desync produced by the server rather than the peer.
+        let mut wire = post("first");
+        wire.extend_from_slice(&post("second"));
+
+        let answer = drive(&wire, Limits::default(), |request: &mut Request| {
+            let first = request.read_body(1024);
+            let second = request.read_body(1024);
+            match (first, second) {
+                // The second read is refused, and the first still got its body.
+                (Ok(body), Err(BodyError::Malformed)) => {
+                    Response::new(200).with_body("text/plain", body.into_bytes())
+                }
+                (first, second) => Response::new(500).with_body(
+                    "text/plain",
+                    format!("{first:?} then {second:?}").into_bytes(),
+                ),
+            }
+        });
+
+        assert_eq!(
+            answer.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "the second request was eaten by the first handler: {answer}"
+        );
+        assert!(answer.contains("\r\n\r\nfirst"), "{answer}");
+        assert!(answer.ends_with("second"), "{answer}");
+    }
+
+    #[test]
     fn a_chunked_body_is_decoded() {
         let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
                         5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
