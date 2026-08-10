@@ -1025,6 +1025,23 @@ fn parse_params<T: serde::de::DeserializeOwned>(request: &JsonRpcRequest) -> Res
         .map_err(|e| McpError::InvalidParams(format!("Invalid params: {e}")))
 }
 
+/// Parse a request's params where every field is optional.
+///
+/// The failure has to be `-32602`, not the `-32700` a bare `?` produced:
+/// JSON-RPC reserves parse error for "invalid JSON was received by the server",
+/// and a type-mismatched parameter in well-formed JSON is not that. The tools
+/// page uses `-32602` for exactly this ("requests that fail to satisfy
+/// CallToolRequest schema").
+fn parse_optional_params<T: serde::de::DeserializeOwned + Default>(
+    request: &JsonRpcRequest,
+) -> Result<T> {
+    match &request.params {
+        Some(params) => serde_json::from_value(params.clone())
+            .map_err(|e| McpError::InvalidParams(format!("Invalid params: {e}"))),
+        None => Ok(T::default()),
+    }
+}
+
 //
 // MCP Server
 //
@@ -1624,13 +1641,21 @@ impl<C: Send + Sync + 'static> Server<C> {
 
     fn handle_task_list(&self, request: &JsonRpcRequest) -> Result<Value> {
         let store = self.task_store_or_unsupported()?;
-        let params: ListTasksParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
-            None => ListTasksParams::default(),
-        };
+        let params: ListTasksParams = parse_optional_params(request)?;
 
         let all = store.list()?;
-        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size);
+        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
+
+        // "Invalid or nonexistent cursor in `tasks/list`: -32602 (Invalid
+        // params)" - a MUST, and one an expiring store can genuinely hit, since
+        // a cursor issued a minute ago may now point past the end.
+        if state.offset > 0 && state.offset >= all.len() {
+            return Err(McpError::InvalidParams(format!(
+                "Invalid cursor: no task at offset {}",
+                state.offset
+            )));
+        }
+
         let (tasks, next_cursor) = paginate(&all, &state);
 
         Ok(serde_json::to_value(ListTasksResult {
@@ -1934,10 +1959,7 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     fn handle_list_tools(&self, request: &JsonRpcRequest) -> Result<Value> {
-        let params: ListToolsParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
-            None => ListToolsParams::default(),
-        };
+        let params: ListToolsParams = parse_optional_params(request)?;
 
         // Collect all tools (sorted for consistent pagination)
         let mut all_tools: Vec<crate::types::Tool> =
@@ -1945,7 +1967,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         all_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Apply pagination
-        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size);
+        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
         let (tools, next_cursor) = paginate(&all_tools, &state);
 
         Ok(serde_json::to_value(ListToolsResult {
@@ -1955,10 +1977,7 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     fn handle_call_tool(&mut self, request: &JsonRpcRequest, context: &mut C) -> Result<Value> {
-        let params: CallToolParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
-            None => return Err(McpError::InvalidParams("Missing params".into())),
-        };
+        let params: CallToolParams = parse_params(request)?;
 
         // An unknown tool is a protocol error, and the spec's own example gives
         // it -32602. It is not something a model can fix by retrying with
@@ -2060,10 +2079,7 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     fn handle_list_resources(&self, request: &JsonRpcRequest) -> Result<Value> {
-        let params: ListResourcesParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
-            None => ListResourcesParams::default(),
-        };
+        let params: ListResourcesParams = parse_optional_params(request)?;
 
         // Collect all resources (sorted for consistent pagination)
         let mut all_resources: Vec<crate::types::Resource> = self
@@ -2074,7 +2090,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         all_resources.sort_by(|a, b| a.uri.cmp(&b.uri));
 
         // Apply pagination
-        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size);
+        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
         let (resources, next_cursor) = paginate(&all_resources, &state);
 
         Ok(serde_json::to_value(ListResourcesResult {
@@ -2084,16 +2100,13 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     fn handle_list_resource_templates(&self, request: &JsonRpcRequest) -> Result<Value> {
-        let params: ListResourceTemplatesParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
-            None => ListResourceTemplatesParams::default(),
-        };
+        let params: ListResourceTemplatesParams = parse_optional_params(request)?;
 
         // Sorted for stable pagination, same as the other list handlers.
         let mut all: Vec<ResourceTemplate> = self.resource_templates.clone();
         all.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
 
-        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size);
+        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
         let (resource_templates, next_cursor) = paginate(&all, &state);
 
         Ok(serde_json::to_value(ListResourceTemplatesResult {
@@ -2103,10 +2116,7 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     fn handle_read_resource(&self, request: &JsonRpcRequest) -> Result<Value> {
-        let params: ReadResourceParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
-            None => return Err(McpError::InvalidParams("Missing params".into())),
-        };
+        let params: ReadResourceParams = parse_params(request)?;
 
         let resource = self
             .resources
@@ -2118,10 +2128,7 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     fn handle_list_prompts(&self, request: &JsonRpcRequest) -> Result<Value> {
-        let params: ListPromptsParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
-            None => ListPromptsParams::default(),
-        };
+        let params: ListPromptsParams = parse_optional_params(request)?;
 
         // Collect all prompts (sorted for consistent pagination)
         let mut all_prompts: Vec<Prompt> = self
@@ -2132,7 +2139,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         all_prompts.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Apply pagination
-        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size);
+        let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
         let (prompts, next_cursor) = paginate(&all_prompts, &state);
 
         Ok(serde_json::to_value(ListPromptsResult {
@@ -2142,10 +2149,7 @@ impl<C: Send + Sync + 'static> Server<C> {
     }
 
     fn handle_get_prompt(&self, request: &JsonRpcRequest) -> Result<Value> {
-        let params: GetPromptParams = match &request.params {
-            Some(p) => serde_json::from_value(p.clone())?,
-            None => return Err(McpError::InvalidParams("Missing params".into())),
-        };
+        let params: GetPromptParams = parse_params(request)?;
 
         let prompt = self
             .prompts
@@ -6520,25 +6524,68 @@ mod tests {
     }
 
     #[test]
-    fn test_pagination_invalid_cursor() {
-        let mut server: Server<TestContext> = Server::new(ServerConfig {
-            page_size: 3,
-            ..Default::default()
-        });
+    fn test_an_invalid_cursor_is_invalid_params_on_every_list_operation() {
+        // "Invalid cursors SHOULD result in an error with code -32602 (Invalid
+        // params)" - and for `tasks/list` it is a MUST. Restarting at page one
+        // instead gave a client that mangled a cursor an infinite loop over the
+        // first page.
+        let mut server = task_server();
         server.add_tool(IncrementTool).unwrap();
 
-        let mut ctx = TestContext { counter: 0 };
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+            "tasks/list",
+        ] {
+            let error = dispatch(
+                &mut server,
+                method,
+                serde_json::json!({ "cursor": "!!!not-a-cursor!!!" }),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_jsonrpc_error().code, -32602, "{method}");
+        }
+    }
 
-        // Invalid cursor should default to first page
-        let req = JsonRpcRequest {
-            jsonrpc: Default::default(),
-            id: RequestId::Number(1),
-            method: "tools/list".to_string(),
-            params: Some(serde_json::json!({ "cursor": "garbage" })),
-        };
-        let result = server.dispatch_request(&req, &mut ctx).unwrap();
-        let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1); // Should get the one tool
+    #[test]
+    fn test_a_cursor_past_the_end_of_tasks_list_is_invalid_params() {
+        // "Invalid or nonexistent cursor in tasks/list: -32602". Tasks expire,
+        // so a cursor handed out a minute ago really can point past the end.
+        let mut server = task_server();
+
+        let past_the_end = crate::pagination::encode_cursor_for_test(99);
+        let error = dispatch(
+            &mut server,
+            "tasks/list",
+            serde_json::json!({ "cursor": past_the_end }),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_jsonrpc_error().code, -32602);
+    }
+
+    #[test]
+    fn test_type_mismatched_params_are_invalid_params_not_a_parse_error() {
+        // JSON-RPC reserves -32700 for "invalid JSON was received by the
+        // server". Well-formed JSON with a wrong-typed field is -32602, which
+        // the tools page's own example uses.
+        let mut server = task_server();
+        server.add_tool(IncrementTool).unwrap();
+
+        let cases: [(&str, Value); 6] = [
+            ("tools/list", serde_json::json!({ "cursor": 12345 })),
+            ("resources/list", serde_json::json!({ "cursor": 12345 })),
+            ("prompts/list", serde_json::json!({ "cursor": 12345 })),
+            ("tasks/list", serde_json::json!({ "cursor": 12345 })),
+            ("tools/call", serde_json::json!({ "name": 42 })),
+            ("resources/read", serde_json::json!({ "uri": [] })),
+        ];
+
+        for (method, params) in cases {
+            let error = dispatch(&mut server, method, params).unwrap_err();
+            assert_eq!(error.to_jsonrpc_error().code, -32602, "{method}");
+        }
     }
 
     //
