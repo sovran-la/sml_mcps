@@ -45,6 +45,19 @@ fixable above it — which is why the HTTP/1.1 layer is now ours (§3.13). A
 **fourth** claim from this document is falsified and corrected in place: an
 idle pool did not queue a burst, it refused half of one (§3.13).
 
+A **fourth** independent review then went through the layer that replaced it,
+`httparse` swap and all, and found 18 issues — 2 critical, 4 significant, 12
+minor. All 18 are fixed; §10 lists each one. It found the same pattern for the
+fourth time running, and this time in the fix to its own last finding: the
+deadline added to answer round three's C2 does bound a peer that has *stopped*
+talking, and does nothing about one that is talking slowly. A **fifth** claim
+from this document is falsified and corrected in place, and it is the one §3.13
+leads with: "every read has a deadline" — a per-read deadline is renewed by
+every byte, so a request dribbled a byte at a time never meets one (§3.13).
+A **sixth** is corrected alongside it: bare-LF chunk framing was said to be
+accepted deliberately, on the strength of a check in `httparse` that the code
+around it prevented from ever running (§3.13.1).
+
 ---
 
 ## 1. Breaking changes
@@ -669,10 +682,29 @@ upgrade. Three properties are the whole point, and each one is a finding:
 - **Nothing is sized from a declared length.** A `Content-Length` is compared
   against a ceiling and thrown away. `read_exactly` grows a buffer as bytes
   arrive; a declared length no machine could hold costs one comparison.
-- **Every read has a deadline.** `read_timeout` (30s) covers a request head, or
-  a body once one has started. `idle_timeout` (2m) covers a kept-alive
-  connection between requests. A body that never arrives costs one connection
-  until the deadline.
+- **Every request has a deadline, and it is not one the peer can renew.**
+  `read_timeout` (30s) is the budget for a *whole* request — head and body
+  together, from its first byte. `idle_timeout` (2m) covers a kept-alive
+  connection between requests, and stops applying the moment one starts. A body
+  that never arrives costs one connection until the deadline; so does one that
+  arrives four bytes a second.
+
+  **This sentence used to say "every *read* has a deadline", and that was the
+  fourth review's C1 and this document's fifth retraction.** A socket timeout is
+  per-`read()`, renewed by every byte that arrives — so it bounds a peer that
+  has *stopped* talking and says nothing about one that is talking slowly.
+  Measured against the code this replaces: a head dribbled one byte per 300 ms
+  at a server configured `read_timeout: 1s` was answered `200 OK` after 30.9 s,
+  and a body the same way, 20.1 s. Worse, the switch from `idle_timeout` to
+  `read_timeout` happened *after* `read_head` returned, so a peer that had begun
+  a request was still on the two-minute idle schedule until its head was
+  complete: `read_timeout` did not guard a request head at all. 512 sockets
+  doing that is every thread this process has, for about four bytes a second and
+  no valid request between them.
+
+  The trade is worth stating: a client on a slow enough link cannot deliver a
+  large body, so `read_timeout` wants sizing against `max_message_bytes` and the
+  slowest link you intend to serve rather than against a round trip.
 - **Live connections are capped** at `max_connections` (512), one thread each,
   spawned on arrival rather than up front. A connection over the ceiling is
   answered `503` by a dedicated refusal thread, never by the accept loop —
@@ -834,10 +866,30 @@ Two consequences worth stating rather than discovering:
   the token it choked on. Both close the connection, no test covered it, and
   reintroducing a hand-rolled request-line scan to recover a status code is a
   bad trade for exactly the reason this section exists.
-- Bare-LF line endings are still accepted. The hand-rolled reader accepted them,
-  `httparse` accepts them, and RFC 9112 §2.2 permits a recipient to. No
-  regression — but tightening it is a separate and arguable change, not
-  something this swap did quietly.
+- Bare-LF line endings are accepted **in the head**, which is `httparse`'s
+  reading and hyper's, and which RFC 9112 §2.2 permits. They are refused in
+  chunked framing, which is a change the fourth review argued for and won.
+
+  This bullet used to say bare LF was accepted everywhere and that tightening it
+  was "a separate and arguable change". §2.2's permission is scoped to "the
+  start-line and fields"; §7.1's chunked grammar is strict CRLF, and bare-LF
+  chunk framing is one of the better-known smuggling differentials precisely
+  because front-ends disagree about it. The argument for leniency was also
+  resting on something that was not true: `parse_chunk_size`'s comment said
+  `httparse` "rejects a bare LF here regardless", which is true of `httparse`
+  and never ran, because `read_line` had stripped the LF and the two lines above
+  re-appended a CRLF before handing it over. Measured: a chunked body with `\n`
+  after the chunk size, after the chunk data, and after the last chunk was
+  answered `200 OK`. `read_line` reports its terminator now, and the three
+  places that frame a body require CRLF.
+
+- **A chunk size is not the only thing on top of `httparse`.** Two more
+  ceilings the parser does not have opinions about: an unbounded run of empty
+  lines before a request line (`skip_empty_lines` skips any number, and
+  `read_head` re-parses from the front on every round — 32 KiB of `\r\n`
+  dribbled a byte at a time measured **1.07 s of CPU** for 32 KiB of traffic),
+  and `Transfer-Encoding: chunked` on an HTTP/1.0 request, which `httparse`
+  reports and does not adjudicate. Eight empty lines, and `400` respectively.
 
 ### 3.14 HTTP state is per *session*, not per process
 
@@ -1268,3 +1320,88 @@ wrong in one of two directions — too small refuses healthy bursts, too large i
 the unbounded queue the ceiling existed to prevent. A connection either gets a
 thread now or is told there is no room, which is the same backpressure signal
 with nothing to tune.
+
+---
+
+## 10. Fourth review findings (all fixed)
+
+A fourth independent review took the HTTP/1.1 layer that answered round three —
+including the `httparse` swap that landed after it — and went at it with a real
+socket and a mutation harness rather than a reading. It verified the previous
+round's fixes (the `EqualReader` class of bug is gone, the chunk-size guard is
+correct *and* necessary, connection accounting holds, task isolation holds), and
+found 18 issues of its own: 2 critical, 4 significant, 12 minor.
+
+Every one is fixed, and every fix has a test that fails without it. Where a
+finding was "this guard has no test", the guard was deleted, the suite re-run,
+and the new test confirmed to be the thing that fails.
+
+Its framing is the one worth keeping, because it is the fourth in a row and this
+time it lands on the previous round's *answer*:
+
+> Two of those three are the same shape as the last three rounds: the ceiling
+> went where the review pointed, and the thing on the other side of it was not
+> looked at. `read_timeout` was added to answer C2 ("a `Content-Length` that
+> never arrives permanently wedges a worker"), and it does answer that — a
+> *dead* peer now costs one connection for 30 s. It does not answer a *slow*
+> one, and the docs in three files say it does.
+
+### Shipping blockers
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| C1 | No deadline bounded a *request*. `read_timeout` was a socket timeout, which is per-`read()` and renewed by every byte that arrives — so it bounds a peer that has stopped talking and says nothing about one talking slowly. Measured: a head dribbled one byte per 300 ms against `read_timeout: 1s` was answered `200 OK` after 30.9 s; a body the same way, 20.1 s. The head was worse than per-read — the switch from `idle_timeout` to `read_timeout` happened *after* `read_head` returned, so a peer that had begun a request stayed on the two-minute idle schedule until its head was complete, and `read_timeout` did not guard a request head at all. 512 sockets is every thread this process has, for ~4 bytes/s. | Fixed. One `Deadline` per request, started by its first byte, spent by the head and the body together. Enforced twice because either alone has a hole: checked *between* reads, which catches a peer that keeps delivering, and used to arm the socket, which catches one that stops mid-read. `read_exactly` and `read_line` grew loops of their own, because `read_to_end` and `read_until` loop *inside* themselves — one socket timeout there bounds a read rather than a line, and the peer sets the pace. A request that blows its budget is `408` and closed. Eight tests, six of them over a socket that ignores `set_read_timeout` on purpose, and reverting any read loop to a per-read deadline fails them. |
+| C2 | The one `&&` preventing request smuggling on the most reachable path had no test: deleting `&& handled.body_finished` from the reuse condition failed **zero** of 629 tests, and the mutant executed a smuggled `ping` on a connection whose only request was a `404`. The three tests that looked like they covered it did not — one drains successfully, so the guard is inert; two answer `.closing()`, so `response.close` short-circuits first. | Fixed, with no production change — the code was right. The untested case is an unfinished body with a response that does *not* ask to close, which is what every `precheck` rejection produces. The test sends a `Content-Length` over the ceiling (so `drain_if_cheap` declines) behind a plain `404`, and asserts one request gets one answer. Verified failing under the mutation and passing without it. |
+
+### Significant
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| S1 | A spec-correct `Expect: 100-continue` client was stalled for the whole `read_timeout` on every rejected request. It is waiting for permission to send its body; the handler declined to read, so permission never came; `drain_if_cheap` then blocked on bytes that were correctly never in flight. Measured at 3.0016 s against a 3-second timeout, 30 s at the default — on `400`, `401`, `403`, `404` and `405`, all of which are on the unauthenticated path, so also a connection-holding primitive for ~100 bytes. | Fixed: two lines in `drain_if_cheap`. The connection then closes, because `finished` stays false, which is the right outcome — the peer's body was never framed onto the wire. The test needs a socket that *honours* its deadline, unlike the ones the slowloris tests use, so the wait itself is the measurement: 30 s without the guard, 30 ms with it. |
+| S2 | Bare LF was accepted in chunked framing, and the comment claimed `httparse` rejected it. True of `httparse` — and it never ran, because `read_line` had stripped the LF and `parse_chunk_size` re-appended a CRLF before handing it over. Measured: `\n` after the chunk size, after the chunk data, and after the last chunk → `200 OK`. RFC 9112 §2.2's leniency is scoped to "the start-line and fields"; §7.1's chunked grammar is strict CRLF. | Fixed by tightening rather than by correcting the comment, which is the choice the review argued for and this module's stated position — "rejecting is the side a proxy cannot be played off against". `read_line` reports its terminator, and the three places that frame a body require CRLF: the chunk size, the terminator after chunk data, and the trailer section including the blank line that ends it. The head keeps `httparse`'s leniency. §3.13.1's bullet is corrected in place. |
+| S3 | `eprintln!("  ✗ Auth failed: {}", e)` interpolated a value the peer chooses. `JwtError::ValidationFailed` wraps `jsonwebtoken`'s error, whose `Display` quotes the offending part of a JOSE header back verbatim — and the header is decoded *before* the signature is verified. An `alg` of `HS256\ninjected-log-line: …` therefore wrote an arbitrary line into the server's stderr, unauthenticated, once per request, unbounded. | Fixed: `JwtError::summary()` maps to a fixed set (missing header, malformed header, invalid signature, expired, bad issuer, bad audience, malformed token, …) and that is what the ungated line prints. The detail moves behind the debug gate, and still goes back in the `401` body, where it is JSON-escaped and the reader is the attacker. One of the three tests asserts that `Display` *still* echoes the peer — the day it stops, the forgery test stops measuring anything. |
+| S4 | Four documents asserted a `read_timeout` behaviour the code did not have, all of them reachable by someone sizing a deployment. | Fixed by C1, which makes them true, and then corrected anyway because none of them said *aggregate* — `Limits::read_timeout`, `HttpServer::read_timeout`, `HttpServer::idle_timeout`, the `HttpServer` exposure note, the module header, `README.md`'s table, and §3.13 above, which is this document's fifth retraction. |
+
+### Minor
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| m1 | Two more load-bearing guards survived mutation untested. `drain_if_cheap`'s `if declared > limit` is shadowed on the main path but not on a `precheck` rejection, where it is the only thing between `read_exactly` and an unbounded read of a peer-declared length — the `EqualReader` shape, rebuilt in our own code. `Body::read`'s `if self.started` stops a handler that reads twice from consuming the next pipelined request as this one's body. | Both tested directly, both verified failing with their guard removed: deleting the first makes a `404` wait out the whole deadline on 900 MB that were never sent; deleting the second makes the second request on a connection vanish into the first. |
+| m2 | Leading blank lines were a CPU DoS. `read_head` re-parses the accumulator on every round that ends a line, which `max_headers` bounds for a well-formed head — and `httparse::skip_empty_lines` skips an unbounded run, so 32 KiB of `\r\n` dribbled a byte at a time is ~16k parses of an average 16 KiB buffer. Measured here, same build and machine: **1.07 s of CPU for 32 KiB of traffic**, then a `431`. | Fixed: eight, per RFC 9112 §2.2's "at least one", counted no further than nine so the check cannot be the quadratic scan it prevents, and counting bare LFs too because `skip_empty_lines` takes either. The same bytes now cost 5.6 ms. |
+| m3 | `send_continue` wrote with no write deadline: it is the one write before `write_response`, so on a plaintext connection the socket was still on "block forever". | Fixed, and tested with a socket that remembers what deadline was in force at its first write. |
+| m4 | A zero `Duration` silently disabled a deadline. `set_read_timeout(Some(ZERO))` is `EINVAL`, the error was discarded by `let _ =`, and the socket was left blocking forever — so asking for the shortest possible deadline got you none at all. | Fixed at both ends: every path that arms a socket goes through `arm_read`/`arm_write`, which clamp to 1 ms, and the two public builders clamp the way `max_connections` already did. |
+| m5 | `read_line`'s doc still called it "one line of a head". It has not read a head since the grammar moved to `httparse`; its callers are the chunked decoder and the trailer reader. | Fixed, along with a note that its `budget == 0` guard is now unreachable by construction — kept deliberately, so the next reader does not delete it. |
+| m6 | `rejection()` described `Error::NewLine` as "a line ending that is not CRLF". `httparse` raises it for a `\r` *not* followed by `\n`; a bare `\n` is the one thing it accepts. | Fixed: "a stray carriage return", which is a thing a client can go and look for. |
+| m7 | Four stale `tiny_http` references, one of them the crate-level rustdoc — naming the wrong crate *and* the wrong threading model, as the first thing a reader of the docs sees. | All four fixed. The references in this document and in `docs/plans/` stay: they are dated records of what was true when written. |
+| m8 | HTTP/1.0 with `Transfer-Encoding: chunked` was answered `200`. Chunked arrived with HTTP/1.1; a 1.0-speaking hop in front reads the same bytes as an opaque body ending at the connection close. | Fixed: `400`, and a test that the same body over 1.1 is still read, so this refuses a version rather than a coding. |
+| m9 | Absolute-form request targets were `404`ed — `path_of` stripped a query and a fragment but not an authority. RFC 9112 §3.2.2: "a server MUST accept the absolute-form in requests." | Fixed. The scheme is only looked for when the target is not origin-form, so `/mcp?next=http://host/other` keeps its own path instead of inheriting a query parameter's — which would have been a new way to reach an endpoint by naming a different one. |
+| m10 | `process_request` asked `has_notifications()` before `take_response()`, so a request whose *input* was a notification and which caused the server to emit one came back `200 text/event-stream` where transports says "the server **MUST** return HTTP status code 202 Accepted with no body". Latent — no path in `server.rs` writes while handling a notification. | Fixed, and moved into `answer_from` so the order can be stated and tested rather than inferred. What the input was is answered by whether a response came back; nothing the server wrote while handling it changes that. |
+| m11 | `register_waiter` was the one broker lock that refused a poisoned mutex, returning `Internal` while every other method carried on — so one panic anywhere made every later server-initiated request fail against a broker that was otherwise working. | Fixed, and fixed wider than asked, because the narrow fix moved the inconsistency instead of removing it: `deliver` degraded by *parking* a response for an off-thread waiter, which its own doc says "would strand it". All four locks go through one `hold` now, for the reason already written down for `HttpTransport::buffered` and `Sessions::table`. |
+| m12 | `Sessions::key` composes with `\u{1}` on values the issuer controls. A `sub` of `a\u{1}b` with no tenant and a `sub` of `a` with tenant `b` compose to the same owner. Theoretical — a signature is required — but a separator that can appear in what it separates is not one. | Fixed: refused at validation, with the constant moved to the crate root so the composer and the validator name the same thing. |
+
+### Where this departs from the review's suggested fix
+
+**C1, and the alternative it offered.** The review's other option was to retract
+"this is safe to expose directly" and say plainly that slow-client protection is
+the reverse proxy's job. It did not recommend that, and neither does this. The
+claim is load-bearing for the whole `serve_tls` story, the fix is about thirty
+lines, and a directly-exposed HTTP/1.1 server having `client_header_timeout`
+and `client_body_timeout` is table stakes rather than a feature.
+
+**S2, tighten versus correct the comment.** The review offered both and left the
+choice open. Tightening is the one taken. The comment was not merely inaccurate
+— it was the *reason* the leniency looked deliberate in §3.13.1, so correcting
+it alone would have left a documented decision resting on a check that never
+ran.
+
+**m11, three locks versus four.** The review asked for `register_waiter` to be
+made consistent with the rest of the broker. Doing exactly that would have left
+`deliver` unable to hand a response to a registered waiter after a poison —
+parking it instead, which its own doc identifies as the thing that strands one.
+The rest of the broker was not a standard worth matching in three different
+ways, so all four locks now share one accessor.
+
+**BodyError gained a variant.** Not asked for. A request that blew its budget
+came back as `400 Bad Request: the body ended early`, which tells a client on a
+slow link to go and look for a bug in its framing. `BodyError::TimedOut` and a
+`408` say the true thing, and it made C1's two halves legible on the wire.
