@@ -1763,6 +1763,101 @@ mod tests {
         fn shutdown_write(&self) {}
     }
 
+    /// A socket that remembers every deadline it was handed, and what was in
+    /// force the first time anything was written to it.
+    struct Recorder {
+        incoming: std::io::Cursor<Vec<u8>>,
+        outgoing: Arc<Mutex<Vec<u8>>>,
+        seen: Arc<Mutex<Vec<Option<Duration>>>>,
+        write_deadline: Mutex<Option<Duration>>,
+        at_first_write: Arc<Mutex<Option<Option<Duration>>>>,
+    }
+
+    impl Read for Recorder {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.incoming.read(buffer)
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let mut first = self
+                .at_first_write
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if first.is_none() {
+                *first = Some(
+                    *self
+                        .write_deadline
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
+            }
+            drop(first);
+
+            self.outgoing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Socket for Recorder {
+        fn set_read_timeout(&self, timeout: Option<Duration>) {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(timeout);
+        }
+
+        fn set_write_timeout(&self, timeout: Option<Duration>) {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(timeout);
+            *self
+                .write_deadline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = timeout;
+        }
+
+        fn shutdown_write(&self) {}
+    }
+
+    /// Drive one request and report every deadline the socket was given, plus
+    /// the write deadline in force at the first byte written back.
+    #[allow(clippy::type_complexity)]
+    fn drive_recorded<H>(
+        request: &[u8],
+        limits: Limits,
+        handle: H,
+    ) -> (String, Vec<Option<Duration>>, Option<Option<Duration>>)
+    where
+        H: for<'a> Fn(&mut Request<'a>) -> Response,
+    {
+        let outgoing = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let at_first_write = Arc::new(Mutex::new(None));
+        let socket = Recorder {
+            incoming: std::io::Cursor::new(request.to_vec()),
+            outgoing: Arc::clone(&outgoing),
+            seen: Arc::clone(&seen),
+            write_deadline: Mutex::new(None),
+            at_first_write: Arc::clone(&at_first_write),
+        };
+        serve_connection(Box::new(socket), &limits, &handle);
+
+        let written = outgoing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let first = *at_first_write.lock().unwrap_or_else(|e| e.into_inner());
+        (String::from_utf8_lossy(&written).into_owned(), seen, first)
+    }
+
     /// Drive one request through a peer that then goes quiet, and say how long
     /// the answer took to come back.
     fn drive_mute<H>(request: &[u8], limits: Limits, handle: H) -> (String, Duration)
@@ -2274,6 +2369,61 @@ mod tests {
         );
         assert!(answer.contains("HTTP/1.1 200 OK"), "{answer}");
         assert!(answer.ends_with("hello"), "{answer}");
+    }
+
+    #[test]
+    fn continue_is_written_under_a_deadline_like_everything_else() {
+        // `100 Continue` is the one write that happens before `write_response`,
+        // so on a plaintext connection nothing had set a write deadline yet and
+        // the socket was still on "block forever". Twenty-five bytes into an
+        // empty send buffer does not block in practice, and "in practice" is
+        // not a deadline.
+        let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\
+                        Content-Length: 5\r\n\r\nhello";
+        let limits = Limits {
+            write_timeout: Duration::from_secs(7),
+            ..Default::default()
+        };
+
+        let (answer, _, at_first_write) = drive_recorded(request, limits, echo_body(1024));
+
+        assert!(
+            answer.starts_with("HTTP/1.1 100 Continue\r\n\r\n"),
+            "{answer}"
+        );
+        assert_eq!(
+            at_first_write,
+            Some(Some(Duration::from_secs(7))),
+            "the first byte written went out with no write deadline"
+        );
+    }
+
+    #[test]
+    fn a_zero_duration_never_reaches_a_socket() {
+        // `set_read_timeout(Some(Duration::ZERO))` is `EINVAL`, and the error is
+        // discarded - which leaves the socket **blocking forever**, the exact
+        // opposite of what asking for zero means. Every path that arms a socket
+        // clamps, so a `Limits` full of zeros produces a server that answers
+        // rather than one that hangs.
+        let limits = Limits {
+            read_timeout: Duration::ZERO,
+            idle_timeout: Duration::ZERO,
+            write_timeout: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let (answer, seen, _) = drive_recorded(&post("hello"), limits, echo_body(1024));
+
+        assert!(!seen.is_empty(), "no deadline was ever set");
+        for timeout in &seen {
+            assert_ne!(
+                *timeout,
+                Some(Duration::ZERO),
+                "a zero deadline reached the socket, which reads it as none: {seen:?}"
+            );
+        }
+        // And it did answer, rather than blocking on a peer forever.
+        assert!(answer.starts_with("HTTP/1.1 "), "{answer}");
     }
 
     #[test]

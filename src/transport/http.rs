@@ -2145,6 +2145,30 @@ mod http_server_tests {
     }
 
     #[test]
+    fn test_a_zero_deadline_is_refused_at_the_builder() {
+        // `max_connections` already does `.max(1)`; these do the same, and for a
+        // sharper reason. A zero connection ceiling refuses everybody, which is
+        // at least visible - a zero *deadline* is `EINVAL` at the syscall, the
+        // error is discarded, and the socket is left blocking forever. Asking
+        // for the shortest possible deadline and getting none at all is the
+        // worst available outcome.
+        let server: HttpServer<TestContext> = HttpServer::new(ServerConfig::default())
+            .read_timeout(Duration::ZERO)
+            .idle_timeout(Duration::ZERO);
+
+        assert!(server.limits.read_timeout > Duration::ZERO);
+        assert!(server.limits.idle_timeout > Duration::ZERO);
+
+        // And a deadline that *is* asked for is the one that is used.
+        let server: HttpServer<TestContext> = HttpServer::new(ServerConfig::default())
+            .read_timeout(Duration::from_secs(3))
+            .idle_timeout(Duration::from_secs(9));
+
+        assert_eq!(server.limits.read_timeout, Duration::from_secs(3));
+        assert_eq!(server.limits.idle_timeout, Duration::from_secs(9));
+    }
+
+    #[test]
     fn test_the_endpoint_is_a_path_not_a_request_target() {
         // "The server MUST provide a single HTTP endpoint *path*". `tiny_http`
         // hands back the raw target, so `/mcp?sessionId=abc` used to 404.
