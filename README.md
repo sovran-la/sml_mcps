@@ -24,10 +24,10 @@ sml_mcps gives us a clean, sync MCP server that we control.
 [features]
 default = ["schema"]
 schema = ["dep:schemars"]     # JSON Schema generation for tools
-http = ["dep:tiny_http"]       # Streamable HTTP transport (with SSE)
+http = []                      # Streamable HTTP transport (with SSE), no deps
 auth = ["dep:jsonwebtoken"]    # JWT validation for hosted
 hosted = ["http", "auth"]      # Both HTTP and auth
-tls = ["http", "tiny_http/ssl-rustls"]  # HTTPS, via rustls
+tls = ["http", "dep:rustls", "dep:rustls-pemfile"]  # HTTPS, via rustls
 ```
 
 ## Usage (Stdio)
@@ -151,13 +151,28 @@ See `examples/unix_server.rs` for a complete single-binary daemon + shim.
 ## HTTP Transport (Streamable HTTP with SSE)
 
 With the `http` feature, `HttpServer` handles all the HTTP boilerplate for you.
-Requests are served concurrently, one thread each from a fixed pool
-(`HttpServer::pool_size`, default `8 × CPU`), so a client blocked in
-`tasks/result` cannot hold up anybody else. The context factory is called per
-request, on that request's own thread, so it must be `Send + Sync`. The pool is
-bounded in both directions: when every thread is busy and the short queue behind
-them is full, further requests are answered `503` rather than queued without
-limit.
+The HTTP/1.1 layer is ours, on `std::net`, so the feature costs no
+dependencies. Requests are served concurrently, one thread per connection, so a
+client blocked in `tasks/result` cannot hold up anybody else. The context
+factory is called per request, on that request's own thread, so it must be
+`Send + Sync`.
+
+Everything a peer controls has a ceiling, and each one is a knob:
+
+| Knob | Default | Bounds |
+|---|---|---|
+| `HttpServer::max_connections` | 512 | live connections, and so threads |
+| `HttpServer::read_timeout` | 30s | delivering a request head or body |
+| `HttpServer::idle_timeout` | 2m | a kept-alive connection between requests |
+| `ServerConfig::max_message_bytes` | 8 MiB | a request body |
+
+A connection arriving when `max_connections` are already live is answered `503`
+and closed — by a thread of its own, never the accept loop. A body over the
+ceiling is answered `413` without being read or drained, and its connection is
+closed rather than left half-framed.
+
+This is safe to expose directly. Behind a reverse proxy, terminate TLS there
+and bind to loopback.
 
 ```rust
 use sml_mcps::{HttpServer, ServerConfig, Tool, ToolEnv, CallToolResult, Result};

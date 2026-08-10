@@ -33,6 +33,18 @@ it named were a remote OOM reachable before any handshake (§8, N1) and a
 total-server denial of service from one `tasks/result` (§8, N2); the second is
 why the HTTP transport now serves every request on its own thread (§3.13).
 
+A **third** independent review then verified those 22, agreed with all of them,
+and found 14 issues of its own — two of them ways to kill the process with a
+request carrying no body, no token and no handshake. All 14 are fixed; §9 lists
+each one. Its framing is worth keeping, because it is the same framing as last
+time: this was "the third round in a row where a fix moved the problem one
+layer outward rather than removing it… the ceiling was put where the review
+pointed, and the thing on the other side of the ceiling was not looked at." The
+thing on the other side was `tiny_http`'s body reader, and neither blocker was
+fixable above it — which is why the HTTP/1.1 layer is now ours (§3.13). A
+**fourth** claim from this document is falsified and corrected in place: an
+idle pool did not queue a burst, it refused half of one (§3.13).
+
 ---
 
 ## 1. Breaking changes
@@ -190,16 +202,37 @@ See §8, N2. `Server` passes `ServerConfig::task_result_timeout`.
 `ServerConfig::max_message_bytes`. Both structs derive `Default`, so
 `..Default::default()` construction (§1.2) is unaffected.
 
-### 1.11 The `http` feature still depends on `tiny_http`, and `tls` moved
+### 1.11 The `http` feature has no dependencies, and `tls` moved again
 
-`http = ["dep:tiny_http"]`, as before this cycle. Nothing here re-exports it, so
-a downstream `Cargo.toml` that names `tiny_http` for its own reasons is
-unaffected either way.
+`http = []`. The HTTP/1.1 layer is ours now (§3.13), so the feature costs
+nothing. Nothing here re-exported `tiny_http`, so a downstream `Cargo.toml` that
+named it for its own reasons is unaffected — but it will no longer arrive by
+way of this crate.
 
 The one thing to change is a hand-written `tls` line: it is
-`tls = ["http", "tiny_http/ssl-rustls"]` now, not `rouille/rustls`. Depending on
-the `tls` *feature* rather than on the crate behind it needs no change. See
-§3.13.
+`tls = ["http", "dep:rustls", "dep:rustls-pemfile"]` now, not
+`tiny_http/ssl-rustls` and not `rouille/rustls`. Depending on the `tls`
+*feature* rather than on the crate behind it needs no change.
+
+### 1.12 `HttpServer::pool_size` is deprecated in favour of `max_connections`
+
+**Confidence: high. Deprecated, not removed — it still compiles and still does
+the sensible thing.**
+
+There is no pool any more; each connection gets a thread of its own (§3.13), so
+the number to give is a ceiling on live connections rather than a count of
+pre-spawned threads:
+
+```rust
+HttpServer::new(config).pool_size(64)          // deprecated, forwards to:
+HttpServer::new(config).max_connections(64)
+```
+
+The default moved from `8 × CPU` threads spawned at `serve()` time to 512
+connections spawned on arrival. Two knobs are new alongside it, and both are
+what make direct exposure supportable: `HttpServer::read_timeout` (30s, how long
+a peer may take over a request head or body) and `HttpServer::idle_timeout` (2
+minutes, how long a kept-alive connection may sit between requests).
 
 ---
 
@@ -578,98 +611,161 @@ prefer that, make the fields required again; the negotiation logic is unchanged
 either way. A *malformed* initialize (wrong types) is `-32602`, not a parse
 error.
 
-### 3.13 HTTP accepts on one thread and answers on a pool of our own
+### 3.13 The HTTP/1.1 layer is ours
 
-**Confidence: high.**
+**Confidence: high. Rewritten twice — read the two claims it replaces.**
 
-The old `HttpServer` was a `for request in server.incoming_requests()` loop that
-handled one request at a time on the accept thread. That was defensible while
-every request was short. It stopped being defensible the moment `tasks/result`
-became resolvable across requests (the S6 fix), because that call **MUST** block
-until the task is terminal — so one client, sending one well-formed and fully
-authorized request, could hold every other client for up to the task's TTL.
-Confirmed on the wire: a `ping` on a second connection waited exactly as long as
-an unrelated 8-second `tasks/result`.
+The transport accepts on one thread and answers on one thread per connection.
+Both halves of that sentence changed this cycle, and the reason is the same
+reason each previous revision of this section changed: the ceiling kept being
+put where the review pointed, and the thing on the other side of it was not
+looked at.
 
-The loop is still `for request in server.incoming_requests()`, and it now does
-exactly two things per iteration: take a request and hand it to a worker. How
-long any one request takes cannot affect when the next is picked up. That shape
-is what makes several other findings tractable:
+**Why it is not somebody else's HTTP server.** The N4 fix refused an over-large
+body before reading a byte of it. That is the right instinct, and against
+`tiny_http` it was the wrong outcome, because the reader it hands back promised
+to consume `Content-Length` bytes and its destructor keeps that promise:
 
-- a blocking call costs one pool slot instead of the server (§8, N2)
-- per-connection state stops being a euphemism for per-process (§3.14)
-- `request.as_reader()` is a plain `Read`, so `take(limit)` is the whole body
-  cap (§8, N4)
+```rust
+// tiny_http-0.12.0 src/util/equal_reader.rs
+fn drop(&mut self) {
+    let mut remaining_to_read = self.size;
+    while remaining_to_read > 0 {
+        let mut buf = vec![0; remaining_to_read];   // the peer chose this number
+        match self.reader.read(&mut buf) { ... }    // and this read has no deadline
+    }
+}
+```
 
-**The claim this replaces.** An earlier revision of this document said the
-transport ran on `rouille`, and blamed `chrono`, `time`, `url`,
-`percent-encoding`, `multipart`, `threadpool`, `filetime`, `sha1_smol`, `rand`
-and "its own older `base64`" on it. Four of those were never rouille's: `time`
-arrives through `jsonwebtoken` → `simple_asn1`, `url` and `percent-encoding`
-through `boon`, and `base64 0.13` through `rustls-pemfile` on the TLS path —
-all of them still present. The rest were, and they are gone.
+Two consequences, both measured on the wire before the fix, both reachable with
+no token and no handshake:
 
-**The pool.** `rouille` is `tiny_http` plus a thread-per-request executor, and
-the executor was the only part of it this crate used. `WorkerPool`
-(`src/transport/pool.rs`) is that part, in ~130 lines of `std::thread` and one
-`sync_channel`: N workers taking items off a bounded queue, with the lock held
-across `recv` and nothing else. Dropping it drains the queue and joins.
+- `Content-Length: 200000000000000000` and no body — 81 bytes — printed
+  `memory allocation of 200000000000000000 bytes failed` and died with
+  `SIGABRT`. The client got its `413` first, and then the server was gone.
+- `Content-Length: 100000000` and no body — 72 bytes — was answered `413`, and
+  the next request went unanswered. The drain has no deadline, so the worker
+  never came back. Repeat it `pool_size + backlog + 1` times and the accept
+  loop drains one itself and never iterates again: a permanently deaf server,
+  every worker idle, for about 8 KiB of traffic.
 
-Swapping back to `tiny_http` directly removes 27 crates and adds none:
+Neither is fixable above `tiny_http`'s API, and this was checked rather than
+assumed. The allocation happens *before* the destructor's first read, so
+draining, responding, or dropping differently beforehand does not avoid it;
+`Request` exposes no way to hand back its reader; and the drain cannot be
+bounded because 0.12 sets no socket timeout and offers no way to set one. The
+same layer is why connection concurrency was unbounded — `TaskPool::spawn`
+starts a thread per connection with no ceiling, so a peer decided how many
+threads this process has.
+
+So the layer is ours: `src/transport/http1.rs`, `std::net`, no dependencies.
+The subset is the subset MCP needs — `POST`/`GET`/`DELETE` on one path,
+`Content-Length` and `chunked` bodies, keep-alive, one buffered response. No
+pipelining, no compression, no ranges, no upgrade. Three properties are the
+whole point, and each one is a finding:
+
+- **Nothing is sized from a declared length.** A `Content-Length` is compared
+  against a ceiling and thrown away. `read_exactly` grows a buffer as bytes
+  arrive; a declared length no machine could hold costs one comparison.
+- **Every read has a deadline.** `read_timeout` (30s) covers a request head, or
+  a body once one has started. `idle_timeout` (2m) covers a kept-alive
+  connection between requests. A body that never arrives costs one connection
+  until the deadline.
+- **Live connections are capped** at `max_connections` (512), one thread each,
+  spawned on arrival rather than up front. A connection over the ceiling is
+  answered `503` by a dedicated refusal thread, never by the accept loop —
+  writing to a peer is peer-paced, and the accept loop is the one thread that
+  must never wait on one.
+
+An over-cap body is refused without being read *and without being drained*, and
+its connection is closed. That is deliberate on both counts: the bytes are
+still coming (or never will), and guessing where the next request starts on a
+connection whose framing was abandoned is how a desynchronised connection
+becomes a request-smuggling primitive. Closing is bounded on the way out — a
+half-close, then a discard capped at 64 KiB and 250 ms, so the peer sees the
+`413` instead of a reset.
+
+Owning the parser also meant owning the framing hygiene that comes with it:
+`Content-Length` together with `Transfer-Encoding` is `400`, conflicting
+lengths are `400`, obsolete line folding is `400`, an extra space in the
+request line is `400`, and an unknown transfer coding is `501`.
+
+**The first claim this replaces.** An earlier revision said the transport ran
+on `rouille`, and blamed `chrono`, `time`, `url`, `percent-encoding`,
+`multipart`, `threadpool`, `filetime`, `sha1_smol`, `rand` and "its own older
+`base64`" on it. Four of those were never rouille's: `time` arrives through
+`jsonwebtoken` → `simple_asn1`, `url` and `percent-encoding` through `boon`,
+and `base64 0.13` through `rustls-pemfile` on the TLS path.
+
+**The second claim this replaces.** The revision after that said "the queue
+holds one waiting request per thread, so a burst still queues; only sustained
+overload is refused." That is false, and the review measured it. `WorkerPool`
+used `sync_channel(backlog)`, which admits `backlog + 1` outstanding items no
+matter how many workers are idle, because only one worker is ever inside `recv`
+at a time. On a pool with **four idle threads** and a tool that does nothing:
+
+| simultaneous pings | 200 | 503 |
+|---|---|---|
+| 8 | 8 | 0 |
+| 32 | 16 | **16** |
+| 128 | 46 | **82** |
+
+Those were `ping`s against an idle server, and the `503` carries no `id`, so a
+client could not even correlate the refusal with the request it lost.
+
+**Where the pool went.** It is gone, and that is the fix for the table above. A
+connection carries one request at a time, so bounding connections bounds work;
+a second ceiling behind the first was one queue too many, and it was the wrong
+size. Nothing is queued now — a connection either gets a thread or is told
+there is no room — so a burst of 32 on an idle server is 32 threads and no
+refusals, which is a test. Two other findings dissolve with it: `WorkerPool`'s
+`Drop` joined every worker unconditionally, so one wedged handler wedged
+shutdown forever, and the default of `8 × available_parallelism()` pre-spawned
+512 threads on a 64-core host before a single request arrived. Threads are
+spawned per connection now, so an idle server has two.
+
+Measured after, on the same machine and with the same probes:
+
+```
+Content-Length: 200000000000000000, no body  -> 413, then ping -> 200 OK
+Content-Length: 100000000, no body           -> 413, next request answered in 92µs
+200 idle keep-alive connections, cap 512     -> +200 threads, 200 answered
+200 idle keep-alive connections, cap 8       -> +8 threads, 8 answered, 192 × 503
+                                                and back to baseline on close
+```
+
+**Dependencies.** Unique crates, `cargo tree -e normal`:
 
 | | before | after |
 |---|---|---|
-| `cargo tree --all-features` | 124 | 97 |
-| `cargo tree --features hosted` | 118 | 89 |
+| default | 64 | 64 |
+| `--features http` | 69 | **64** |
+| `--features hosted` | 84 | 79 |
+| `--all-features` | 92 | 86 |
 
-Gone: `rouille`, `chrono`, `multipart`, `buf_redux`, `mime`, `mime_guess`,
-`unicase`, `twoway`, `safemem`, `quick-error`, `rand`, `rand_chacha`,
-`rand_core`, `ppv-lite86`, `filetime`, `sha1_smol`, `tempfile`, `fastrand`,
-`rustix`, `errno`, `bitflags`, `httparse`, `num_cpus`, `num_threads`,
-`iana-time-zone`, `core-foundation-sys`, `threadpool`. What remains under the
-`http` feature is `tiny_http` and its four: `ascii`, `chunked_transfer`,
-`httpdate`, `log`. The future-incompatibility warning current Rust emits for
-`buf_redux` and `multipart` goes with them — `cargo build --all-features` is
-silent now, and was not before.
+The `http` feature now costs nothing at all. What went: `tiny_http`, `ascii`,
+`chunked_transfer`, `httpdate`, `log`, and on the TLS path the whole `rustls
+0.20` / `webpki` / `sct` / `ring 0.16` / `rustls-pemfile 0.2` chain.
 
-The earlier revision judged the weight worth it "because the alternative was
-hand-rolling the same thread pool and getting the shutdown and panic edges
-wrong". Those edges are two: a handler that panics must cost its item and not
-the worker (`catch_unwind` in the worker loop, tested), and shutdown must drain
-what it accepted before joining (dropping the sender does that, also tested).
-Both are load-bearing and both are cheaper to own than 27 crates.
+**TLS.** `rustls` directly, 0.23 rather than the unmaintained 0.20 that arrived
+through `tiny_http/ssl-rustls`, with `ring` as the provider. The handshake runs
+on the connection's own thread under the connection's own deadlines, never on
+the accept loop. `serve_tls` still refuses a certificate it cannot use *before*
+binding, so a mis-wired TLS path cannot serve plaintext on the HTTPS port — and
+there is now a test that drives a real handshake and a real `ping` through it,
+rather than only testing the refusal.
 
-**Saturation.** This is the one behavioral difference from `rouille`, and it is
-deliberate. Both the thread count and the queue behind it are bounded, so there
-is a state where a request arrives with nowhere to run. `rouille` queued
-without limit; this answers `503` with a JSON-RPC error body, the same shape as
-every other rejection here. Queueing without limit is a peer-controlled amount
-of memory and a growing pile of requests nobody is getting to — the ceiling
-every other peer-controlled thing in this crate already has (§8, N1, N4).
-Blocking the accept loop instead would make the listener as slow as its slowest
-request, which is the failure this whole design exists to prevent. The queue
-holds one waiting request per thread, so a burst still queues; only sustained
-overload is refused.
+**Exposure.** This is a supported configuration now, which it was not before:
+with no request deadlines anywhere in the stack, a peer that declared a body
+and never sent it held a thread forever. Behind a reverse proxy, terminate TLS
+there and bind to loopback; in front of nothing, keep the defaults and set
+`origin_policy` deliberately.
 
-**Pool sizing.** `8 × CPU` by default, tunable with `HttpServer::pool_size`.
-Each in-flight request occupies one slot for its whole duration — including a
-`tasks/result` that is waiting, which is bounded by
-`ServerConfig::task_result_timeout` (§8, N2) rather than by the task's TTL.
-Those two knobs are the ones to think about together: the pool has to be
-comfortably larger than the number of clients expected to be blocked at once.
-
-**TLS.** There was none before this cycle; the loop only ever called
-`Server::http`. The optional `tls` feature forwards to `tiny_http/ssl-rustls`
-and adds `serve_tls` / `serve_with_auth_tls`. Same rustls underneath as the
-`rouille/rustls` route it replaces. Off by default, pure Rust, and mostly there
-for deployments with nothing in front of them — behind a reverse proxy,
-terminate there and bind to loopback.
-
-**Re-verified on the wire, not assumed.** The same probe that established N2
-was run against both implementations: an 8-second `tasks/result` blocking on
-one connection while five pings went out on another. Pings took 551–701µs
-against `tiny_http` + pool and 585–757µs against `rouille`, with the blocked
-call holding its full 8s in both. The property N2 needed is unchanged.
+**Sizing.** `max_connections` is the knob to think about alongside
+`ServerConfig::task_result_timeout`: an in-flight request holds its connection
+for its whole duration, including a `tasks/result` that is waiting, so the
+ceiling has to be comfortably above the number of clients expected to be
+blocked at once.
 
 ### 3.14 HTTP state is per *session*, not per process
 
@@ -726,6 +822,7 @@ The consequences are worth stating plainly:
 | ~~Per-auth-context task binding~~ | **Now implemented.** See §3.7 and §7, S8. |
 | Acting on `notifications/cancelled` | Accepted and ignored. The server is single-threaded per request, so there is nothing to interrupt; task cancellation goes through `tasks/cancel`, which is implemented. |
 | SSE resumability (`Last-Event-ID`) | Our HTTP transport buffers a whole response and returns it as one body. There is no long-lived stream to resume. That also disposes of the neighbouring SHOULD — "the server SHOULD immediately send an SSE event consisting of an event ID and an empty `data` field in order to prime the client to reconnect" — since priming a client to reconnect to a stream that is already complete when it is sent would achieve nothing. Worth revisiting together if the transport ever streams incrementally. |
+| The `GET`-opened SSE stream | A separate rule from resumability, and separately a MAY: transports §Listening lets a server open a stream on `GET` to push server-initiated messages, and lets one that does not "return HTTP 405". We return `405`, with `Allow: POST, DELETE`. The reason is the same as the row above — there is no long-lived stream here — but it is its own decision and was previously only implied by that one. |
 | DCR / CIMD / OIDC discovery | Client-and-authorization-server concerns. The server-side obligation is Protected Resource Metadata, which *is* implemented. |
 | Anything from 2026-07-28 | Out of scope by instruction. |
 
@@ -776,7 +873,7 @@ now.
 
 ## 6. Verification
 
-- 597 tests, all passing, `--all-features` (590 unit + 5 integration + 2 doc)
+- 626 tests, all passing, `--all-features` (619 unit + 5 integration + 2 doc)
 - `cargo clippy --all-features --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: clean
 - `cargo clippy` clean for every feature combination: none, `http`, `hosted`,
@@ -784,7 +881,12 @@ now.
 - `cargo build --all-features`: no future-incompatibility warnings, which was
   not true while `multipart` and `buf_redux` were in the tree (§3.13)
 - suite run repeatedly to confirm the flakes above are gone, and to shake out
-  the timing-sensitive concurrency guards added for §8
+  the timing-sensitive concurrency guards added for §8 and §9
+- §9's two critical findings were re-driven against the *previous* commit
+  before the fix and against this one after it, with the same probe: the
+  allocator abort and the wedged listener are both reproducible there and
+  neither is here. The probes were deleted; the guards that replaced them are
+  in the list below
 
 Conformance checks that exist specifically as regression guards:
 
@@ -817,21 +919,37 @@ Conformance checks that exist specifically as regression guards:
   on the listener (§8, N3)
 - one requestor's tasks are invisible to another
 - a blocking `tasks/result` over HTTP does not delay an unrelated `ping` on
-  another connection, measured (§8, N2) — re-measured against both the
-  `rouille` and the `tiny_http` + pool implementations (§3.13)
-- the worker pool runs items concurrently, hands an item back rather than
-  queueing without limit when saturated, survives a handler that panics, and
-  drains what it accepted before shutting down
+  another connection, measured (§8, N2) — re-measured against the `rouille`,
+  the `tiny_http` + pool, and the thread-per-connection implementations (§3.13)
+- an absurd `Content-Length` with no body behind it is answered `413` and the
+  **process is still there afterwards** — it aborted out of the allocator
+  before (§9, C1)
+- a declared body that never arrives costs one connection and not the listener,
+  once per slot and one over, with every attacker socket still open (§9, C2)
+- a body *under* the cap that never arrives expires on the deadline rather than
+  waiting for a peer that has stopped talking
+- both of those, unauthenticated, against `serve_with_auth` — which is where
+  they were reachable from
+- a burst of 32 simultaneous pings against an idle server is answered 32 times,
+  which the pool this replaced did not manage (§9, S1)
 - a saturated HTTP server answers `503` with a JSON-RPC body and is unharmed by
-  having refused
-- two requests on one reused connection are both answered, in order — the
-  handoff to a worker thread is what could have wedged a keep-alive connection,
-  and every other HTTP test here sends `Connection: close`
+  having refused: the ceiling lets go when the connection does
+- two requests on one reused connection are both answered, in order, and a
+  request whose body the handler never read does not desynchronise the next one
 - an HTTP body over the cap is refused with `413` even when it is *chunked* and
-  declares no length at all, which is the only case where the cap on the read
-  itself is load-bearing
+  declares no length at all
+- framing a proxy and this server could read differently is refused rather than
+  guessed at: `Content-Length` with `Transfer-Encoding`, two different
+  `Content-Length`s, obsolete line folding, an extra space in the request line,
+  an unknown transfer coding
+- a header value carrying a newline cannot forge a second response header
+- `100 Continue` is sent for a body that will be accepted and withheld from one
+  already refused
+- a session id issued to one identity is not usable by another, and neither is
+  a `DELETE` of it (§9, S2)
 - `serve_tls` refuses a certificate it cannot use and binds nothing, so a
-  mis-wired TLS path cannot serve plaintext on the HTTPS port
+  mis-wired TLS path cannot serve plaintext on the HTTPS port — and a
+  certificate it *can* use serves a real `ping` over a real handshake
 - one client's `logging/setLevel` and declared capabilities do not reach another
 - a response to an id the server never issued is dropped rather than retained
 - the deferred queue refuses rather than growing, and says so with
@@ -989,3 +1107,85 @@ gets served. Same bound, same honesty, better ordering.
 a private throwaway session instead. See §3.14 — the short version is that
 requiring it breaks every client that ignores an optional feature, while a
 throwaway session gives exactly the pre-session behavior with none of the bleed.
+
+---
+
+## 9. Third review findings (all fixed)
+
+A third independent review verified the 22 fixes in §8 — all real, each with a
+genuine regression guard — re-measured the two properties §3.13 rests on rather
+than trusting them, and found 14 issues of its own. Two were ways to kill the
+process with a request carrying no body, no token and no handshake.
+
+Every one of the 14 is fixed. Each fix came with a test that fails without it.
+
+Its assessment of the pool is worth recording even though the pool is gone:
+the concurrency reasoning in it was correct, the two edges it identified as
+load-bearing were the two that mattered, and the property N2 needed — a
+blocking `tasks/result` costs one slot, not the server — held on the wire, at a
+worst-case 610 µs ping against a 4-second block. What it got wrong was its
+*size*, and what it did not cover was the layer underneath it.
+
+### Shipping blockers
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| C1 | One unauthenticated request, headers only, aborted the process. The N4 fix refused an over-large body before reading it; `tiny_http`'s `EqualReader::drop` then ran `vec![0; content_length]` on our own worker thread, and `alloc_zeroed` of a peer-chosen 200000000000000000 calls `handle_alloc_error`, which aborts. 81 bytes. The client got its `413` first. | Fixed, by owning the HTTP layer — see §3.13 for why it could not be fixed above `tiny_http`, which was checked rather than assumed. Nothing is sized from a declared length now: it is compared against a ceiling and thrown away, and the body of a refused request is never read *and never drained*. |
+| C2 | The same destructor's drain was a blocking read with no deadline, and `tiny_http` 0.12 sets no socket timeout and exposes no way to. `Content-Length: 100000000` with no body held a worker forever; `pool_size + backlog + 1` of them — 65 requests, under 8 KiB, no token — reached the accept loop, which drained one itself and never iterated again. A permanently deaf server with every worker idle. | Fixed. Every read has a deadline (`read_timeout`, `idle_timeout`), an over-cap body is refused without a drain at all, and a refused *connection* is answered by a dedicated thread so the accept loop never waits on a peer. Measured after: the next request was answered in 92 µs, with the attacker's socket still open. |
+
+### Significant
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| S1 | An **idle** four-thread pool refused 16 of 32 simultaneous pings, because `sync_channel(backlog)` admits `backlog + 1` outstanding items however many workers are free. This falsified §3.13's "a burst still queues; only sustained overload is refused", and the `503` carries no `id`, so a client could not correlate the refusal with the request it lost. | Fixed by removing the queue rather than resizing it. A connection carries one request at a time, so bounding connections bounds work; nothing waits behind a full queue because there is no queue. 32 simultaneous pings against an idle server are answered 32 times, which is now a test. The falsified claim is corrected in place in §3.13. |
+| S2 | Sessions were keyed on the header value alone — one global map, shared across tenants. security_best_practices §Session Hijacking names the exact mitigation: "combine the session ID with information unique to the authorized user… Use a key format like `<user_id>:<session_id>`." Guessing or capturing an id got you another tenant's negotiated version, `initialized`, log level and a write handle to their `client_capabilities`. | Fixed: keyed `<owner>\u{1}<id>` under `serve_with_auth` and on the bare id under `serve`, where there is no identity to bind to. A mismatched id falls out as the `404` the spec already prescribes, and `DELETE` is scoped the same way, so one tenant cannot terminate another's session. |
+| S3 | `tiny_http`'s `TaskPool` spawns an OS thread per connection with no ceiling: 200 idle keep-alive connections took the process from 694 to 890 threads, and `pool_size` did not enter into it. Past the platform's thread limit `thread::spawn` panics on the accept thread, which is C2's terminal state by another road. | Fixed: `HttpServer::max_connections` (512) is a real ceiling, one thread per live connection, spawned on arrival rather than up front. Measured at a cap of 8: 200 connections became +8 threads, 8 answered, 192 refused `503`, and the thread count returned to baseline when they closed. A thread the OS refuses closes that one connection instead of ending the listener. |
+
+### Minor
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| m1 | `Sessions::check_in` was not poison-tolerant, and failed by *deleting* the session: a poisoned lock was indistinguishable from "nothing worth keeping", so the client's next request got `404`. N14 chose `into_inner()` for exactly this reasoning, and two of the three call sites followed it. | Fixed: all three are consistent now. |
+| m2 | `Session::absorb` assigned `client_capabilities` wholesale while merging everything else, so two concurrent requests in one session could lose a handshake's declaration — `initialize` absorbs the real set, a concurrent `ping` absorbs an empty one over the top. | Fixed: merged, not assigned. A request whose capability set says nothing at all has nothing to say about capabilities. |
+| m3 | `405` responses carried no `Allow` header. RFC 9110 §15.5.6 makes it a MUST, and clients probing for the old HTTP+SSE transport read 405s. | Fixed: `Allow: POST, DELETE` on the endpoint, `Allow: GET` on the metadata path. |
+| m4 | An over-cap *chunked* body left the decoder mid-stream, so the next request on that connection got a bare `400` from `tiny_http` with no body — and behind a proxy pooling upstream connections, a desync is a smuggling primitive rather than an inconvenience. | Fixed at the source: an over-cap body is never read past the ceiling and its connection is closed, with `Connection: close` on the `413` saying so. Closing is bounded on the way out so the peer still sees the answer rather than a reset. |
+| m5 | Six unconditional `eprintln!`s on remotely reachable paths, so any peer could write one stderr line per request without authenticating — and one of them echoed the peer's own `Origin` verbatim. | Fixed: the `Origin` echo and the body/parse diagnostics are behind the same `debug` gate as bodies. The three auth-failure lines stay ungated, which is the review's own recommendation: they are security events, and none of them interpolates peer text. |
+| m6 | `guarded` covered the context factory and dispatch. A panic in `precheck`, `read_body`, `finish` or `send` was caught one layer out, and the `Request` was then dropped without a response — a bare `500` with an empty body, the one answer shape §3.11 exists to eliminate. | Fixed in two layers: the whole per-request answer is inside `catch_unwind` and comes back as a JSON-RPC `-32603`, and the connection loop has a backstop of its own so a handler that somehow unwinds past that still produces a response rather than a dropped connection. |
+| m7 | A float `id` was answered `-32600 "invalid request: data did not match any variant of untagged enum RequestId"` — correct code, correct `id: null`, and a message naming a private Rust type. | Fixed: "request id must be a string or an integer", caught where it is noticed rather than inherited from a whole-struct parse. |
+| m8 | A session could vanish without a `DELETE`: once a never-initialized session's tasks expire it holds nothing, so `check_in` drops it and the client's next request is `404`. Spec-legal, and worth saying rather than fixing. | Documented on `worth_keeping`, including which client it bites — one that creates tasks without ever initializing. |
+| m9 | `evict_oldest` used `min_by_key` with a tuple containing a cloned `String`, so it allocated once per entry scanned, per eviction, to break a tie between identical instants. | Fixed: `min_by` with a comparison, which reads the same and allocates nothing. |
+
+### Where this departs from the review's suggested fix
+
+**C1/C2, drain versus own the layer.** The review's recommendation was to drain
+the refused body through a fixed-size buffer now, file the two-line upstream fix
+on `EqualReader::drop`, and pin or vendor `tiny_http` until it lands — noting
+that the drain converts C1 into C2 rather than fixing it, and that
+`Expect: 100-continue` defeats the drain and aborts anyway.
+
+That reasoning is right, and it is why this does not drain. Draining is a read
+on a peer's schedule, which is C2; not draining is an abort, which is C1; and
+the third option — bounding the drain — needs a socket deadline `tiny_http` 0.12
+does not have. Every route out of the pair requires changing the layer, and the
+review lists "a different HTTP server" among the options for C2 and S3 both. A
+vendored reader would have fixed C1 alone; a vendored `RefinedTcpStream` would
+have added C2; neither touches S3. Owning ~1000 lines of `std::net` fixes all
+three, removes five dependencies, and puts the ceilings where the rest of this
+crate already keeps them. It is also the same trade §3.13 already made once, for
+the same reason: the thread pool was cheaper to own than 27 crates.
+
+The cost is honest and worth stating: this is a hand-written HTTP parser, and
+hand-written HTTP parsers are where request smuggling lives. So the framing
+rules a smuggler needs are refused rather than guessed at — `Content-Length`
+with `Transfer-Encoding`, conflicting lengths, obsolete folding, an extra space
+in the request line, an unknown transfer coding — and a connection whose body
+was abandoned is closed rather than reused. Each has a test.
+
+**S1, an independent backlog versus no backlog.** The review suggested giving
+the queue its own depth and adding a short `send_timeout`. This removes the
+queue instead. With one request in flight per connection, `max_connections` is
+already the ceiling on outstanding work, and a second one behind it can only be
+wrong in one of two directions — too small refuses healthy bursts, too large is
+the unbounded queue the ceiling existed to prevent. A connection either gets a
+thread now or is told there is no room, which is the same backpressure signal
+with nothing to tune.
