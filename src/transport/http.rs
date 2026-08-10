@@ -495,9 +495,16 @@ where
 
 /// High-level HTTP MCP server
 ///
-/// Wraps the request loop boilerplate for serving MCP over HTTP. Requests are
-/// served concurrently, one thread each from a fixed pool, so a client blocked
-/// in `tasks/result` cannot hold up anybody else.
+/// Wraps the request loop boilerplate for serving MCP over HTTP. `tiny_http`
+/// accepts; a fixed pool of threads answers, one request each, so a client
+/// blocked in `tasks/result` cannot hold up anybody else.
+///
+/// The pool is bounded in both directions - [`pool_size`](Self::pool_size)
+/// threads, and one waiting request per thread behind them. A request arriving
+/// when both are full is answered `503` rather than queued, because a queue
+/// with no ceiling is a peer deciding how much this server holds, and blocking
+/// the accept loop instead would make the listener as slow as its slowest
+/// request.
 ///
 /// # Example (no auth)
 /// ```ignore
@@ -578,6 +585,12 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// `tasks/result` that is waiting for a task to finish - bounded by
     /// [`ServerConfig::task_result_timeout`], but a wait all the same. Size
     /// this above the number of clients you expect to be blocked at once.
+    ///
+    /// It also sets how deep the queue behind those threads runs: one waiting
+    /// request per thread, so a burst queues rather than being refused. A
+    /// request that arrives with every thread busy *and* that queue full is
+    /// answered `503` - see [`HttpServer`] for why that beats queueing without
+    /// limit.
     pub fn pool_size(mut self, threads: usize) -> Self {
         self.pool_size = Some(threads.max(1));
         self
