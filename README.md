@@ -24,10 +24,10 @@ sml_mcps gives us a clean, sync MCP server that we control.
 [features]
 default = ["schema"]
 schema = ["dep:schemars"]     # JSON Schema generation for tools
-http = ["dep:rouille"]         # Streamable HTTP transport (with SSE)
+http = ["dep:tiny_http"]       # Streamable HTTP transport (with SSE)
 auth = ["dep:jsonwebtoken"]    # JWT validation for hosted
 hosted = ["http", "auth"]      # Both HTTP and auth
-tls = ["http", "rouille/rustls"]  # HTTPS, via rustls
+tls = ["http", "tiny_http/ssl-rustls"]  # HTTPS, via rustls
 ```
 
 ## Usage (Stdio)
@@ -151,9 +151,13 @@ See `examples/unix_server.rs` for a complete single-binary daemon + shim.
 ## HTTP Transport (Streamable HTTP with SSE)
 
 With the `http` feature, `HttpServer` handles all the HTTP boilerplate for you.
-Requests are served concurrently, one thread each from a fixed pool, so a client
-blocked in `tasks/result` cannot hold up anybody else. The context factory is
-called per request, on that request's own thread, so it must be `Send + Sync`.
+Requests are served concurrently, one thread each from a fixed pool
+(`HttpServer::pool_size`, default `8 × CPU`), so a client blocked in
+`tasks/result` cannot hold up anybody else. The context factory is called per
+request, on that request's own thread, so it must be `Send + Sync`. The pool is
+bounded in both directions: when every thread is busy and the short queue behind
+them is full, further requests are answered `503` rather than queued without
+limit.
 
 ```rust
 use sml_mcps::{HttpServer, ServerConfig, Tool, ToolEnv, CallToolResult, Result};

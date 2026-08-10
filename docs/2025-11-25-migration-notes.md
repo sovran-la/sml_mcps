@@ -31,7 +31,7 @@ falsified claim from this document is corrected in place: HTTP kept
 per-*process* state, not per-connection (§6, §3.14). The two shipping blockers
 it named were a remote OOM reachable before any handshake (§8, N1) and a
 total-server denial of service from one `tasks/result` (§8, N2); the second is
-why the HTTP transport now runs on `rouille` (§3.13).
+why the HTTP transport now serves every request on its own thread (§3.13).
 
 ---
 
@@ -190,10 +190,16 @@ See §8, N2. `Server` passes `ServerConfig::task_result_timeout`.
 `ServerConfig::max_message_bytes`. Both structs derive `Default`, so
 `..Default::default()` construction (§1.2) is unaffected.
 
-### 1.11 The `http` feature depends on `rouille`, not `tiny_http`
+### 1.11 The `http` feature still depends on `tiny_http`, and `tls` moved
 
-A downstream `Cargo.toml` that names `tiny_http` for its own reasons keeps it;
-nothing here re-exported it. See §3.13 for what the swap bought and cost.
+`http = ["dep:tiny_http"]`, as before this cycle. Nothing here re-exports it, so
+a downstream `Cargo.toml` that names `tiny_http` for its own reasons is
+unaffected either way.
+
+The one thing to change is a hand-written `tls` line: it is
+`tls = ["http", "tiny_http/ssl-rustls"]` now, not `rouille/rustls`. Depending on
+the `tls` *feature* rather than on the crate behind it needs no change. See
+§3.13.
 
 ---
 
@@ -572,7 +578,7 @@ prefer that, make the fields required again; the negotiation logic is unchanged
 either way. A *malformed* initialize (wrong types) is `-32602`, not a parse
 error.
 
-### 3.13 HTTP is served by `rouille`, one thread per request
+### 3.13 HTTP accepts on one thread and answers on a pool of our own
 
 **Confidence: high.**
 
@@ -585,38 +591,85 @@ authorized request, could hold every other client for up to the task's TTL.
 Confirmed on the wire: a `ping` on a second connection waited exactly as long as
 an unrelated 8-second `tasks/result`.
 
-`rouille` is `tiny_http` — the same server, still sync, still no runtime — plus
-a thread pool and a request/response handler shape. Swapping to it is a smaller
-change than hand-rolling `Arc<Server>` plus a pool, and it is the piece that
-makes several other findings tractable:
+The loop is still `for request in server.incoming_requests()`, and it now does
+exactly two things per iteration: take a request and hand it to a worker. How
+long any one request takes cannot affect when the next is picked up. That shape
+is what makes several other findings tractable:
 
 - a blocking call costs one pool slot instead of the server (§8, N2)
 - per-connection state stops being a euphemism for per-process (§3.14)
-- `request.data()` is a plain `Read`, so `take(limit)` is the whole body cap
-  (§8, N4)
+- `request.as_reader()` is a plain `Read`, so `take(limit)` is the whole body
+  cap (§8, N4)
 
-**What it cost.** `rouille` pulls in `chrono`, `time`, `url`,
-`percent-encoding`, `multipart`, `threadpool`, `filetime`, `sha1_smol`, `rand`,
-and its own older `base64` — a real increase for a crate whose pitch is "no
-tokio, few deps". Two of those (`multipart`, `buf_redux`) emit a
-future-incompatibility warning under current Rust. `default-features = false`
-drops `gzip` and `brotli`, which an MCP endpoint has no use for; the rest come
-along. The trade was judged worth it because the alternative was hand-rolling
-the same thread pool and getting the shutdown and panic edges wrong in a way
-`rouille` already gets right.
+**The claim this replaces.** An earlier revision of this document said the
+transport ran on `rouille`, and blamed `chrono`, `time`, `url`,
+`percent-encoding`, `multipart`, `threadpool`, `filetime`, `sha1_smol`, `rand`
+and "its own older `base64`" on it. Four of those were never rouille's: `time`
+arrives through `jsonwebtoken` → `simple_asn1`, `url` and `percent-encoding`
+through `boon`, and `base64 0.13` through `rustls-pemfile` on the TLS path —
+all of them still present. The rest were, and they are gone.
 
-**Pool sizing.** `8 × CPU` by default, matching `rouille`'s own, tunable with
-`HttpServer::pool_size`. Each in-flight request occupies one slot for its whole
-duration — including a `tasks/result` that is waiting, which is bounded by
+**The pool.** `rouille` is `tiny_http` plus a thread-per-request executor, and
+the executor was the only part of it this crate used. `WorkerPool`
+(`src/transport/pool.rs`) is that part, in ~130 lines of `std::thread` and one
+`sync_channel`: N workers taking items off a bounded queue, with the lock held
+across `recv` and nothing else. Dropping it drains the queue and joins.
+
+Swapping back to `tiny_http` directly removes 27 crates and adds none:
+
+| | before | after |
+|---|---|---|
+| `cargo tree --all-features` | 124 | 97 |
+| `cargo tree --features hosted` | 118 | 89 |
+
+Gone: `rouille`, `chrono`, `multipart`, `buf_redux`, `mime`, `mime_guess`,
+`unicase`, `twoway`, `safemem`, `quick-error`, `rand`, `rand_chacha`,
+`rand_core`, `ppv-lite86`, `filetime`, `sha1_smol`, `tempfile`, `fastrand`,
+`rustix`, `errno`, `bitflags`, `httparse`, `num_cpus`, `num_threads`,
+`iana-time-zone`, `core-foundation-sys`, `threadpool`. What remains under the
+`http` feature is `tiny_http` and its four: `ascii`, `chunked_transfer`,
+`httpdate`, `log`. The future-incompatibility warning current Rust emits for
+`buf_redux` and `multipart` goes with them — `cargo build --all-features` is
+silent now, and was not before.
+
+The earlier revision judged the weight worth it "because the alternative was
+hand-rolling the same thread pool and getting the shutdown and panic edges
+wrong". Those edges are two: a handler that panics must cost its item and not
+the worker (`catch_unwind` in the worker loop, tested), and shutdown must drain
+what it accepted before joining (dropping the sender does that, also tested).
+Both are load-bearing and both are cheaper to own than 27 crates.
+
+**Saturation.** This is the one behavioral difference from `rouille`, and it is
+deliberate. Both the thread count and the queue behind it are bounded, so there
+is a state where a request arrives with nowhere to run. `rouille` queued
+without limit; this answers `503` with a JSON-RPC error body, the same shape as
+every other rejection here. Queueing without limit is a peer-controlled amount
+of memory and a growing pile of requests nobody is getting to — the ceiling
+every other peer-controlled thing in this crate already has (§8, N1, N4).
+Blocking the accept loop instead would make the listener as slow as its slowest
+request, which is the failure this whole design exists to prevent. The queue
+holds one waiting request per thread, so a burst still queues; only sustained
+overload is refused.
+
+**Pool sizing.** `8 × CPU` by default, tunable with `HttpServer::pool_size`.
+Each in-flight request occupies one slot for its whole duration — including a
+`tasks/result` that is waiting, which is bounded by
 `ServerConfig::task_result_timeout` (§8, N2) rather than by the task's TTL.
 Those two knobs are the ones to think about together: the pool has to be
 comfortably larger than the number of clients expected to be blocked at once.
 
-**TLS.** There was none before; the loop only ever called `Server::http`. An
-optional `tls` feature now forwards to `rouille/rustls` and adds `serve_tls` /
-`serve_with_auth_tls`. Off by default, pure Rust, and mostly there for
-deployments with nothing in front of them — behind a reverse proxy, terminate
-there and bind to loopback.
+**TLS.** There was none before this cycle; the loop only ever called
+`Server::http`. The optional `tls` feature forwards to `tiny_http/ssl-rustls`
+and adds `serve_tls` / `serve_with_auth_tls`. Same rustls underneath as the
+`rouille/rustls` route it replaces. Off by default, pure Rust, and mostly there
+for deployments with nothing in front of them — behind a reverse proxy,
+terminate there and bind to loopback.
+
+**Re-verified on the wire, not assumed.** The same probe that established N2
+was run against both implementations: an 8-second `tasks/result` blocking on
+one connection while five pings went out on another. Pings took 551–701µs
+against `tiny_http` + pool and 585–757µs against `rouille`, with the blocked
+call holding its full 8s in both. The property N2 needed is unchanged.
 
 ### 3.14 HTTP state is per *session*, not per process
 
@@ -723,10 +776,13 @@ now.
 
 ## 6. Verification
 
-- 582 tests, all passing, `--all-features` (575 unit + 5 integration + 2 doc)
-- `cargo clippy --all-features --all-targets`: clean
+- 597 tests, all passing, `--all-features` (590 unit + 5 integration + 2 doc)
+- `cargo clippy --all-features --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: clean
-- `cargo build --features tls`: clean
+- `cargo clippy` clean for every feature combination: none, `http`, `hosted`,
+  `tls`
+- `cargo build --all-features`: no future-incompatibility warnings, which was
+  not true while `multipart` and `buf_redux` were in the tree (§3.13)
 - suite run repeatedly to confirm the flakes above are gone, and to shake out
   the timing-sensitive concurrency guards added for §8
 
@@ -761,7 +817,21 @@ Conformance checks that exist specifically as regression guards:
   on the listener (§8, N3)
 - one requestor's tasks are invisible to another
 - a blocking `tasks/result` over HTTP does not delay an unrelated `ping` on
-  another connection, measured (§8, N2)
+  another connection, measured (§8, N2) — re-measured against both the
+  `rouille` and the `tiny_http` + pool implementations (§3.13)
+- the worker pool runs items concurrently, hands an item back rather than
+  queueing without limit when saturated, survives a handler that panics, and
+  drains what it accepted before shutting down
+- a saturated HTTP server answers `503` with a JSON-RPC body and is unharmed by
+  having refused
+- two requests on one reused connection are both answered, in order — the
+  handoff to a worker thread is what could have wedged a keep-alive connection,
+  and every other HTTP test here sends `Connection: close`
+- an HTTP body over the cap is refused with `413` even when it is *chunked* and
+  declares no length at all, which is the only case where the cap on the read
+  itself is load-bearing
+- `serve_tls` refuses a certificate it cannot use and binds nothing, so a
+  mis-wired TLS path cannot serve plaintext on the HTTPS port
 - one client's `logging/setLevel` and declared capabilities do not reach another
 - a response to an id the server never issued is dropped rather than retained
 - the deferred queue refuses rather than growing, and says so with
@@ -851,7 +921,7 @@ Every one of the 22 is fixed. Each fix came with a test that fails without it.
 | # | What was wrong | Resolution |
 |---|---|---|
 | N1 | `RequestBroker::parked` was unbounded and never swept. The server has no in-flight requests of its own until a tool elicits or samples, so *every* response a peer sends before that is unmatched by construction — ~48 messages of 8 MiB reached a gigabyte, pre-handshake, while the server went on answering pings. | Fixed. A response to an id the broker never issued is dropped outright; what survives is capped at 16, oldest evicted, and a repeated answer to one id replaces rather than accumulates. |
-| N2 | `tasks/result` over HTTP wedged the whole server. Requests were processed one at a time on the accept loop, so the mandated block held every other client for up to the task's TTL — client-requested, an hour by default. A regression the S6 fix introduced. | Fixed in two halves. The wait is bounded by `ServerConfig::task_result_timeout` (30s) on any transport that cannot be pumped, answering `-32603 reason = "timeout"` so a client can poll and ask again. And requests are served concurrently on `rouille` (§3.13), so a blocked call costs one pool slot rather than the server. |
+| N2 | `tasks/result` over HTTP wedged the whole server. Requests were processed one at a time on the accept loop, so the mandated block held every other client for up to the task's TTL — client-requested, an hour by default. A regression the S6 fix introduced. | Fixed in two halves. The wait is bounded by `ServerConfig::task_result_timeout` (30s) on any transport that cannot be pumped, answering `-32603 reason = "timeout"` so a client can poll and ask again. And requests are served concurrently, one worker thread each (§3.13), so a blocked call costs one pool slot rather than the server. |
 
 ### Significant
 

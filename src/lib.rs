@@ -5,7 +5,7 @@
 //! ## Features
 //!
 //! - `schema` (default) - JSON Schema generation for tools via schemars
-//! - `http` - Streamable HTTP transport via rouille (thread-per-request)
+//! - `http` - Streamable HTTP transport via tiny_http (thread-per-request)
 //! - `auth` - JWT validation for hosted deployments
 //! - `hosted` - Enables both `http` and `auth`
 //! - `tls` - HTTPS for the HTTP transport, via rustls
