@@ -34,6 +34,12 @@ rustls-pemfile = { version = "2", optional = true }
 boon = "0.6"
 getrandom = "0.3"
 
+# The HTTP/1.1 request-line and header parser. Zero dependencies, zero async,
+# `#![no_std]`-capable, and the parser hyper has been running in production for
+# a decade - which is the entire argument for it over the hand-written one it
+# replaces. Only pulled in by the `http` feature.
+httparse = { version = "1.10", optional = true }
+
 # Unix daemon syscalls (fork, setsid, dup2, kill) for UnixServer::serve_daemon.
 # Unix-only, always available there - no feature flag (matches #[cfg(unix)] gating).
 [target.'cfg(unix)'.dependencies]
@@ -42,10 +48,11 @@ libc = "0.2"
 [features]
 default = ["schema"]
 schema = ["dep:schemars"]
-# The HTTP/1.1 server is ours, on std::net, so this feature costs no
-# dependencies at all. See src/transport/http1.rs for why it is not somebody
-# else's.
-http = []
+# The HTTP/1.1 server is ours, on std::net: the connection loop, the framing,
+# the ceilings and the deadlines. The one thing it does not hand-write is the
+# request-line and header parser, which is `httparse` - one crate, no
+# transitive dependencies. See src/transport/http1.rs for both halves of that.
+http = ["dep:httparse"]
 auth = ["dep:jsonwebtoken"]
 hosted = ["http", "auth"]
 # HTTPS via rustls. Pure Rust - no system OpenSSL - and off by default,

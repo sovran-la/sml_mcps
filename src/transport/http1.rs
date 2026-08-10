@@ -18,6 +18,24 @@
 //! keep-alive, and a whole response in one buffer. There is no pipelining
 //! (a request is answered before the next is read), no compression, no
 //! ranges, and no upgrade.
+//!
+//! **The one thing here that is not hand-written is the parser.** Those three
+//! properties are about what a peer can make this process *hold*, and none of
+//! them is an argument for hand-writing the byte-level grammar of a request
+//! line and a header block. That grammar is where request smuggling lives, so
+//! it is [`httparse`]'s - the parser hyper has been running in production for a
+//! decade, at one crate and no transitive dependencies. It decides what a
+//! request line is, what a header is, and where the head ends; this module
+//! decides everything that then happens to those bytes:
+//!
+//! - **Framing.** `Content-Length` against `Transfer-Encoding`, conflicting
+//!   lengths, unknown transfer codings. `httparse` reports headers, it does not
+//!   adjudicate them, so [`framing_of`] still does - see its comments for which
+//!   shapes are refused and why.
+//! - **Ceilings.** How many bytes a head may occupy and how many fields it may
+//!   carry, both charged before the parser is asked anything.
+//! - **The body**, which `httparse` never touches: deadlines, the chunked
+//!   decoder, and the rule that nothing is sized from a declared length.
 
 use crate::types::{McpError, Result};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -620,62 +638,103 @@ where
 ///
 /// `Ok(None)` is a connection that ended before a request started - a hangup
 /// or an idle timeout, both ordinary.
+///
+/// The head is accumulated into a buffer of *our* size and handed to
+/// [`httparse`] whole, again, as more of it arrives. `httparse` is the only
+/// thing that decides where a head ends: the alternative is scanning for the
+/// blank line here and disagreeing with the parser about which byte starts the
+/// body, which is a desynchronised connection written by hand.
+///
+/// The accumulator is bounded by [`Limits::max_head_bytes`] and grows only as
+/// bytes actually arrive, so - like everywhere else here - a peer's declared
+/// intent never sizes a buffer.
 fn read_head(
     io: &mut BufReader<Box<dyn Socket>>,
     limits: &Limits,
 ) -> std::result::Result<Option<Head>, Response> {
-    let mut budget = limits.max_head_bytes;
+    let mut raw: Vec<u8> = Vec::new();
+    // How much of `raw` has been taken out of the reader's buffer. Everything
+    // past it must stay there: it is the body, and the body is read from the
+    // reader.
+    let mut consumed = 0usize;
 
-    // "a server that is expecting to read a request line SHOULD ignore at
-    // least one empty line (CRLF) received prior to the request-line."
-    let request_line = loop {
-        match read_line(io, &mut budget) {
-            Ok(Line::Text(line)) if line.is_empty() => continue,
-            Ok(Line::Text(line)) => break line,
-            Ok(Line::Eof) => return Ok(None),
-            Ok(Line::TooLong) => return Err(too_long()),
-            Ok(Line::Invalid) => return Err(bad_request("a request line that is not text")),
-            Err(e) if is_timeout(&e) => return Ok(None),
-            Err(_) => return Ok(None),
-        }
-    };
-
-    let (method, target, version) = parse_request_line(&request_line)?;
-
-    let mut headers: Vec<(String, String)> = Vec::new();
     loop {
-        let line = match read_line(io, &mut budget) {
-            Ok(Line::Text(line)) => line,
-            Ok(Line::Eof) => return Ok(None),
-            Ok(Line::TooLong) => return Err(too_long()),
-            Ok(Line::Invalid) => {
-                return Err(bad_request("a header field that is not text"));
-            }
-            Err(_) => return Ok(None),
-        };
-        if line.is_empty() {
-            break;
-        }
-        if headers.len() == limits.max_headers {
+        if raw.len() >= limits.max_head_bytes {
             return Err(too_long());
         }
-        // Obsolete line folding. RFC 9112 §5.2: "A server that receives an
-        // obs-fold ... MUST either reject the message ... or replace each
-        // received obs-fold with one or more SP octets". Rejecting is the side
-        // that cannot be used to smuggle a header past a proxy.
-        if line.starts_with(' ') || line.starts_with('\t') {
-            return Err(bad_request("obsolete header line folding"));
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(bad_request("a header field with no `:`"));
+
+        // Copy out of the reader's buffer without consuming it, so that the
+        // bytes past the head are still there for the body to read.
+        let (taken, ended_a_line) = {
+            let available = match io.fill_buf() {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                // A deadline or a broken socket before a request finished.
+                // Neither is worth an answer.
+                Err(_) => return Ok(None),
+            };
+            if available.is_empty() {
+                // A clean hangup. Mid-head it is a peer that changed its mind,
+                // which is still not an error worth answering.
+                return Ok(None);
+            }
+            let room = limits.max_head_bytes - raw.len();
+            let take = available.len().min(room);
+            raw.extend_from_slice(&available[..take]);
+            (take, available[..take].contains(&b'\n'))
         };
-        if !is_token(name) {
-            return Err(bad_request("a header field name that is not a token"));
+
+        // A head ends with a newline, so a round that brought none cannot have
+        // completed one, and re-parsing everything to be told so again is work
+        // a slow peer would be choosing for us. This cannot disagree with
+        // `httparse` about where a head ends - it only declines to ask.
+        if ended_a_line {
+            let mut fields = vec![httparse::EMPTY_HEADER; limits.max_headers];
+            let mut parsed = httparse::Request::new(&mut fields);
+            match parsed.parse(&raw) {
+                Ok(httparse::Status::Complete(head_len)) => {
+                    // `head_len` is past `consumed`: every earlier round was
+                    // told `Partial` over a prefix of these same bytes, so the
+                    // head cannot have ended inside one.
+                    io.consume(head_len.saturating_sub(consumed));
+                    return head_from(parsed).map(Some);
+                }
+                Ok(httparse::Status::Partial) => {}
+                Err(e) => return Err(rejection(e)),
+            }
         }
-        headers.push((
-            name.to_string(),
-            value.trim_matches([' ', '\t']).to_string(),
-        ));
+
+        io.consume(taken);
+        consumed += taken;
+    }
+}
+
+/// Turn a parsed request line and header block into a [`Head`], deciding the
+/// things `httparse` reports but does not adjudicate.
+fn head_from(parsed: httparse::Request<'_, '_>) -> std::result::Result<Head, Response> {
+    // `Complete` guarantees all three, but answering beats unwrapping.
+    let (Some(method), Some(target), Some(version)) = (parsed.method, parsed.path, parsed.version)
+    else {
+        return Err(bad_request("a malformed request line"));
+    };
+    let version = match version {
+        0 => Version::Http10,
+        1 => Version::Http11,
+        // `httparse` accepts no other version, so this is unreachable - and
+        // answering rather than unwrapping is what keeps it that way.
+        _ => return Err(status_only(505, "HTTP Version Not Supported").closing()),
+    };
+
+    // A header value is bytes, and RFC 9110 §5.5 still permits obs-text
+    // (0x80-0xFF) in one. Nothing downstream has a use for a header that is not
+    // text, and every one of them here is compared, logged or echoed as text,
+    // so one that is not is refused rather than lossily repaired.
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(parsed.headers.len());
+    for field in parsed.headers.iter() {
+        let Ok(value) = std::str::from_utf8(field.value) else {
+            return Err(bad_request("a header field value that is not text"));
+        };
+        headers.push((field.name.to_string(), value.to_string()));
     }
 
     let framing = framing_of(&headers)?;
@@ -694,40 +753,45 @@ fn read_head(
         Some(_) => return Err(status_only(417, "Expectation Failed").closing()),
     };
 
-    Ok(Some(Head {
-        method,
-        target,
+    Ok(Head {
+        method: Method::parse(method),
+        target: target.to_string(),
         version,
         headers,
         framing,
         expects_continue,
         wants_close,
-    }))
+    })
 }
 
-fn parse_request_line(line: &str) -> std::result::Result<(Method, String, Version), Response> {
-    // Exactly two spaces, and no more: a request line with extra whitespace is
-    // parsed differently by different intermediaries, which is where request
-    // smuggling starts.
-    let mut parts = line.split(' ');
-    let (Some(method), Some(target), Some(version), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err(bad_request("a malformed request line"));
-    };
-    if method.is_empty() || target.is_empty() || !is_token(method) {
-        return Err(bad_request("a malformed request line"));
+/// What to answer a peer whose head `httparse` would not accept.
+///
+/// Every one of these ends the connection, because a head that did not parse
+/// leaves no agreed answer to where the next one starts.
+fn rejection(error: httparse::Error) -> Response {
+    use httparse::Error;
+    match error {
+        // `HTTP/2.0`, `HTTP/1.9`, and a request line whose third token is not a
+        // version at all. RFC 9110 §15.6.6 is what 505 is for.
+        Error::Version => status_only(505, "HTTP Version Not Supported").closing(),
+        // More fields than `max_headers`. Same answer as a head over its byte
+        // budget, because it is the same kind of "too much".
+        Error::TooManyHeaders => too_long(),
+        // A field name that is not a token - which is also how obsolete line
+        // folding arrives, and how a space before the colon does. Both are
+        // smuggling primitives: RFC 9112 §5.2 lets a server reject an obs-fold
+        // rather than rewrite it, and rejecting is the side a proxy cannot be
+        // played off against.
+        Error::HeaderName => bad_request("a header field name that is not a token"),
+        Error::HeaderValue => bad_request("a header field value that is not text"),
+        // An extra space in the request line, a method that is not a token, a
+        // control character in the target.
+        Error::Token => bad_request("a malformed request line"),
+        Error::NewLine => bad_request("a line ending that is not CRLF"),
+        // `Error::Status` is response-only, so unreachable from here; the
+        // wildcard is for whatever a later `httparse` adds.
+        _ => bad_request("a malformed request head"),
     }
-
-    let version = match version {
-        "HTTP/1.1" => Version::Http11,
-        "HTTP/1.0" => Version::Http10,
-        _ => {
-            return Err(status_only(505, "HTTP Version Not Supported").closing());
-        }
-    };
-
-    Ok((Method::parse(method), target.to_string(), version))
 }
 
 /// Decide how the body is framed, refusing every shape two parsers could read
@@ -764,6 +828,14 @@ fn framing_of(headers: &[(String, String)]) -> std::result::Result<Framing, Resp
             }
         }
         (None, Some(length)) => {
+            // RFC 9112 §6.2: `Content-Length = 1*DIGIT`, and nothing else.
+            // `usize::from_str` is looser than that - it accepts a leading `+`
+            // - and a length this server reads as 5 while the proxy in front of
+            // it rejects the field outright is two answers to where the request
+            // ends.
+            if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(bad_request("an unreadable `Content-Length`"));
+            }
             let declared: usize = length
                 .parse()
                 .map_err(|_| bad_request("an unreadable `Content-Length`"))?;
@@ -844,19 +916,38 @@ fn read_exactly(
     }
 }
 
-fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-}
-
 /// `1a3f` or `1a3f;ext=value` - the size, in hex, of the chunk that follows.
+///
+/// The hex and the chunk extensions are `httparse`'s to read. The one thing
+/// added on top is a guard, because `httparse::parse_chunk_size` answers `0` -
+/// *the last chunk* - to three lines that are not a chunk size at all:
+///
+/// ```text
+/// "\r\n"     => Complete((2, 0))     a blank line
+/// " \r\n"    => Complete((3, 0))     whitespace before the size
+/// ";x\r\n"   => Complete((4, 0))     an extension with no size
+/// ```
+///
+/// Reading any of those as "the body ends here" while a stricter parser in
+/// front reads it as a malformed chunk is a disagreement about where the
+/// request ends, which is the whole of request smuggling. So a chunk size must
+/// start with a hex digit, and nothing else opens one.
 fn parse_chunk_size(line: &str) -> Option<usize> {
-    let digits = line.split(';').next()?.trim_end_matches([' ', '\t']);
-    if digits.is_empty() || digits.len() > 16 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !line.starts_with(|c: char| c.is_ascii_hexdigit()) {
         return None;
     }
-    u64::from_str_radix(digits, 16)
-        .ok()
-        .and_then(|size| usize::try_from(size).ok())
+    // `read_line` took the CRLF off; `httparse` needs it back to know the size
+    // is finished, and rejects a bare LF here regardless.
+    let mut framed = String::with_capacity(line.len() + 2);
+    framed.push_str(line);
+    framed.push_str("\r\n");
+
+    match httparse::parse_chunk_size(framed.as_bytes()) {
+        Ok(httparse::Status::Complete((_, size))) => usize::try_from(size).ok(),
+        // `Partial` is unreachable - the CRLF above is what it would be
+        // waiting for - and is a malformed size either way.
+        Ok(httparse::Status::Partial) | Err(_) => None,
+    }
 }
 
 fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
