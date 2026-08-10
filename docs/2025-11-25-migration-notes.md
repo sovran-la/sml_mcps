@@ -24,6 +24,15 @@ falsified by that review and are corrected in place: batch arrays were *not*
 answered on the wire (§6), and per-auth-context task binding is no longer
 "deliberately not implemented" (§4, §3.7).
 
+A **second** independent review then verified those 37 fixes — all real, none
+faked — and found that three of them had moved the problem rather than removed
+it, plus 22 issues of its own. All 22 are fixed; §8 lists each one. A third
+falsified claim from this document is corrected in place: HTTP kept
+per-*process* state, not per-connection (§6, §3.14). The two shipping blockers
+it named were a remote OOM reachable before any handshake (§8, N1) and a
+total-server denial of service from one `tasks/result` (§8, N2); the second is
+why the HTTP transport now runs on `rouille` (§3.13).
+
 ---
 
 ## 1. Breaking changes
@@ -133,6 +142,58 @@ by the framework; nothing downstream constructs it.
 ### 1.6 Error codes moved
 
 **Confidence: high.** See §3.1.
+
+### 1.7 `HttpServer` context factories must be `Send + Sync + 'static`
+
+**Confidence: high.**
+
+`serve` and `serve_with_auth` used to call the factory on the one accept-loop
+thread. Requests are served concurrently now (§3.13), so it is called on each
+request's own thread:
+
+```rust
+pub fn serve<F>(self, addr: &str, context_factory: F) -> Result<()>
+where F: Fn() -> C + Send + Sync + 'static     // was: F: Fn() -> C
+```
+
+A factory that closes over an `Arc` — which is what all four downstream servers
+do — needs no change. One that closes over an `Rc`, a `RefCell`, or a borrow of
+a local does, and could not have been correct under concurrency anyway.
+
+`C` itself already had to be `Send + Sync + 'static`.
+
+### 1.8 `paginate` returns a `Result`
+
+**Confidence: high.**
+
+```rust
+let (page, next) = paginate(&items, &state);      // was
+let (page, next) = paginate(&items, &state)?;     // now
+```
+
+A cursor past the end of the list is `-32602` rather than an empty page; see
+§8, N16. Only relevant to a downstream server that paginates its own lists —
+the built-in handlers do this internally.
+
+### 1.9 `TaskStore::await_result` takes a patience
+
+```rust
+store.await_result(&id, requestor)                     // was
+store.await_result(&id, requestor, Some(timeout))      // now, `None` waits for the TTL
+```
+
+See §8, N2. `Server` passes `ServerConfig::task_result_timeout`.
+
+### 1.10 `TaskConfig` and `ServerConfig` gained fields
+
+`TaskConfig::max_records`, `ServerConfig::task_result_timeout`,
+`ServerConfig::max_message_bytes`. Both structs derive `Default`, so
+`..Default::default()` construction (§1.2) is unaffected.
+
+### 1.11 The `http` feature depends on `rouille`, not `tiny_http`
+
+A downstream `Cargo.toml` that names `tiny_http` for its own reasons keeps it;
+nothing here re-exported it. See §3.13 for what the swap bought and cost.
 
 ---
 
@@ -511,6 +572,95 @@ prefer that, make the fields required again; the negotiation logic is unchanged
 either way. A *malformed* initialize (wrong types) is `-32602`, not a parse
 error.
 
+### 3.13 HTTP is served by `rouille`, one thread per request
+
+**Confidence: high.**
+
+The old `HttpServer` was a `for request in server.incoming_requests()` loop that
+handled one request at a time on the accept thread. That was defensible while
+every request was short. It stopped being defensible the moment `tasks/result`
+became resolvable across requests (the S6 fix), because that call **MUST** block
+until the task is terminal — so one client, sending one well-formed and fully
+authorized request, could hold every other client for up to the task's TTL.
+Confirmed on the wire: a `ping` on a second connection waited exactly as long as
+an unrelated 8-second `tasks/result`.
+
+`rouille` is `tiny_http` — the same server, still sync, still no runtime — plus
+a thread pool and a request/response handler shape. Swapping to it is a smaller
+change than hand-rolling `Arc<Server>` plus a pool, and it is the piece that
+makes several other findings tractable:
+
+- a blocking call costs one pool slot instead of the server (§8, N2)
+- per-connection state stops being a euphemism for per-process (§3.14)
+- `request.data()` is a plain `Read`, so `take(limit)` is the whole body cap
+  (§8, N4)
+
+**What it cost.** `rouille` pulls in `chrono`, `time`, `url`,
+`percent-encoding`, `multipart`, `threadpool`, `filetime`, `sha1_smol`, `rand`,
+and its own older `base64` — a real increase for a crate whose pitch is "no
+tokio, few deps". Two of those (`multipart`, `buf_redux`) emit a
+future-incompatibility warning under current Rust. `default-features = false`
+drops `gzip` and `brotli`, which an MCP endpoint has no use for; the rest come
+along. The trade was judged worth it because the alternative was hand-rolling
+the same thread pool and getting the shutdown and panic edges wrong in a way
+`rouille` already gets right.
+
+**Pool sizing.** `8 × CPU` by default, matching `rouille`'s own, tunable with
+`HttpServer::pool_size`. Each in-flight request occupies one slot for its whole
+duration — including a `tasks/result` that is waiting, which is bounded by
+`ServerConfig::task_result_timeout` (§8, N2) rather than by the task's TTL.
+Those two knobs are the ones to think about together: the pool has to be
+comfortably larger than the number of clients expected to be blocked at once.
+
+**TLS.** There was none before; the loop only ever called `Server::http`. An
+optional `tls` feature now forwards to `rouille/rustls` and adds `serve_tls` /
+`serve_with_auth_tls`. Off by default, pure Rust, and mostly there for
+deployments with nothing in front of them — behind a reverse proxy, terminate
+there and bind to loopback.
+
+### 3.14 HTTP state is per *session*, not per process
+
+**Confidence: medium-high.**
+
+**The claim this replaces.** An earlier revision of this document said the HTTP
+transport "keeps **per-connection** state across requests." It kept
+per-*process* state: one `Session` on the `HttpServer`, not keyed by anything.
+Every client on the listener read and wrote it. Confirmed on the wire — a client
+that had never sent `initialize` was reported as supporting elicitation and
+sampling because a *different* client had, and `logging/setLevel` from one
+client changed what an unrelated one received. Under `serve_with_auth` that was
+one tenant's session state driving another tenant's request. That claim is now
+corrected, and this is the third falsified statement this document has had to
+retract in place.
+
+**What it is now.** State is keyed on `Mcp-Session-Id`, which transports
+§Session Management makes a MAY, with each session behind its own lock. The id
+is 128 bits from the platform CSPRNG, the same source task ids use — the spec
+asks for "globally unique and cryptographically secure".
+
+**The decision worth arguing with.** The review suggested requiring the header
+on every request after `initialize`. This does not: a request that carries no
+session id gets a **private, throwaway session** instead of an error. The
+reasoning is that a client which ignores session management then behaves exactly
+as it did *before* sessions existed — nothing carried, nothing inherited, no
+bleed — where requiring the header would break every such client at once for a
+feature the spec marks optional. A client that *does* echo the id gets full
+continuity, including its tasks.
+
+The consequences are worth stating plainly:
+
+- an id this server does not know is `404`, per the spec's rule for a
+  terminated session, and `DELETE` on the endpoint terminates one
+- the id is only handed out once a request establishes something worth keeping
+  (a handshake, a log level, a live task), so a client that only pings never
+  churns the table
+- **tasks are reachable only within the session that created them.** A client
+  that wants to resolve a `taskId` on a later request must send the session id
+  it was given. This is a behavior change from the S6 fix, which made the store
+  process-wide; process-wide is exactly what N3 was about.
+- the table is swept at 30 minutes idle and bounded at 256 sessions,
+  least-recently-used first
+
 ---
 
 ## 4. Deliberately not implemented
@@ -573,10 +723,12 @@ now.
 
 ## 6. Verification
 
-- 533 tests, all passing, `--all-features` (526 unit + 5 integration + 2 doc)
+- 582 tests, all passing, `--all-features` (575 unit + 5 integration + 2 doc)
 - `cargo clippy --all-features --all-targets`: clean
 - `cargo fmt --check`: clean
-- suite run 12+ consecutive times to confirm the flakes above are gone
+- `cargo build --features tls`: clean
+- suite run repeatedly to confirm the flakes above are gone, and to shake out
+  the timing-sensitive concurrency guards added for §8
 
 Conformance checks that exist specifically as regression guards:
 
@@ -604,8 +756,22 @@ Conformance checks that exist specifically as regression guards:
 - a task's elicitations, logs and progress carry `related-task` metadata, and
   its status notifications do not
 - HTTP answers 202 with no body to a notification, 400 to a malformed body, and
-  keeps per-connection state across requests
+  keeps **per-session** state across requests — the earlier version of this
+  claim said "per-connection", and the state was in fact shared by every client
+  on the listener (§8, N3)
 - one requestor's tasks are invisible to another
+- a blocking `tasks/result` over HTTP does not delay an unrelated `ping` on
+  another connection, measured (§8, N2)
+- one client's `logging/setLevel` and declared capabilities do not reach another
+- a response to an id the server never issued is dropped rather than retained
+- the deferred queue refuses rather than growing, and says so with
+  `-32603 reason = "overloaded"`
+- the bridge answers unreadable input and keeps the session, including a message
+  over the frame cap
+- an unreadable request is answered with the id it carried, when it carried one
+- an HTTP body over the cap is refused with `413`, including one whose
+  `Content-Length` lies
+- `require_initialization` works over HTTP, and per client
 
 ---
 
@@ -666,3 +832,90 @@ came with a test that fails without it.
 | M14 | `nbf` was not validated, so a not-yet-valid token was accepted. |
 | M15 | The negotiated protocol version was computed and discarded. Kept now, and a test backs the claim that everything newer is additive and optional. |
 | M16 | `tasks/result` error responses carried no related-task metadata. It goes in `error.data`. |
+
+---
+
+## 8. Second review findings (all fixed)
+
+A second independent review verified the 37 fixes in §7 — all of them real, none
+faked, each with a genuine regression guard — and found 22 issues of its own,
+two of them shipping blockers. Its framing is worth keeping: the first round's
+fixes were applied to the places the findings *named* and not to the
+structurally identical places they didn't, and three of them moved the problem
+rather than removing it.
+
+Every one of the 22 is fixed. Each fix came with a test that fails without it.
+
+### Shipping blockers
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| N1 | `RequestBroker::parked` was unbounded and never swept. The server has no in-flight requests of its own until a tool elicits or samples, so *every* response a peer sends before that is unmatched by construction — ~48 messages of 8 MiB reached a gigabyte, pre-handshake, while the server went on answering pings. | Fixed. A response to an id the broker never issued is dropped outright; what survives is capped at 16, oldest evicted, and a repeated answer to one id replaces rather than accumulates. |
+| N2 | `tasks/result` over HTTP wedged the whole server. Requests were processed one at a time on the accept loop, so the mandated block held every other client for up to the task's TTL — client-requested, an hour by default. A regression the S6 fix introduced. | Fixed in two halves. The wait is bounded by `ServerConfig::task_result_timeout` (30s) on any transport that cannot be pumped, answering `-32603 reason = "timeout"` so a client can poll and ask again. And requests are served concurrently on `rouille` (§3.13), so a blocked call costs one pool slot rather than the server. |
+
+### Significant
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| N3 | The HTTP `Session` was process-wide, so capabilities and log level bled between clients — and, under `serve_with_auth`, between tenants. | Fixed: state is keyed on `Mcp-Session-Id`, one lock per session. See §3.14 for the design and the one place it deliberately departs from the review's suggestion. |
+| N4 | The HTTP body had no cap: 48 MiB accepted and echoed back at the same size, while stdio and Unix capped at 8 MiB — the wrong way round relative to exposure. | Fixed: `ServerConfig::max_message_bytes` applies to HTTP too, checked against `Content-Length` before reading and enforced on the read itself. `413`. |
+| N5 | `Bridge::pump` still died on one malformed line and returned `Ok(())`, so the client's session vanished with nothing written and no diagnostic. S9's new 8 MiB cap gave that a fresh trigger on a *legitimate* large message the shim used to forward. | Fixed: the shim answers and carries on, exactly as the server does, with teardown reserved for a connection that has actually failed. |
+| N6 | Error responses carried `id: null` even when the id was readable, so a client that forgot `jsonrpc` got an error it could not correlate and blocked until its own timeout. | Fixed: `McpError::InvalidRequest` carries the id through classification. A genuinely unreadable id — a float, an object — still answers `null`, which is what the spec's exception is for. |
+| N7 | `require_initialization` made the HTTP transport permanently unusable, for every client, forever. | Fixed: `Server::set_initialized`, carried in the session. Tested over HTTP, including that one client's handshake does not open the gate for another. |
+| N8 | `RequestBroker::deferred` was unbounded while anything blocked the loop, and every queued `tools/call` was then executed serially on release. | Fixed: capped at 256, shedding the newest so the queue keeps its arrival order, and a shed *request* is answered `-32603` with `data.reason = "overloaded"` rather than dropped. |
+
+### Minor
+
+| # | What was wrong | Resolution |
+|---|---|---|
+| N9 | The `jsonrpc` value was never checked while a *missing* one was fatal — strictness exactly backwards. | Fixed: absent defaults to `"2.0"`, a wrong value is `-32600` (with its id, per N6). |
+| N10 | A broker waiter leaked if the write of a server-initiated request failed. | Fixed: every non-success exit unregisters, one exit earlier than S14's. |
+| N11 | `MAX_MESSAGE_BYTES` was a `pub(crate) const` with no escape hatch, so a server whose clients legitimately send a base64 attachment had to fork. | Fixed: `ServerConfig::max_message_bytes`, pushed down through a new `Transport::set_max_message_bytes`. |
+| N12 | The cap could be overshot by one buffer refill, because the branch that found the newline appended without re-checking. | Fixed: checked on both branches. The constant means what it says. |
+| N13 | `max_concurrent` counted the whole store, so one tenant on the shared HTTP store denied every other. | Fixed: counted per requestor, per tasks §Resource Management. |
+| N14 | The HTTP `session` mutex was not poison-tolerant, so one panic would have answered `-32603 Session lock poisoned` forever. | Fixed: `unwrap_or_else(|e| e.into_inner())`, matching `HttpTransport::buffered`. |
+| N15 | Terminal task records accumulated for their full TTL and counted toward nothing, bounded only by the client's request rate. | Fixed: `TaskConfig::max_records` (1024). Eviction only ever takes finished records; a store full of running ones refuses rather than discarding work. |
+| N16 | A past-the-end cursor returned an empty page on four of the five list operations — indistinguishable from "that was everything". | Fixed: the check is in `paginate`, so `tasks/list` keeps its MUST-level wording and the rest get the SHOULD. Offset zero stays exempt: an empty list is not an error. |
+| N17 | This document's "per-connection state" claim was not true. | Corrected in place, in §6 and §3.14, and the `Session` doc comment says what it actually is. |
+| N18 | `answer_inline` bypassed `require_initialization`. Unreachable in practice, but an invariant enforced on one path is not an invariant. | Fixed: one `check_initialized`, called from every path that dispatches. |
+| N19 | The content type of a task-augmented `tools/call` was a race between the worker's status notification and the response being read. | Fixed at the source: `HttpTransport` keeps notifications and the response apart, and the response seals the buffer. |
+| N20 | `await_task` held the connection thread after the client hung up, waiting out the task's TTL on behalf of nobody. | Fixed: returns `TransportClosed`. The worker finishes on its own and its result waits in the store. |
+| N21 | An HTTP task worker's notifications went into a buffer nobody drains, so `env.log()` from inside a task went nowhere. | Fixed rather than documented: a sealed transport refuses the write with `TransportClosed`, which is what makes `env.log()` fall back to stderr. |
+| N22 | Two `eprintln!`s survived the M9 fix — the full request target, query string included, and `user=`/`tenant=` on every authenticated request. | Fixed: both behind the same `debug` gate as bodies. |
+
+### Residuals the second review flagged on §7's fixes
+
+- **C1** — the two gaps are N6 (the id) and N5 (the bridge). Both closed.
+- **S3** — the residual is N16. Closed.
+- **S13** — closed as far as it goes, and worth saying out loud rather than
+  leaving implied: what `answer_inline` provides is the *narrow* form. `ping`,
+  `tasks/get`, `tasks/list` and `tasks/cancel` are answered while a
+  `tasks/result` blocks; `tools/list`, `tools/call`, `logging/setLevel`,
+  `resources/*`, `prompts/*` and a second `tasks/result` are still deferred for
+  its duration. That is deliberate — those four are the ones that are `&self`,
+  touch only the store, and cannot re-enter `await_task` — and it covers what
+  the spec actually promises, which is parallel `tasks/get` polling. The general
+  form is *narrowed*, not closed. What has changed is that the queue behind it
+  is now bounded and answers instead of growing (N8), and that on HTTP the block
+  itself is bounded and concurrent (N2), so the narrowing is no longer load
+  bearing.
+- **M9** — the residual is N22. Closed.
+
+### Two places this departs from the review's suggested fix
+
+Both are judgement calls, recorded here so the next reviewer can disagree with
+the reasoning rather than reverse-engineer it.
+
+**N8, which end of the queue to shed.** The review suggested answering the
+*oldest* queued request on overflow. This sheds the *newest* — the one being
+deferred at that moment. Shedding at the door keeps whatever is already queued
+moving in arrival order and gives the client its backpressure signal
+immediately, where shedding the oldest fails requests that have already waited
+longest and, under sustained load, can starve the queue of anything that ever
+gets served. Same bound, same honesty, better ordering.
+
+**N3, whether the session header is required.** The review suggested requiring
+`Mcp-Session-Id` on every request after `initialize`. A request without one gets
+a private throwaway session instead. See §3.14 — the short version is that
+requiring it breaks every client that ignores an optional feature, while a
+throwaway session gives exactly the pre-session behavior with none of the bleed.
