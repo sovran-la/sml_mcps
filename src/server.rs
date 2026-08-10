@@ -5,8 +5,8 @@
 use crate::broker::RequestBroker;
 use crate::pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
 use crate::tasks::{
-    CreateTaskResult, ListTasksParams, ListTasksResult, TaskConfig, TaskIdParams, TaskOutcome,
-    TaskParams, TaskStatus, TaskStore, TasksCapability, related_task_meta,
+    CreateTaskResult, ListTasksParams, ListTasksResult, RELATED_TASK, TaskConfig, TaskIdParams,
+    TaskOutcome, TaskParams, TaskStatus, TaskStore, TasksCapability, related_task_meta,
 };
 use crate::transport::Transport;
 use crate::types::*;
@@ -82,7 +82,7 @@ impl<'a> ToolEnv<'a> {
         let Some(transport) = self.transport else {
             return Ok(());
         };
-        let notification = JsonRpcMessage::notification(method, params);
+        let notification = JsonRpcMessage::notification(method, self.tag_with_task(params));
         let mut transport = transport
             .lock()
             .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
@@ -141,6 +141,44 @@ impl<'a> ToolEnv<'a> {
                 None => eprintln!("[{}] {}: {}", logger, level.as_str(), data),
             }
         }
+    }
+
+    /// Associate an outgoing message with the task it belongs to.
+    ///
+    /// "All requests, notifications, and responses related to a task **MUST**
+    /// include the `io.modelcontextprotocol/related-task` key in their `_meta`
+    /// field... For example, an elicitation that a task-augmented tool call
+    /// depends on **MUST** share the same related task ID with that tool call's
+    /// task."
+    ///
+    /// It is not decoration. A client sitting in `tasks/result` for task X that
+    /// receives an out-of-band `elicitation/create` has no protocol-level way
+    /// to know the elicitation belongs to X without it, and a conformant client
+    /// may refuse to route it back.
+    ///
+    /// Outside a task this is the identity function. `notifications/tasks/status`
+    /// is the one message that **SHOULD NOT** carry the key, and it is written
+    /// directly by the worker rather than through here.
+    fn tag_with_task(&self, params: Option<Value>) -> Option<Value> {
+        let Some(task) = self.task.as_ref() else {
+            return params;
+        };
+
+        let mut params = params.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        let Some(object) = params.as_object_mut() else {
+            return Some(params);
+        };
+
+        let meta = object
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(meta) = meta.as_object_mut() {
+            meta.insert(
+                RELATED_TASK.to_string(),
+                serde_json::json!({ "taskId": task.task_id }),
+            );
+        }
+        Some(params)
     }
 
     /// The minimum log severity the client is currently accepting.
@@ -257,7 +295,7 @@ impl<'a> ToolEnv<'a> {
         };
 
         let id = self.broker.next_request_id();
-        let request = JsonRpcMessage::request(id.clone(), method, Some(params));
+        let request = JsonRpcMessage::request(id.clone(), method, self.tag_with_task(Some(params)));
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
 
         // Registered *before* the request goes out: the answer can come back
@@ -934,6 +972,25 @@ impl Default for ServerConfig {
     }
 }
 
+/// Note the task an error response belongs to, in `data`.
+///
+/// Left alone when `data` is present but not an object: a task that failed with
+/// structured diagnostics must still return "exactly what the underlying
+/// request would have returned", and mangling that to make room is a worse
+/// trade than omitting the annotation.
+fn with_related_task_data(mut error: JsonRpcError, task_id: &str) -> JsonRpcError {
+    let data = error
+        .data
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(object) = data.as_object_mut() {
+        object.insert(
+            RELATED_TASK.to_string(),
+            serde_json::json!({ "taskId": task_id }),
+        );
+    }
+    error
+}
+
 /// The message a panic carried, for reporting it as an error instead.
 ///
 /// `panic!("text")` and `panic!("{fmt}")` produce a `&str` and a `String`
@@ -1432,14 +1489,38 @@ impl<C: Send + Sync + 'static> Server<C> {
             // because the result shape carries no task id of its own.
             TaskOutcome::Value(mut value) => {
                 if let Some(object) = value.as_object_mut() {
-                    object.insert(
-                        "_meta".to_string(),
-                        Value::Object(related_task_meta(&params.task_id)),
-                    );
+                    // Merged, not substituted. Overwriting `_meta` wholesale
+                    // threw away whatever the tool put there, and "receivers
+                    // MUST return from tasks/result exactly what the underlying
+                    // request would have returned" - plus this key, not instead
+                    // of the caller's metadata.
+                    let meta = object
+                        .entry("_meta")
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    match meta.as_object_mut() {
+                        Some(meta) => {
+                            meta.insert(
+                                RELATED_TASK.to_string(),
+                                serde_json::json!({ "taskId": params.task_id }),
+                            );
+                        }
+                        // A tool that put a non-object under `_meta` produced
+                        // something no client can read anyway; the required key
+                        // wins.
+                        None => *meta = Value::Object(related_task_meta(&params.task_id)),
+                    }
                 }
                 Ok(value)
             }
-            TaskOutcome::Error(error) => Err(McpError::Passthrough(error)),
+            // "The `tasks/result` operation MUST include this metadata in its
+            // response, as the result structure itself does not contain the
+            // task ID." An error response has no result object to carry it, so
+            // it goes in `data` - which is where a client would look for
+            // anything the error knows beyond its code and message.
+            TaskOutcome::Error(error) => Err(McpError::Passthrough(with_related_task_data(
+                error,
+                &params.task_id,
+            ))),
         }
     }
 
@@ -1662,47 +1743,48 @@ impl<C: Send + Sync + 'static> Server<C> {
                 // not a wedged server.
                 let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     match tool.execute(arguments, &mut context, &env) {
-                    // "For tool calls specifically, this includes cases where
-                    // the tool call result has isError set to true" -> failed.
-                    Ok(result) if result.is_error => {
-                        let message = result
-                            .content
-                            .first()
-                            .and_then(Content::as_text)
-                            .unwrap_or("tool reported an error")
-                            .to_string();
-                        match serde_json::to_value(result) {
-                            Ok(value) => (TaskStatus::Failed, TaskOutcome::Value(value)),
-                            Err(e) => (
-                                TaskStatus::Failed,
-                                TaskOutcome::Error(JsonRpcError::internal_error(format!(
-                                    "{message} (and the result could not be serialized: {e})"
-                                ))),
-                            ),
+                        // "For tool calls specifically, this includes cases where
+                        // the tool call result has isError set to true" -> failed.
+                        Ok(result) if result.is_error => {
+                            let message = result
+                                .content
+                                .first()
+                                .and_then(Content::as_text)
+                                .unwrap_or("tool reported an error")
+                                .to_string();
+                            match serde_json::to_value(result) {
+                                Ok(value) => (TaskStatus::Failed, TaskOutcome::Value(value)),
+                                Err(e) => (
+                                    TaskStatus::Failed,
+                                    TaskOutcome::Error(JsonRpcError::internal_error(format!(
+                                        "{message} (and the result could not be serialized: {e})"
+                                    ))),
+                                ),
+                            }
                         }
-                    }
-                    Ok(result) => match serde_json::to_value(result) {
-                        Ok(value) => (TaskStatus::Completed, TaskOutcome::Value(value)),
-                        Err(e) => (
-                            TaskStatus::Failed,
-                            TaskOutcome::Error(JsonRpcError::internal_error(e.to_string())),
-                        ),
-                    },
-                    Err(McpError::ToolError(message)) | Err(McpError::InvalidParams(message)) => {
-                        // Same classification as a synchronous call: a tool
-                        // execution failure is an isError result.
-                        match serde_json::to_value(CallToolResult::error(&message)) {
-                            Ok(value) => (TaskStatus::Failed, TaskOutcome::Value(value)),
+                        Ok(result) => match serde_json::to_value(result) {
+                            Ok(value) => (TaskStatus::Completed, TaskOutcome::Value(value)),
                             Err(e) => (
                                 TaskStatus::Failed,
                                 TaskOutcome::Error(JsonRpcError::internal_error(e.to_string())),
                             ),
+                        },
+                        Err(McpError::ToolError(message))
+                        | Err(McpError::InvalidParams(message)) => {
+                            // Same classification as a synchronous call: a tool
+                            // execution failure is an isError result.
+                            match serde_json::to_value(CallToolResult::error(&message)) {
+                                Ok(value) => (TaskStatus::Failed, TaskOutcome::Value(value)),
+                                Err(e) => (
+                                    TaskStatus::Failed,
+                                    TaskOutcome::Error(JsonRpcError::internal_error(e.to_string())),
+                                ),
+                            }
                         }
-                    }
-                    Err(other) => (
-                        TaskStatus::Failed,
-                        TaskOutcome::Error(other.to_jsonrpc_error()),
-                    ),
+                        Err(other) => (
+                            TaskStatus::Failed,
+                            TaskOutcome::Error(other.to_jsonrpc_error()),
+                        ),
                     }
                 }));
 
@@ -5194,6 +5276,92 @@ mod tests {
         );
     }
 
+    /// A task-callable tool that puts its own key in the result's `_meta`.
+    struct TracingTool;
+
+    impl Tool<TestContext> for TracingTool {
+        fn name(&self) -> &str {
+            "tracing"
+        }
+        fn description(&self) -> &str {
+            "Returns metadata of its own"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn task_support(&self) -> TaskSupport {
+            TaskSupport::Optional
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            Ok(CallToolResult::text("done")
+                .with_meta_key("com.example/trace", serde_json::json!("keep-me")))
+        }
+    }
+
+    #[test]
+    fn test_task_result_adds_related_task_without_destroying_tool_meta() {
+        // "Receivers MUST return from tasks/result exactly what the underlying
+        // request would have returned." Overwriting `_meta` wholesale deleted
+        // whatever the tool put there.
+        let mut server = task_server();
+        server.add_tool(TracingTool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "tracing", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+        await_terminal(&mut server, &task_id);
+
+        let result = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap();
+
+        assert_eq!(result["_meta"]["com.example/trace"], "keep-me", "{result}");
+        assert_eq!(
+            result["_meta"][crate::tasks::RELATED_TASK]["taskId"],
+            task_id.as_str()
+        );
+    }
+
+    #[test]
+    fn test_task_result_errors_name_their_task_too() {
+        let mut server = task_server();
+        server.add_tool(PanickingTool).unwrap();
+
+        let created = dispatch(
+            &mut server,
+            "tools/call",
+            serde_json::json!({ "name": "panics", "task": {} }),
+        )
+        .unwrap();
+        let task_id = created["task"]["taskId"].as_str().unwrap().to_string();
+        await_terminal(&mut server, &task_id);
+
+        let error = dispatch(
+            &mut server,
+            "tasks/result",
+            serde_json::json!({ "taskId": task_id }),
+        )
+        .unwrap_err()
+        .to_jsonrpc_error();
+
+        assert_eq!(
+            error.data.expect("error data")[crate::tasks::RELATED_TASK]["taskId"],
+            task_id.as_str()
+        );
+    }
+
     #[test]
     fn test_task_result_blocks_until_the_task_finishes() {
         let mut server = task_server();
@@ -5572,6 +5740,37 @@ mod tests {
         }
     }
 
+    /// A task-callable tool that logs and reports progress, so the `_meta` on
+    /// task-related *notifications* can be inspected on the wire.
+    #[cfg(unix)]
+    struct ChattyTool;
+
+    #[cfg(unix)]
+    impl Tool<TestContext> for ChattyTool {
+        fn name(&self) -> &str {
+            "chatty"
+        }
+        fn description(&self) -> &str {
+            "Logs from inside a task"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn task_support(&self) -> TaskSupport {
+            TaskSupport::Optional
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            env.log(LogLevel::Info, "working on it")?;
+            env.send_progress("tok", 0.5, Some(1.0))?;
+            Ok(CallToolResult::text("done"))
+        }
+    }
+
     /// A task-enabled server running over one end of a socket pair.
     ///
     /// Returns the client end. The server thread ends when the client drops.
@@ -5584,6 +5783,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let mut server = task_server();
             server.add_tool(AskingTool).unwrap();
+            server.add_tool(ChattyTool).unwrap();
             let _ = server.start(
                 UnixTransport::from_stream(server_end),
                 TestContext { counter: 0 },
@@ -5832,6 +6032,86 @@ mod tests {
         };
 
         (task_id, elicitation)
+    }
+
+    /// The task id a message claims to be related to, if it says.
+    #[cfg(unix)]
+    fn related_task_of(params: Option<&Value>) -> Option<String> {
+        params?
+            .get("_meta")?
+            .get(crate::tasks::RELATED_TASK)?
+            .get("taskId")?
+            .as_str()
+            .map(String::from)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_task_elicitation_carries_related_task_meta() {
+        // "The receiver MUST include the `io.modelcontextprotocol/related-task`
+        // metadata in the request to associate it with the task." Without it
+        // the client, which is sitting in `tasks/result` for this very task,
+        // cannot tell what the elicitation belongs to.
+        let (mut client, _server) = task_server_on_a_socket();
+        let (task_id, elicitation) = task_blocked_on_input(&mut client);
+
+        assert_eq!(
+            related_task_of(elicitation.params.as_ref()).as_deref(),
+            Some(task_id.as_str()),
+            "elicitation params: {:?}",
+            elicitation.params
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_task_notifications_carry_related_task_meta_except_status() {
+        let (mut client, _server) = task_server_on_a_socket();
+        initialize_with_elicitation(&mut client);
+
+        send(
+            &mut client,
+            2,
+            "tools/call",
+            serde_json::json!({ "name": "chatty", "task": {} }),
+        );
+
+        let mut logs = 0;
+        let mut progress = 0;
+        let mut status = 0;
+
+        // Read until the task announces it finished, checking everything on
+        // the way.
+        for _ in 0..20 {
+            match client.read().expect("client read") {
+                JsonRpcMessage::Response(_) => {}
+                JsonRpcMessage::Request(r) => panic!("unexpected request {r:?}"),
+                JsonRpcMessage::Notification(n) => {
+                    let related = related_task_of(n.params.as_ref());
+                    match n.method.as_str() {
+                        // "Task status notifications SHOULD NOT include the
+                        // `io.modelcontextprotocol/related-task` metadata" -
+                        // the params already carry the whole task.
+                        "notifications/tasks/status" => {
+                            assert_eq!(related, None, "status params: {:?}", n.params);
+                            status += 1;
+                            break;
+                        }
+                        "notifications/message" => {
+                            assert!(related.is_some(), "log params: {:?}", n.params);
+                            logs += 1;
+                        }
+                        "notifications/progress" => {
+                            assert!(related.is_some(), "progress params: {:?}", n.params);
+                            progress += 1;
+                        }
+                        other => panic!("unexpected notification {other}"),
+                    }
+                }
+            }
+        }
+
+        assert_eq!((logs, progress, status), (1, 1, 1));
     }
 
     #[cfg(unix)]
@@ -6339,7 +6619,10 @@ mod tests {
         // `JsonRpcMessage::parse`; on the wire the client saw a closed socket.
         let (mut client, _server) = server_on_a_raw_socket();
 
-        let error = exchange_raw(&mut client, br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#);
+        let error = exchange_raw(
+            &mut client,
+            br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+        );
         assert_eq!(error["error"]["code"], -32600, "{error}");
         assert!(
             error["error"]["message"]
@@ -6357,7 +6640,10 @@ mod tests {
     fn test_a_null_id_is_answered_with_invalid_request() {
         let (mut client, _server) = server_on_a_raw_socket();
 
-        let error = exchange_raw(&mut client, br#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#);
+        let error = exchange_raw(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+        );
         assert_eq!(error["error"]["code"], -32600, "{error}");
         assert!(
             error["error"]["message"].as_str().unwrap().contains("null"),
@@ -6375,7 +6661,10 @@ mod tests {
         // for a response nobody owes it.
         let (mut client, _server) = server_on_a_raw_socket();
 
-        let error = exchange_raw(&mut client, br#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#);
+        let error = exchange_raw(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#,
+        );
         assert_eq!(error["error"]["code"], -32600, "{error}");
 
         assert_still_alive(&mut client);
@@ -6389,7 +6678,10 @@ mod tests {
         let error = exchange_raw(&mut client, &[0x7b, 0xff, 0xfe, 0x7d]);
         assert_eq!(error["error"]["code"], -32600, "{error}");
         assert!(
-            error["error"]["message"].as_str().unwrap().contains("UTF-8"),
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("UTF-8"),
             "{error}"
         );
 
