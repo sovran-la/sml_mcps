@@ -5,10 +5,22 @@
 //! ## Features
 //!
 //! - `schema` (default) - JSON Schema generation for tools via schemars
-//! - `http` - Streamable HTTP transport via tiny_http (thread-per-request)
+//! - `http` - Streamable HTTP transport on an in-tree HTTP/1.1 server
+//!   (thread-per-connection; the request grammar is `httparse`'s)
 //! - `auth` - JWT validation for hosted deployments
 //! - `hosted` - Enables both `http` and `auth`
 //! - `tls` - HTTPS for the HTTP transport, via rustls
+
+/// What a composed identity is joined with, and so what neither half of one may
+/// contain.
+///
+/// Sessions and tasks are keyed on `<user>␁<tenant>␁<id>`, which is what
+/// security_best_practices §Session Hijacking asks for - and it only tells two
+/// identities apart while the separator cannot appear in what it separates. A
+/// control character rather than a `:` because it cannot occur in a URI, an
+/// email address, a UUID or any other shape a subject realistically takes, so
+/// refusing one costs no legitimate token anything.
+pub(crate) const IDENTITY_SEPARATOR: char = '\u{1}';
 
 mod broker;
 pub mod pagination;

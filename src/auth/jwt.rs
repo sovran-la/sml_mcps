@@ -3,6 +3,7 @@
 //! Validates tokens and extracts claims. Does NOT issue tokens -
 //! that's the job of your OAuth provider (Auth0, Cognito, etc).
 
+use crate::IDENTITY_SEPARATOR;
 use crate::auth::ResourceUri;
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, decode};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,58 @@ pub enum JwtError {
 
     #[error("Invalid audience")]
     InvalidAudience,
+
+    /// A claim carrying a character this server composes keys out of.
+    ///
+    /// See [`JwtValidator::validate`].
+    #[error("A claim contains a character that cannot appear in one")]
+    MalformedClaim,
+}
+
+impl JwtError {
+    /// What failed, in words this server chose.
+    ///
+    /// `Display` on a [`ValidationFailed`](Self::ValidationFailed) quotes the
+    /// offending part of the token back verbatim - and a JOSE header is decoded
+    /// **before** the signature is verified, so an unauthenticated peer picks
+    /// that text, newlines and all. Interpolating it into a log line is log
+    /// forgery: one arbitrary record per request, unbounded, attributed to a
+    /// server that never emitted it.
+    ///
+    /// So anything that reaches a log gets this instead - a fixed set, one of
+    /// which is always true, none of which the peer wrote. The detail is still
+    /// worth having behind a debug gate, and still goes back to the client in
+    /// the `401` body, where it is JSON-escaped and the reader is the attacker.
+    pub fn summary(&self) -> &'static str {
+        use jsonwebtoken::errors::ErrorKind;
+
+        match self {
+            JwtError::MissingHeader => "missing header",
+            JwtError::InvalidFormat => "malformed header",
+            JwtError::Expired => "expired",
+            JwtError::InvalidIssuer => "bad issuer",
+            JwtError::InvalidAudience => "bad audience",
+            JwtError::MalformedClaim => "a claim this server cannot use",
+            JwtError::ValidationFailed(inner) => match inner.kind() {
+                ErrorKind::InvalidToken => "malformed token",
+                ErrorKind::InvalidSignature => "invalid signature",
+                ErrorKind::ExpiredSignature => "expired",
+                ErrorKind::ImmatureSignature => "not valid yet",
+                ErrorKind::InvalidIssuer => "bad issuer",
+                ErrorKind::InvalidAudience => "bad audience",
+                ErrorKind::InvalidSubject => "bad subject",
+                ErrorKind::MissingRequiredClaim(_) => "a required claim is missing",
+                ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => {
+                    "unacceptable algorithm"
+                }
+                ErrorKind::Base64(_) | ErrorKind::Utf8(_) | ErrorKind::Json(_) => "malformed token",
+                // The remainder are this server's key or provider being wrong,
+                // not the peer's token - and `ErrorKind` is `non_exhaustive`,
+                // so the wildcard is also whatever a later version adds.
+                _ => "the validator could not run",
+            },
+        }
+    }
 }
 
 /// Standard JWT claims plus custom fields for multi-tenancy
@@ -281,9 +334,29 @@ impl JwtValidator {
     }
 
     /// Validate a token and return claims
+    ///
+    /// # The separator stays a separator
+    ///
+    /// `sub` and `tenant_id` are composed with `\u{1}` between them to key
+    /// sessions and tasks - which is what security_best_practices §Session
+    /// Hijacking asks for, and only works while the separator cannot appear in
+    /// what it separates. A `sub` of `a\u{1}b` with no tenant and a `sub` of `a`
+    /// with tenant `b` would otherwise be one identity.
+    ///
+    /// The issuer controls both claims and a signature is required to get here,
+    /// so this is a belt over braces. It is also one comparison.
     pub fn validate(&self, token: &str) -> Result<Claims, JwtError> {
         let token_data: TokenData<Claims> = decode(token, &self.decoding_key, &self.validation)?;
         let claims = token_data.claims;
+
+        if claims.sub.contains(IDENTITY_SEPARATOR)
+            || claims
+                .tenant_id
+                .as_deref()
+                .is_some_and(|tenant| tenant.contains(IDENTITY_SEPARATOR))
+        {
+            return Err(JwtError::MalformedClaim);
+        }
 
         // An absent `aud` is the token the spec says to refuse, and it is the
         // one `jsonwebtoken` waves through. Checked here, where "no audience
@@ -644,5 +717,125 @@ mod tests {
 
         // Should fall back to user_id
         assert_eq!(claims.tenant_id(), "user-123");
+    }
+
+    /// A token with `exp` an hour out, so only the thing under test can fail
+    /// it.
+    fn live_claims(sub: &str, tenant: Option<&str>) -> Claims {
+        Claims {
+            sub: sub.to_string(),
+            exp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+            iat: 0,
+            iss: None,
+            aud: None,
+            tenant_id: tenant.map(str::to_string),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn a_separator_in_a_claim_is_refused_so_two_identities_stay_two() {
+        // Sessions and tasks are keyed `<user>␁<tenant>␁<id>`, which only tells
+        // identities apart while `␁` cannot appear in what it separates. These
+        // two compose to the same owner: `a␁b` with no tenant falls back to the
+        // subject and yields `a␁b␁a␁b`, and subject `a` with tenant `b` also
+        // starts `a␁b`. One is refused, so the collision cannot be built.
+        let secret = b"super-secret-key-for-testing";
+        let validator = JwtValidator::hs256(secret);
+
+        let smuggled = create_test_token(&live_claims("a\u{1}b", None), secret);
+        assert!(
+            matches!(validator.validate(&smuggled), Err(JwtError::MalformedClaim)),
+            "a subject carrying the separator was accepted"
+        );
+
+        let smuggled = create_test_token(&live_claims("a", Some("b\u{1}c")), secret);
+        assert!(
+            matches!(validator.validate(&smuggled), Err(JwtError::MalformedClaim)),
+            "a tenant carrying the separator was accepted"
+        );
+
+        // And the ordinary token this is not allowed to cost anything.
+        let ordinary = create_test_token(&live_claims("user-123", Some("tenant-456")), secret);
+        assert!(validator.validate(&ordinary).is_ok());
+    }
+
+    #[test]
+    fn an_auth_failure_summary_is_never_the_peers_text() {
+        // Log forgery. `Display` on a `ValidationFailed` quotes the offending
+        // part of the token back, and the JOSE header is decoded *before* the
+        // signature is checked - so an unauthenticated peer writes whatever it
+        // likes, newlines included, into the server's stderr once per request.
+        //
+        // The header below is `{"alg":"HS256\ninjected-log-line: ...","typ":"JWT"}`,
+        // base64url, with a body and signature that are never reached.
+        let forged = "eyJhbGciOiJIUzI1NlxuaW5qZWN0ZWQtbG9nLWxpbmU6IHRoZS1zZXJ2ZXItd2FzLXB3bmVkIiwidHlwIjoiSldUIn0\
+                      .eyJzdWIiOiJ4IiwiZXhwIjo5OTk5OTk5OTk5fQ.c2ln";
+        let validator = JwtValidator::hs256(b"super-secret-key-for-testing");
+
+        let error = validator.validate(forged).expect_err("a forged header");
+        assert!(
+            error.to_string().contains("injected-log-line"),
+            "this test is only meaningful while `Display` still echoes the \
+             peer: {error}"
+        );
+
+        let summary = error.summary();
+        assert!(
+            !summary.contains("injected-log-line"),
+            "the summary echoed the peer: {summary}"
+        );
+        assert!(
+            !summary.contains('\n') && !summary.contains('\r'),
+            "the summary can forge a log line: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn every_auth_failure_summarises_to_one_safe_line() {
+        // The property, not the cases: whatever a peer manages to produce, what
+        // reaches a log is one line of text this server wrote.
+        let secret = b"super-secret-key-for-testing";
+        let validator = JwtValidator::hs256(secret);
+        let expired = create_test_token(
+            &Claims {
+                exp: 1,
+                ..live_claims("user-123", None)
+            },
+            secret,
+        );
+
+        let failures = [
+            JwtError::MissingHeader,
+            JwtError::InvalidFormat,
+            JwtError::Expired,
+            JwtError::InvalidIssuer,
+            JwtError::InvalidAudience,
+            JwtError::MalformedClaim,
+            validator.validate("not-a-token").unwrap_err(),
+            validator.validate(&expired).unwrap_err(),
+            validator
+                .validate(&create_test_token(
+                    &live_claims("x", None),
+                    b"a-different-key",
+                ))
+                .unwrap_err(),
+            JwtValidator::extract_token("Basic nope").unwrap_err(),
+        ];
+
+        for failure in &failures {
+            let summary = failure.summary();
+            assert!(!summary.is_empty(), "{failure:?} summarised to nothing");
+            assert!(
+                summary
+                    .bytes()
+                    .all(|b| b == b' ' || (0x21..0x7f).contains(&b)),
+                "{failure:?} summarised to something a log cannot hold: {summary:?}"
+            );
+        }
     }
 }

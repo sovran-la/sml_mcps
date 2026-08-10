@@ -123,6 +123,7 @@ impl Transport for HttpTransport {
 // HttpServer - high-level server wrapper
 //
 
+use crate::IDENTITY_SEPARATOR;
 use crate::server::{LogLevel, Server, ServerConfig, TaskContext};
 use crate::tasks::{TaskStore, random_hex_id};
 use crate::transport::OriginPolicy;
@@ -307,6 +308,22 @@ struct Sessions {
 /// A request naming a session this server does not have.
 struct UnknownSession;
 
+/// Who a request belongs to: the token's subject and tenant, composed.
+///
+/// Tasks bind to this, and so do sessions - which is what makes them isolatable
+/// per identity rather than per listener. It only works while
+/// [`IDENTITY_SEPARATOR`] cannot appear in either half, which is why
+/// [`JwtValidator::validate`](crate::auth::JwtValidator) refuses a claim
+/// carrying one.
+#[cfg(feature = "auth")]
+fn owner_of(claims: &Claims) -> String {
+    format!(
+        "{}{IDENTITY_SEPARATOR}{}",
+        claims.user_id(),
+        claims.tenant_id()
+    )
+}
+
 impl Sessions {
     /// The table, tolerating a poisoned lock.
     ///
@@ -331,7 +348,7 @@ impl Sessions {
     /// alone - and that server has no tenants to keep apart.
     fn key(owner: Option<&str>, id: &str) -> String {
         match owner {
-            Some(owner) => format!("{owner}\u{1}{id}"),
+            Some(owner) => format!("{owner}{IDENTITY_SEPARATOR}{id}"),
             None => id.to_string(),
         }
     }
@@ -1172,7 +1189,16 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
                     claims
                 }
                 Err(e) => {
-                    eprintln!("  ✗ Auth failed: {}", e);
+                    // The discriminant, not the payload. `Display` on a
+                    // `ValidationFailed` quotes the offending part of the token
+                    // back, and a JOSE header is decoded *before* the signature
+                    // is checked - so an unauthenticated peer chooses that
+                    // text, newlines included, and writes a line of its own
+                    // into this server's stderr once per request. The detail
+                    // stays behind the debug gate and in the `401` body, where
+                    // it is JSON-escaped and the reader is the attacker.
+                    eprintln!("  ✗ Auth failed: {}", e.summary());
+                    self.trace(|| format!("  ✗ Auth failure detail: {}", e));
                     return self.unauthorized(format!("Unauthorized: {}", e));
                 }
             },
@@ -1190,13 +1216,13 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         }
 
         if matches!(request.method(), Method::Delete) {
-            let owner = format!("{}\u{1}{}", claims.user_id(), claims.tenant_id());
+            let owner = owner_of(&claims);
             return self.end_session_for(request, Some(&owner));
         }
 
         // Tasks bind to the identity the token carries, which is what makes
         // them isolatable. So do sessions - see `Sessions::checkout`.
-        let owner = format!("{}\u{1}{}", claims.user_id(), claims.tenant_id());
+        let owner = owner_of(&claims);
         self.respond(
             request,
             TaskContext::Owner(owner.clone()),
