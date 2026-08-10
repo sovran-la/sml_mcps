@@ -202,12 +202,14 @@ See §8, N2. `Server` passes `ServerConfig::task_result_timeout`.
 `ServerConfig::max_message_bytes`. Both structs derive `Default`, so
 `..Default::default()` construction (§1.2) is unaffected.
 
-### 1.11 The `http` feature has no dependencies, and `tls` moved again
+### 1.11 The `http` feature costs one crate, and `tls` moved again
 
-`http = []`. The HTTP/1.1 layer is ours now (§3.13), so the feature costs
-nothing. Nothing here re-exported `tiny_http`, so a downstream `Cargo.toml` that
-named it for its own reasons is unaffected — but it will no longer arrive by
-way of this crate.
+`http = ["dep:httparse"]`. The HTTP/1.1 layer is ours now (§3.13), so the
+feature no longer drags in a server — it carries `httparse` for the request
+grammar and nothing else (§3.13.1), which is one crate with no dependencies of
+its own, against the five that went. Nothing here re-exported `tiny_http`, so a
+downstream `Cargo.toml` that named it for its own reasons is unaffected — but it
+will no longer arrive by way of this crate.
 
 The one thing to change is a hand-written `tls` line: it is
 `tls = ["http", "dep:rustls", "dep:rustls-pemfile"]` now, not
@@ -658,11 +660,11 @@ same layer is why connection concurrency was unbounded — `TaskPool::spawn`
 starts a thread per connection with no ceiling, so a peer decided how many
 threads this process has.
 
-So the layer is ours: `src/transport/http1.rs`, `std::net`, no dependencies.
-The subset is the subset MCP needs — `POST`/`GET`/`DELETE` on one path,
-`Content-Length` and `chunked` bodies, keep-alive, one buffered response. No
-pipelining, no compression, no ranges, no upgrade. Three properties are the
-whole point, and each one is a finding:
+So the layer is ours: `src/transport/http1.rs` on `std::net`, with one crate
+behind the request grammar (§3.13.1). The subset is the subset MCP needs —
+`POST`/`GET`/`DELETE` on one path, `Content-Length` and `chunked` bodies,
+keep-alive, one buffered response. No pipelining, no compression, no ranges, no
+upgrade. Three properties are the whole point, and each one is a finding:
 
 - **Nothing is sized from a declared length.** A `Content-Length` is compared
   against a ceiling and thrown away. `read_exactly` grows a buffer as bytes
@@ -685,7 +687,9 @@ becomes a request-smuggling primitive. Closing is bounded on the way out — a
 half-close, then a discard capped at 64 KiB and 250 ms, so the peer sees the
 `413` instead of a reset.
 
-Owning the parser also meant owning the framing hygiene that comes with it:
+Owning the layer also meant owning the framing hygiene, which is a different job
+from parsing and stayed here when the grammar left (§3.13.1) — a parser reports
+what the fields *are*, and none of the rules below follow from that:
 `Content-Length` together with `Transfer-Encoding` is `400`, conflicting
 lengths are `400`, obsolete line folding is `400`, an extra space in the
 request line is `400`, and an unknown transfer coding is `501`.
@@ -736,16 +740,18 @@ Content-Length: 100000000, no body           -> 413, next request answered in 92
 
 **Dependencies.** Unique crates, `cargo tree -e normal`:
 
-| | before | after |
-|---|---|---|
-| default | 64 | 64 |
-| `--features http` | 69 | **64** |
-| `--features hosted` | 84 | 79 |
-| `--all-features` | 92 | 86 |
+| | `tiny_http` | ours, hand-rolled | ours, `httparse` |
+|---|---|---|---|
+| default | 64 | 64 | 64 |
+| `--features http` | 69 | 64 | **65** |
+| `--features hosted` | 84 | 79 | **80** |
+| `--all-features` | 92 | 86 | **87** |
 
-The `http` feature now costs nothing at all. What went: `tiny_http`, `ascii`,
-`chunked_transfer`, `httpdate`, `log`, and on the TLS path the whole `rustls
-0.20` / `webpki` / `sct` / `ring 0.16` / `rustls-pemfile 0.2` chain.
+What went: `tiny_http`, `ascii`, `chunked_transfer`, `httpdate`, `log`, and on
+the TLS path the whole `rustls 0.20` / `webpki` / `sct` / `ring 0.16` /
+`rustls-pemfile 0.2` chain. The third column is the one crate the request
+grammar came back for (§3.13.1) — five out, one in, and the one that is in has
+no dependencies of its own.
 
 **TLS.** `rustls` directly, 0.23 rather than the unmaintained 0.20 that arrived
 through `tiny_http/ssl-rustls`, with `ring` as the provider. The handshake runs
@@ -766,6 +772,72 @@ there and bind to loopback; in front of nothing, keep the defaults and set
 for its whole duration, including a `tasks/result` that is waiting, so the
 ceiling has to be comfortably above the number of clients expected to be
 blocked at once.
+
+### 3.13.1 The server is ours; the request grammar is `httparse`'s
+
+**Confidence: high. Every claim about `httparse` below was measured against it,
+not read out of its docs — which were wrong in at least one place.**
+
+§3.13's framing paragraph used to open "owning the parser", and that part did
+not survive review of its own argument. §5 states the cost plainly: *this is a
+hand-written HTTP parser, and hand-written HTTP parsers are where request
+smuggling lives.* Having written that down, the honest move was to stop being
+the counterexample. Request smuggling is a disagreement between two parsers
+about where a request ends — which makes it a property of the **grammar**, and
+the grammar is the one part of this layer with no MCP-specific content
+whatsoever. There is nothing about `POST /mcp` that wants a bespoke reading of
+RFC 9112 §3. So the request line and the header block are `httparse`'s now, and
+`read_head` accumulates bytes and asks it.
+
+**What that buys.** `httparse` is the parser under `hyper` — `hyper`'s own
+`Cargo.toml` names it — which is to say it has been read by more adversaries
+than this file will ever attract. It also ships four implementations of the same
+header scan, AVX2 / SSE4.2 / NEON and a SWAR fallback behind a runtime
+dispatcher, which is a thing to depend on and emphatically not a thing to
+hand-write. Three edges the swap closed on arrival, each one a real smuggling
+primitive and each one now a test:
+
+- **A space before a header's colon** (`X-Thing : v`) was accepted, and is
+  `400`. A hop in front may read that field as `X-Thing` while this server reads
+  `X-Thing `, which is how a header gets past a proxy that filters on it.
+- **`Content-Length: +5`** was accepted, and is `400`. `usize::from_str` takes
+  the leading `+`; RFC 9112 §6.2 is `1*DIGIT` and a strict front-end rejects the
+  field outright. We read a body where it reads none.
+- **A chunk size must open with a hex digit.** This one is a guard *on top of*
+  `httparse`, not a gift from it: measured, `httparse::parse_chunk_size` answers
+  `Complete((_, 0))` — *the last chunk* — to `"\r\n"`, `" \r\n"` and `";x\r\n"`
+  alike. Ending a body on a blank line while the hop in front calls it malformed
+  is the whole primitive. Removing the guard turns the test for it into
+  `200 OK, Content-Length: 0`, which is that smuggle landing.
+
+The third is the point worth keeping: a dependency is not an oracle. `httparse`
+decides the grammar because the grammar is what it is good at; it does not
+decide what this server accepts.
+
+**What it costs.** One crate, and it is a leaf — `cargo tree -e normal --invert
+httparse` names only this package, and `httparse` has no dependencies of its own
+at any depth. Every configuration that carries `http` gains exactly one crate
+and no transitive risk.
+
+**What did not change, which is the whole reason the server is still ours.** The
+three properties in §3.13 are untouched and were never the parser's to provide:
+nothing is sized from a declared length, every read has a deadline, and live
+connections are capped. `tiny_http` had a competent parser too — C1 was an
+allocation in a destructor and C2 was a read with no deadline, and neither is a
+grammar bug. Swapping the grammar for a better-audited one does not hand back
+the layer, because the layer was never taken for the grammar's sake.
+
+Two consequences worth stating rather than discovering:
+
+- `POST /a b HTTP/1.1` — a space in the target — now answers **505** instead of
+  **400**, because `httparse` reports it as `Error::Version` and does not expose
+  the token it choked on. Both close the connection, no test covered it, and
+  reintroducing a hand-rolled request-line scan to recover a status code is a
+  bad trade for exactly the reason this section exists.
+- Bare-LF line endings are still accepted. The hand-rolled reader accepted them,
+  `httparse` accepts them, and RFC 9112 §2.2 permits a recipient to. No
+  regression — but tightening it is a separate and arguable change, not
+  something this swap did quietly.
 
 ### 3.14 HTTP state is per *session*, not per process
 
@@ -1174,12 +1246,19 @@ three, removes five dependencies, and puts the ceilings where the rest of this
 crate already keeps them. It is also the same trade §3.13 already made once, for
 the same reason: the thread pool was cheaper to own than 27 crates.
 
-The cost is honest and worth stating: this is a hand-written HTTP parser, and
+The cost was honest and worth stating: this was a hand-written HTTP parser, and
 hand-written HTTP parsers are where request smuggling lives. So the framing
 rules a smuggler needs are refused rather than guessed at — `Content-Length`
 with `Transfer-Encoding`, conflicting lengths, obsolete folding, an extra space
 in the request line, an unknown transfer coding — and a connection whose body
 was abandoned is closed rather than reused. Each has a test.
+
+**Since resolved, by taking the sentence seriously.** The framing rules above
+are still ours and still tested, but the request grammar underneath them is
+`httparse`'s now (§3.13.1). The cost stated here was the one genuinely bad part
+of owning the layer, and it was also the one part with no MCP-specific content
+to justify it — so it is the part that went back out. The three properties the
+layer was actually taken for did not move.
 
 **S1, an independent backlog versus no backlog.** The review suggested giving
 the queue its own depth and adding a short `send_timeout`. This removes the

@@ -24,7 +24,7 @@ sml_mcps gives us a clean, sync MCP server that we control.
 [features]
 default = ["schema"]
 schema = ["dep:schemars"]     # JSON Schema generation for tools
-http = []                      # Streamable HTTP transport (with SSE), no deps
+http = ["dep:httparse"]        # Streamable HTTP transport (with SSE)
 auth = ["dep:jsonwebtoken"]    # JWT validation for hosted
 hosted = ["http", "auth"]      # Both HTTP and auth
 tls = ["http", "dep:rustls", "dep:rustls-pemfile"]  # HTTPS, via rustls
@@ -151,11 +151,11 @@ See `examples/unix_server.rs` for a complete single-binary daemon + shim.
 ## HTTP Transport (Streamable HTTP with SSE)
 
 With the `http` feature, `HttpServer` handles all the HTTP boilerplate for you.
-The HTTP/1.1 layer is ours, on `std::net`, so the feature costs no
-dependencies. Requests are served concurrently, one thread per connection, so a
-client blocked in `tasks/result` cannot hold up anybody else. The context
-factory is called per request, on that request's own thread, so it must be
-`Send + Sync`.
+The HTTP/1.1 layer is ours, on `std::net`, with `httparse` for the request
+grammar — one crate, no transitive dependencies. Requests are served
+concurrently, one thread per connection, so a client blocked in `tasks/result`
+cannot hold up anybody else. The context factory is called per request, on that
+request's own thread, so it must be `Send + Sync`.
 
 Everything a peer controls has a ceiling, and each one is a knob:
 
