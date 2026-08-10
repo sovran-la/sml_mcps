@@ -7,8 +7,13 @@
 //! - **Nothing is allocated on a peer's say-so.** A `Content-Length` is a
 //!   number an attacker chooses. It is compared against a ceiling and then
 //!   thrown away; no buffer is ever sized from it.
-//! - **Every read has a deadline.** A peer that declares a body and sends none
-//!   costs one connection until the deadline, not a thread forever.
+//! - **Every request has a deadline, and it is not one the peer can renew.**
+//!   A socket timeout is per-`read()`, so every byte that arrives resets it and
+//!   a peer sending one byte at a time never meets one. The budget here starts
+//!   with a request's first byte and covers its head *and* its body, so a
+//!   declared body that never arrives - and one that arrives four bytes a
+//!   second - both cost one connection until the deadline, not a thread
+//!   forever.
 //! - **Concurrency is capped.** One thread per live connection, and a ceiling
 //!   on how many of those exist, so how many threads this process has is not a
 //!   decision the network gets to make.
@@ -78,6 +83,32 @@ const CHUNK_LINE_BYTES: usize = 128;
 /// How many trailer fields a chunked body may carry.
 const MAX_TRAILERS: usize = 16;
 
+/// The shortest deadline this server will put on a socket.
+///
+/// `set_read_timeout(Some(Duration::ZERO))` is `EINVAL`, and the error goes
+/// nowhere - which leaves the socket **blocking forever**, the exact opposite of
+/// what a zero timeout asks for. One millisecond is the shortest deadline that
+/// means what it says.
+pub(crate) const MIN_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// The longest a request's budget can be, if the clock cannot express what was
+/// configured.
+///
+/// Only reachable from a `Duration` large enough to overflow `Instant`, which
+/// is a configuration mistake rather than a peer's doing - and panicking on the
+/// connection thread is a worse answer than an hour.
+const MAX_BUDGET: Duration = Duration::from_secs(3600);
+
+/// How many empty lines may precede a request line.
+///
+/// RFC 9112 §2.2 asks a recipient to ignore "at least one" empty line before a
+/// request line. `httparse::skip_empty_lines` ignores an unbounded run, and
+/// [`read_head`] hands it the whole accumulator again on every round that ends
+/// a line - so an unbounded run is a quadratic re-parse whose size the *peer*
+/// chooses, for two bytes a line. Ignoring a few is politeness; ignoring all of
+/// them is letting the network decide how much CPU a connection costs.
+const MAX_LEADING_BLANK_LINES: usize = 8;
+
 /// Live connections allowed at once, by default.
 ///
 /// Each one costs a thread, so this is the ceiling on what a peer can make this
@@ -96,8 +127,13 @@ pub(crate) struct Limits {
     pub(crate) max_headers: usize,
     /// The largest body that will be read.
     pub(crate) max_body_bytes: usize,
-    /// How long a peer may take over a request head, or over a body once it
-    /// has started one.
+    /// How long a peer has to deliver a whole request, head and body together,
+    /// counted from its first byte.
+    ///
+    /// **Aggregate, not per-read.** A per-read deadline is renewed by every
+    /// byte that arrives, so it bounds a peer that has *stopped* talking and
+    /// says nothing at all about one that is talking slowly. This is the one a
+    /// slow peer cannot renew.
     pub(crate) read_timeout: Duration,
     /// How long a kept-alive connection may sit between requests.
     pub(crate) idle_timeout: Duration,
@@ -142,6 +178,60 @@ impl Socket for TcpStream {
 
     fn shutdown_write(&self) {
         let _ = TcpStream::shutdown(self, Shutdown::Write);
+    }
+}
+
+/// Put a socket on a read deadline, never a zero one.
+///
+/// See [`MIN_TIMEOUT`] for why zero is the one value that must not get through.
+fn arm_read(io: &BufReader<Box<dyn Socket>>, timeout: Duration) {
+    io.get_ref()
+        .set_read_timeout(Some(timeout.max(MIN_TIMEOUT)));
+}
+
+/// [`arm_read`], for the other direction.
+fn arm_write(io: &BufReader<Box<dyn Socket>>, timeout: Duration) {
+    io.get_ref()
+        .set_write_timeout(Some(timeout.max(MIN_TIMEOUT)));
+}
+
+/// The whole budget one request gets, from its first byte to its last.
+///
+/// This is the difference between bounding a peer that has *stopped* and
+/// bounding one that is *slow*. A socket timeout is per-`read()`: a peer
+/// sending one byte just under the deadline resets it and can do that forever,
+/// which costs a connection - and at `max_connections` sockets, costs every
+/// connection - for a few bytes a second. This deadline starts when a request
+/// does and does not move.
+///
+/// It is enforced twice, because either alone has a hole. It is checked
+/// *between* reads, which catches a peer that keeps delivering; and the
+/// socket's own timeout is set from what is left of it, which catches one that
+/// stops mid-read. Neither check can be renewed by anything the peer sends.
+#[derive(Clone, Copy, Debug)]
+struct Deadline {
+    at: Instant,
+}
+
+impl Deadline {
+    /// A budget of `total`, starting now.
+    fn starting_now(total: Duration) -> Self {
+        let now = Instant::now();
+        let at = now
+            .checked_add(total)
+            .or_else(|| now.checked_add(MAX_BUDGET))
+            .unwrap_or(now);
+        Self { at }
+    }
+
+    fn expired(&self) -> bool {
+        Instant::now() >= self.at
+    }
+
+    /// Put the socket on what is left, so no single read can outlive the
+    /// request that is spending it.
+    fn arm(&self, io: &BufReader<Box<dyn Socket>>) {
+        arm_read(io, self.at.saturating_duration_since(Instant::now()));
     }
 }
 
@@ -237,8 +327,22 @@ pub(crate) enum BodyError {
     TooLarge,
     /// Framing the peer got wrong, or bytes that are not UTF-8.
     Malformed,
-    /// The peer stopped talking, or ran out of time.
+    /// The peer stopped talking.
     Incomplete,
+    /// The peer kept talking, but not fast enough to finish inside the budget
+    /// its request started with. Told apart from [`Incomplete`](Self::Incomplete)
+    /// because "you were too slow" is a different thing for a client to act on
+    /// than "your body ended early".
+    TimedOut,
+}
+
+/// Whether this is a deadline rather than a broken socket.
+///
+/// The socket's own timeout is armed from what is left of the request's
+/// budget, so one firing means the budget is spent - the same answer the
+/// between-reads check gives, arrived at from inside a `read`.
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
 }
 
 /// The request body, read on demand and only up to a ceiling.
@@ -253,6 +357,11 @@ struct Body<'a> {
     finished: bool,
     /// Whether a read was already attempted.
     started: bool,
+    /// The budget this request's head was already spending. A body does not
+    /// get a fresh one: the deadline covers a request, not a phase of one.
+    deadline: Deadline,
+    /// How long a `100 Continue` may take to go out.
+    write_timeout: Duration,
 }
 
 impl Body<'_> {
@@ -275,7 +384,7 @@ impl Body<'_> {
             Framing::Length(declared) => {
                 self.send_continue()?;
                 let mut buffer = Vec::new();
-                read_exactly(self.io, declared, &mut buffer)?;
+                read_exactly(self.io, declared, &mut buffer, self.deadline)?;
                 self.finished = true;
                 String::from_utf8(buffer).map_err(|_| BodyError::Malformed)
             }
@@ -298,16 +407,29 @@ impl Body<'_> {
         if self.started || self.finished {
             return;
         }
+        // A peer waiting for `100 Continue` has sent nothing, and nothing is
+        // what it will send until told otherwise - which the handler, having
+        // declined to read, never did. Draining it waits out the whole deadline
+        // for bytes that were never in flight, and delivers an already-computed
+        // `401`/`403`/`404` that much later.
+        if self.must_send_continue {
+            return;
+        }
         let Framing::Length(declared) = self.framing else {
             return;
         };
+        // The only thing between `read_exactly` and an unbounded read of a
+        // length the *peer* chose. The main path is covered upstream - `read`
+        // refuses an over-limit length before this can be reached - but a
+        // request rejected before the handler read anything arrives here with
+        // `started == false` and nothing else in the way.
         if declared > limit {
             return;
         }
 
         self.started = true;
         let mut sink = Vec::new();
-        if read_exactly(self.io, declared, &mut sink).is_ok() {
+        if read_exactly(self.io, declared, &mut sink, self.deadline).is_ok() {
             self.finished = true;
         }
     }
@@ -324,6 +446,11 @@ impl Body<'_> {
         }
         self.must_send_continue = false;
 
+        // Nothing has written to this socket yet on a plaintext connection, so
+        // without this it has no write deadline at all - 25 bytes into an empty
+        // send buffer never blocks in practice, and "in practice" is not a
+        // deadline.
+        arm_write(self.io, self.write_timeout);
         let writer = self.io.get_mut();
         writer
             .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
@@ -331,15 +458,30 @@ impl Body<'_> {
             .map_err(|_| BodyError::Incomplete)
     }
 
+    /// Decode a chunked body.
+    ///
+    /// **Every line ending here must be a CRLF.** RFC 9112 §2.2 permits a
+    /// recipient to accept a bare LF, but that permission is scoped to "the
+    /// start-line and fields"; §7.1's chunked grammar is strict CRLF, and
+    /// bare-LF chunk framing is one of the better-known smuggling differentials
+    /// precisely because front-ends disagree about it. The head keeps
+    /// `httparse`'s leniency, which is hyper's and is a defensible thing to
+    /// inherit. The body does not, for the same reason [`parse_chunk_size`]
+    /// exists: a chunked body is where a disagreement about the end of a
+    /// request gets written.
     fn read_chunked(&mut self, limit: usize) -> std::result::Result<Vec<u8>, BodyError> {
         let mut body: Vec<u8> = Vec::new();
 
         loop {
             let mut budget = CHUNK_LINE_BYTES;
-            let size = match read_line(self.io, &mut budget) {
-                Ok(Line::Text(line)) => parse_chunk_size(&line).ok_or(BodyError::Malformed)?,
+            let size = match read_line(self.io, &mut budget, self.deadline) {
+                Ok(Line::Text { text, crlf: true }) => {
+                    parse_chunk_size(&text).ok_or(BodyError::Malformed)?
+                }
+                Ok(Line::Text { .. }) => return Err(BodyError::Malformed),
                 Ok(Line::Eof) => return Err(BodyError::Incomplete),
                 Ok(Line::TooLong | Line::Invalid) => return Err(BodyError::Malformed),
+                Err(e) if is_timeout(&e) => return Err(BodyError::TimedOut),
                 Err(_) => return Err(BodyError::Incomplete),
             };
 
@@ -355,11 +497,12 @@ impl Body<'_> {
                 return Err(BodyError::TooLarge);
             }
 
-            read_exactly(self.io, size, &mut body)?;
-            match read_line(self.io, &mut { 2usize }) {
-                Ok(Line::Text(line)) if line.is_empty() => {}
+            read_exactly(self.io, size, &mut body, self.deadline)?;
+            match read_line(self.io, &mut { 2usize }, self.deadline) {
+                Ok(Line::Text { text, crlf: true }) if text.is_empty() => {}
                 Ok(Line::Eof) => return Err(BodyError::Incomplete),
                 Ok(_) => return Err(BodyError::Malformed),
+                Err(e) if is_timeout(&e) => return Err(BodyError::TimedOut),
                 Err(_) => return Err(BodyError::Incomplete),
             }
         }
@@ -368,11 +511,16 @@ impl Body<'_> {
     fn read_trailers(&mut self) -> std::result::Result<(), BodyError> {
         for _ in 0..=MAX_TRAILERS {
             let mut budget = CHUNK_LINE_BYTES;
-            match read_line(self.io, &mut budget) {
-                Ok(Line::Text(line)) if line.is_empty() => return Ok(()),
-                Ok(Line::Text(_)) => continue,
+            match read_line(self.io, &mut budget, self.deadline) {
+                // The blank line that ends the trailers is the byte the next
+                // request starts after, so it is held to the same CRLF as the
+                // rest of the framing.
+                Ok(Line::Text { text, crlf: true }) if text.is_empty() => return Ok(()),
+                Ok(Line::Text { crlf: true, .. }) => continue,
+                Ok(Line::Text { .. }) => return Err(BodyError::Malformed),
                 Ok(Line::Eof) => return Err(BodyError::Incomplete),
                 Ok(Line::TooLong | Line::Invalid) => return Err(BodyError::Malformed),
+                Err(e) if is_timeout(&e) => return Err(BodyError::TimedOut),
                 Err(_) => return Err(BodyError::Incomplete),
             }
         }
@@ -562,10 +710,12 @@ where
 
     loop {
         // A connection between requests is idle on the peer's schedule; one in
-        // the middle of a request is on ours.
-        io.get_ref().set_read_timeout(Some(limits.idle_timeout));
-        let head = match read_head(&mut io, limits) {
-            Ok(Some(head)) => head,
+        // the middle of a request is on ours. `read_head` makes that switch on
+        // the first byte of the request - not here, and not after the head is
+        // complete, because a peer that has begun a request is no longer idle.
+        arm_read(&io, limits.idle_timeout);
+        let (head, deadline) = match read_head(&mut io, limits) {
+            Ok(Some(started)) => started,
             // A clean hangup, or a peer that went quiet. Neither is worth an
             // answer, and neither is an error.
             Ok(None) => return,
@@ -575,7 +725,6 @@ where
                 return;
             }
         };
-        io.get_ref().set_read_timeout(Some(limits.read_timeout));
 
         let handled = {
             let mut request = Request {
@@ -585,6 +734,10 @@ where
                     must_send_continue: head.expects_continue,
                     finished: matches!(head.framing, Framing::Empty),
                     started: false,
+                    // The head's budget, not a new one. The peer does not get
+                    // a fresh `read_timeout` for having reached the blank line.
+                    deadline,
+                    write_timeout: limits.write_timeout,
                 },
                 head,
             };
@@ -634,10 +787,12 @@ where
     }
 }
 
-/// Read the request head, or the response that says why not.
+/// Read the request head, and start the clock the whole request runs on.
 ///
 /// `Ok(None)` is a connection that ended before a request started - a hangup
-/// or an idle timeout, both ordinary.
+/// or an idle timeout, both ordinary. `Ok(Some(..))` carries the [`Deadline`]
+/// the head was read under, because the body is read under the same one: the
+/// budget belongs to the request, not to a phase of it.
 ///
 /// The head is accumulated into a buffer of *our* size and handed to
 /// [`httparse`] whole, again, as more of it arrives. `httparse` is the only
@@ -651,16 +806,23 @@ where
 fn read_head(
     io: &mut BufReader<Box<dyn Socket>>,
     limits: &Limits,
-) -> std::result::Result<Option<Head>, Response> {
+) -> std::result::Result<Option<(Head, Deadline)>, Response> {
     let mut raw: Vec<u8> = Vec::new();
     // How much of `raw` has been taken out of the reader's buffer. Everything
     // past it must stay there: it is the body, and the body is read from the
     // reader.
     let mut consumed = 0usize;
+    // Unset until the first byte of the request arrives. Before that the
+    // connection is idle, and idle runs on the peer's schedule; after it, the
+    // request runs on ours.
+    let mut clock: Option<Deadline> = None;
 
     loop {
         if raw.len() >= limits.max_head_bytes {
             return Err(too_long());
+        }
+        if clock.is_some_and(|deadline| deadline.expired()) {
+            return Err(timed_out());
         }
 
         // Copy out of the reader's buffer without consuming it, so that the
@@ -669,9 +831,15 @@ fn read_head(
             let available = match io.fill_buf() {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                // A deadline or a broken socket before a request finished.
-                // Neither is worth an answer.
-                Err(_) => return Ok(None),
+                // A deadline or a broken socket. Before a request started
+                // neither is worth an answer; part-way into one, a peer that
+                // ran out of time is owed the reason.
+                Err(_) => {
+                    return match clock {
+                        Some(deadline) if deadline.expired() => Err(timed_out()),
+                        _ => Ok(None),
+                    };
+                }
             };
             if available.is_empty() {
                 // A clean hangup. Mid-head it is a peer that changed its mind,
@@ -683,6 +851,19 @@ fn read_head(
             raw.extend_from_slice(&available[..take]);
             (take, available[..take].contains(&b'\n'))
         };
+
+        // The first byte of a request starts its budget, and everything after
+        // this - the rest of the head, then the body - spends that one budget.
+        let deadline = *clock.get_or_insert_with(|| Deadline::starting_now(limits.read_timeout));
+        deadline.arm(io);
+
+        // See `MAX_LEADING_BLANK_LINES`: `httparse` skips an unbounded run of
+        // these, and this loop re-parses from the front every round.
+        if blank_lines_before_a_request(&raw, MAX_LEADING_BLANK_LINES) > MAX_LEADING_BLANK_LINES {
+            return Err(bad_request(
+                "more empty lines before a request line than this server ignores",
+            ));
+        }
 
         // A head ends with a newline, so a round that brought none cannot have
         // completed one, and re-parsing everything to be told so again is work
@@ -697,7 +878,7 @@ fn read_head(
                     // told `Partial` over a prefix of these same bytes, so the
                     // head cannot have ended inside one.
                     io.consume(head_len.saturating_sub(consumed));
-                    return head_from(parsed).map(Some);
+                    return head_from(parsed).map(|head| Some((head, deadline)));
                 }
                 Ok(httparse::Status::Partial) => {}
                 Err(e) => return Err(rejection(e)),
@@ -707,6 +888,28 @@ fn read_head(
         io.consume(taken);
         consumed += taken;
     }
+}
+
+/// How many empty lines stand before the request line, counted no further than
+/// `cap + 1`.
+///
+/// Stopping there is the point: the caller only needs to know whether the run
+/// is over its ceiling, and counting the whole run every round would be the
+/// same quadratic scan the ceiling exists to prevent.
+fn blank_lines_before_a_request(raw: &[u8], cap: usize) -> usize {
+    let mut at = 0;
+    let mut lines = 0;
+    while lines <= cap {
+        if raw[at..].starts_with(b"\r\n") {
+            at += 2;
+        } else if raw[at..].starts_with(b"\n") {
+            at += 1;
+        } else {
+            break;
+        }
+        lines += 1;
+    }
+    lines
 }
 
 /// Turn a parsed request line and header block into a [`Head`], deciding the
@@ -849,50 +1052,98 @@ fn framing_of(headers: &[(String, String)]) -> std::result::Result<Framing, Resp
     }
 }
 
-/// One line of a head, charged against a shared budget.
+/// One line of chunked framing, charged against a shared byte budget.
+///
+/// Its callers are [`Body::read_chunked`] and [`Body::read_trailers`]; the head
+/// is [`httparse`]'s and has not come through here since the grammar moved.
 enum Line {
-    Text(String),
+    Text {
+        text: String,
+        /// Whether the line ended with a CRLF rather than a bare LF.
+        ///
+        /// Reported rather than decided here because the two are not the same
+        /// question everywhere: RFC 9112 §2.2 lets a recipient accept a bare LF
+        /// in "the start-line and fields", and §7.1's chunked grammar is strict
+        /// CRLF. The callers that frame a body require `true`.
+        crlf: bool,
+    },
     /// The peer hung up.
     Eof,
     /// The budget ran out before the line ended.
     TooLong,
-    /// The line is not text a head may contain.
+    /// The line is not text this may contain.
     Invalid,
 }
 
-fn read_line(io: &mut BufReader<Box<dyn Socket>>, budget: &mut usize) -> std::io::Result<Line> {
-    // An exhausted budget is a head too long, not a connection that ended -
+fn read_line(
+    io: &mut BufReader<Box<dyn Socket>>,
+    budget: &mut usize,
+    deadline: Deadline,
+) -> std::io::Result<Line> {
+    // An exhausted budget is a line too long, not a connection that ended -
     // reading zero bytes because we asked for zero says nothing about the peer.
     if *budget == 0 {
         return Ok(Line::TooLong);
     }
 
+    // Read a byte range at a time rather than through `read_until`, which loops
+    // inside itself: the deadline has to be checked *between* reads, and one
+    // socket timeout covering an inner loop bounds each read rather than the
+    // line, which is `CHUNK_LINE_BYTES` × the timeout for a peer that dribbles.
     let mut raw = Vec::new();
-    let read = (&mut *io)
-        .take(*budget as u64)
-        .read_until(b'\n', &mut raw)?;
+    let terminated = loop {
+        if deadline.expired() {
+            return Err(std::io::Error::from(ErrorKind::TimedOut));
+        }
+        deadline.arm(io);
 
-    if read == 0 {
+        let available = match io.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            break false;
+        }
+
+        let room = available.len().min(*budget);
+        let take = match available[..room].iter().position(|byte| *byte == b'\n') {
+            Some(at) => at + 1,
+            None => room,
+        };
+        raw.extend_from_slice(&available[..take]);
+        io.consume(take);
+        *budget -= take;
+
+        if raw.ends_with(b"\n") {
+            break true;
+        }
+        if *budget == 0 {
+            break false;
+        }
+    };
+
+    if raw.is_empty() {
         return Ok(Line::Eof);
     }
-    *budget -= read;
-    if !raw.ends_with(b"\n") {
+    if !terminated {
         return Ok(Line::TooLong);
     }
 
     raw.pop();
-    if raw.last() == Some(&b'\r') {
+    let crlf = raw.last() == Some(&b'\r');
+    if crlf {
         raw.pop();
     }
-    // A head is text. Anything else is either a wrong guess about the protocol
-    // or an attempt to smuggle a control character through a header.
+    // Framing is text. Anything else is either a wrong guess about the protocol
+    // or an attempt to smuggle a control character through a trailer.
     match String::from_utf8(raw) {
-        Ok(line)
-            if line
+        Ok(text)
+            if text
                 .bytes()
                 .all(|b| b == b'\t' || (0x20..0x7f).contains(&b) || b >= 0x80) =>
         {
-            Ok(Line::Text(line))
+            Ok(Line::Text { text, crlf })
         }
         _ => Ok(Line::Invalid),
     }
@@ -902,18 +1153,43 @@ fn read_line(io: &mut BufReader<Box<dyn Socket>>, budget: &mut usize) -> std::io
 ///
 /// `count` is peer-declared, so nothing is reserved for it up front: a
 /// `Content-Length` of 200000000000000000 costs the same here as one of 10.
+///
+/// The loop is here rather than in `read_to_end` for the same reason as
+/// [`read_line`]'s: `deadline` has to be checked between reads, or a peer
+/// delivering one byte at a time never meets one.
 fn read_exactly(
     io: &mut BufReader<Box<dyn Socket>>,
     count: usize,
     into: &mut Vec<u8>,
+    deadline: Deadline,
 ) -> std::result::Result<(), BodyError> {
-    let before = into.len();
-    match (&mut *io).take(count as u64).read_to_end(into) {
-        Ok(_) if into.len() - before == count => Ok(()),
-        // A hangup, a deadline, and a broken socket are the same answer: the
-        // body promised is not going to arrive, and this connection is over.
-        Ok(_) | Err(_) => Err(BodyError::Incomplete),
+    let mut outstanding = count;
+
+    while outstanding > 0 {
+        if deadline.expired() {
+            return Err(BodyError::TimedOut);
+        }
+        deadline.arm(io);
+
+        let available = match io.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            // A hangup, a deadline and a broken socket all end this connection;
+            // only the deadline gets a different word for it.
+            Err(e) if is_timeout(&e) => return Err(BodyError::TimedOut),
+            Err(_) => return Err(BodyError::Incomplete),
+        };
+        if available.is_empty() {
+            return Err(BodyError::Incomplete);
+        }
+
+        let take = available.len().min(outstanding);
+        into.extend_from_slice(&available[..take]);
+        io.consume(take);
+        outstanding -= take;
     }
+
+    Ok(())
 }
 
 /// `1a3f` or `1a3f;ext=value` - the size, in hex, of the chunk that follows.
@@ -936,8 +1212,11 @@ fn parse_chunk_size(line: &str) -> Option<usize> {
     if !line.starts_with(|c: char| c.is_ascii_hexdigit()) {
         return None;
     }
-    // `read_line` took the CRLF off; `httparse` needs it back to know the size
-    // is finished, and rejects a bare LF here regardless.
+    // `read_line` has already established the terminator was a CRLF and taken
+    // it off; `httparse` needs one back to know the size is finished. Its own
+    // bare-LF rejection cannot run on a line that has been through here, which
+    // is exactly why requiring the CRLF is `read_chunked`'s job and not a
+    // property inherited from the parser.
     let mut framed = String::with_capacity(line.len() + 2);
     framed.push_str(line);
     framed.push_str("\r\n");
@@ -989,6 +1268,17 @@ fn too_long() -> Response {
         .closing()
 }
 
+/// A request that ran out of its budget part-way through.
+///
+/// Closing is not optional here: a request that is half-delivered leaves no
+/// agreed answer to where the next one starts, which is the same reason every
+/// other rejection in this file closes.
+fn timed_out() -> Response {
+    Response::new(408)
+        .with_body("text/plain", b"Request Timeout\n".to_vec())
+        .closing()
+}
+
 fn status_only(status: u16, reason: &str) -> Response {
     Response::new(status).with_body("text/plain", format!("{reason}\n").into_bytes())
 }
@@ -1001,7 +1291,7 @@ fn write_response(
     response: Response,
     limits: &Limits,
 ) -> std::io::Result<()> {
-    io.get_ref().set_write_timeout(Some(limits.write_timeout));
+    arm_write(io, limits.write_timeout);
     let keep_alive = !response.close;
     let bytes = render(method, version, response, keep_alive);
     let writer = io.get_mut();
@@ -1079,7 +1369,7 @@ fn reason_phrase(status: u16) -> &'static str {
 /// flight, bounded by a byte budget *and* a deadline, neither of which the peer
 /// gets a say in.
 fn linger_close(io: &mut BufReader<Box<dyn Socket>>) {
-    io.get_ref().set_read_timeout(Some(LINGER_POLL));
+    arm_read(io, LINGER_POLL);
     io.get_ref().shutdown_write();
 
     let deadline = Instant::now() + LINGER_TIME;
@@ -1203,8 +1493,8 @@ impl Acceptor {
                 // The handshake runs here, on the connection's own thread, and
                 // under the connection's own deadline - never on the accept
                 // loop, where a slow one would be everybody's problem.
-                let _ = stream.set_read_timeout(Some(limits.read_timeout));
-                let _ = stream.set_write_timeout(Some(limits.write_timeout));
+                let _ = stream.set_read_timeout(Some(limits.read_timeout.max(MIN_TIMEOUT)));
+                let _ = stream.set_write_timeout(Some(limits.write_timeout.max(MIN_TIMEOUT)));
                 let connection = rustls::ServerConnection::new(Arc::clone(config)).ok()?;
                 Some(Box::new(TlsSocket {
                     stream: rustls::StreamOwned::new(connection, stream),
@@ -1366,6 +1656,58 @@ mod tests {
         fn shutdown_write(&self) {}
     }
 
+    /// A socket that waits before handing back each small piece.
+    ///
+    /// [`Fake`] and [`Dribble`] both answer instantly, which is the one thing a
+    /// slow peer never does - so neither can measure a deadline. This one can,
+    /// and deliberately **ignores `set_read_timeout` entirely**: a per-read
+    /// deadline is what a slow peer defeats by sending a byte, so a test that
+    /// let the socket enforce one would be measuring the wrong thing. The only
+    /// thing that can stop it is a budget that does not move.
+    struct Trickle {
+        incoming: std::io::Cursor<Vec<u8>>,
+        outgoing: Arc<Mutex<Vec<u8>>>,
+        /// Bytes the *first* read hands over at once, with no wait - a head a
+        /// real client put in one segment. Zero means trickle from the start.
+        burst: usize,
+        chunk: usize,
+        gap: Duration,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let take = match std::mem::replace(&mut self.burst, 0) {
+                0 => {
+                    std::thread::sleep(self.gap);
+                    self.chunk
+                }
+                burst => burst,
+            };
+            let take = buffer.len().min(take);
+            self.incoming.read(&mut buffer[..take])
+        }
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.outgoing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Socket for Trickle {
+        fn set_read_timeout(&self, _: Option<Duration>) {}
+        fn set_write_timeout(&self, _: Option<Duration>) {}
+        fn shutdown_write(&self) {}
+    }
+
     /// Drive one connection's worth of bytes through the loop and return what
     /// came back.
     fn drive<H>(request: &[u8], limits: Limits, handle: H) -> String
@@ -1400,11 +1742,46 @@ mod tests {
         String::from_utf8_lossy(&written).into_owned()
     }
 
+    /// The same, `burst` bytes at once and then one `chunk` every `gap`, with
+    /// how long the whole thing took.
+    fn drive_trickled<H>(
+        request: &[u8],
+        burst: usize,
+        chunk: usize,
+        gap: Duration,
+        limits: Limits,
+        handle: H,
+    ) -> (String, Duration)
+    where
+        H: for<'a> Fn(&mut Request<'a>) -> Response,
+    {
+        let outgoing = Arc::new(Mutex::new(Vec::new()));
+        let socket = Trickle {
+            incoming: std::io::Cursor::new(request.to_vec()),
+            outgoing: Arc::clone(&outgoing),
+            burst,
+            chunk,
+            gap,
+        };
+
+        let started = Instant::now();
+        serve_connection(Box::new(socket), &limits, &handle);
+        let took = started.elapsed();
+
+        let written = outgoing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (String::from_utf8_lossy(&written).into_owned(), took)
+    }
+
     fn echo_body(limit: usize) -> impl for<'a> Fn(&mut Request<'a>) -> Response {
+        // The same mapping `HttpServer::read_body` makes, so what these tests
+        // see on the wire is what a client would.
         move |request: &mut Request| match request.read_body(limit) {
             Ok(body) => Response::new(200).with_body("text/plain", body.into_bytes()),
             Err(BodyError::TooLarge) => Response::new(413)
                 .with_body("text/plain", b"too large".to_vec())
+                .closing(),
+            Err(BodyError::TimedOut) => Response::new(408)
+                .with_body("text/plain", b"too slow".to_vec())
                 .closing(),
             Err(_) => Response::new(400).with_body("text/plain", b"bad body".to_vec()),
         }
@@ -1798,6 +2175,185 @@ mod tests {
         wire.extend_from_slice(&post("hi"));
         let answer = drive(&wire, Limits::default(), echo_body(1024));
         assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+    }
+
+    /// The budget the slowloris tests give a request, and a bound on how long
+    /// answering one that blows it may take.
+    ///
+    /// The bound is the budget plus [`LINGER_TIME`], which is what the bounded
+    /// close spends making sure the `408` arrives instead of a reset, plus
+    /// slack for a sleeping thread waking up late. What it has to stay under is
+    /// the time the peer's *whole* request would have taken - that difference
+    /// is the finding.
+    const SLOW_BUDGET: Duration = Duration::from_millis(60);
+    const SLOW_ANSWER_BY: Duration = Duration::from_millis(600);
+
+    fn slow_limits() -> Limits {
+        Limits {
+            read_timeout: SLOW_BUDGET,
+            // Deliberately enormous. Whatever cuts these connections off, it is
+            // not the idle clock: a peer that is talking is not idle.
+            idle_timeout: Duration::from_secs(120),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_head_dribbled_past_the_deadline_is_cut_off() {
+        // Slowloris, and the reason the deadline is aggregate rather than
+        // per-read. `Trickle` ignores `set_read_timeout` on purpose: it always
+        // has one more byte, always a little late, so a per-`read()` deadline
+        // is renewed forever and never fires. The only thing that can end this
+        // is a budget that does not move.
+        //
+        // 55 bytes at 20 ms is 1.1 s of peer. The budget is 60 ms.
+        let (answer, took) = drive_trickled(
+            &post("hello"),
+            0,
+            1,
+            Duration::from_millis(20),
+            slow_limits(),
+            echo_body(1024),
+        );
+
+        assert!(answer.starts_with("HTTP/1.1 408 "), "{answer}");
+        assert!(answer.contains("Connection: close"), "{answer}");
+        assert!(
+            took < SLOW_ANSWER_BY,
+            "cut off on the budget, not on the last byte: {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_dribbled_past_the_deadline_is_cut_off() {
+        // The other half, and the handoff between them. The head arrives in one
+        // segment the way a real client sends it, and the body does not - so
+        // what is being measured is the budget *surviving* `read_head` into
+        // `read_exactly`. A deadline that restarted per phase would hand a peer
+        // a fresh one for reaching the blank line.
+        //
+        // 40 body bytes at 30 ms is 1.2 s of peer, against the same 60 ms.
+        let mut wire = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\n".to_vec();
+        let head = wire.len();
+        wire.extend_from_slice(&b"x".repeat(40));
+
+        let (answer, took) = drive_trickled(
+            &wire,
+            head,
+            1,
+            Duration::from_millis(30),
+            slow_limits(),
+            echo_body(1024),
+        );
+
+        assert!(answer.starts_with("HTTP/1.1 408 "), "{answer}");
+        assert!(answer.contains("Connection: close"), "{answer}");
+        assert!(
+            took < SLOW_ANSWER_BY,
+            "cut off on the budget, not on the last byte: {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_dribbled_past_the_deadline_is_cut_off() {
+        // The third read loop, and the one with the most places to lose a
+        // deadline: `read_chunked` alternates `read_line` and `read_exactly`,
+        // and both of those used to loop *inside* themselves - where one socket
+        // timeout bounds a read rather than a line, and a peer sets the pace.
+        //
+        // 26 body bytes at 40 ms is 1 s of peer, against the same 60 ms.
+        let wire = b"POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let head = wire.len() - 26;
+
+        let (answer, took) = drive_trickled(
+            wire,
+            head,
+            1,
+            Duration::from_millis(40),
+            slow_limits(),
+            echo_body(1024),
+        );
+
+        assert!(answer.starts_with("HTTP/1.1 408 "), "{answer}");
+        assert!(
+            took < SLOW_ANSWER_BY,
+            "cut off on the budget, not on the last byte: {took:?}"
+        );
+    }
+
+    #[test]
+    fn an_idle_connection_is_not_spending_a_request_budget() {
+        // The other side of the same coin, and the reason the switch happens on
+        // the *first byte* rather than at the top of the loop. A connection
+        // sitting between requests is idle on the peer's schedule; only a
+        // request that has started runs on ours. Here the wait before the first
+        // byte is four times the whole request budget, and the request that
+        // then arrives is answered rather than refused.
+        let limits = Limits {
+            read_timeout: Duration::from_millis(25),
+            idle_timeout: Duration::from_secs(120),
+            ..Default::default()
+        };
+        let (answer, _) = drive_trickled(
+            &post("hello"),
+            0,
+            usize::MAX,
+            Duration::from_millis(100),
+            limits,
+            echo_body(1024),
+        );
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.ends_with("\r\n\r\nhello"), "{answer}");
+    }
+
+    #[test]
+    fn a_request_inside_its_budget_is_answered_normally() {
+        // The deadline is not allowed to be the reason the ordinary case works
+        // or fails. Same trickle as the tests above, a budget that fits.
+        let limits = Limits {
+            read_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let (answer, _) = drive_trickled(
+            &post("hello"),
+            0,
+            4,
+            Duration::from_millis(1),
+            limits,
+            echo_body(1024),
+        );
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.ends_with("\r\n\r\nhello"), "{answer}");
+    }
+
+    #[test]
+    fn each_request_on_a_connection_gets_its_own_budget() {
+        // A budget spent by the first request must not be charged to the
+        // second. `read_head` starts a fresh clock every time round the loop;
+        // one hoisted out of it would close a perfectly healthy keep-alive
+        // connection as soon as two slow-ish requests added up.
+        //
+        // Two 53-byte requests at 4 ms a byte: ~212 ms each, ~424 ms together,
+        // against a 400 ms budget. One clock for the connection answers the
+        // first and times out the second.
+        let mut wire = post("one");
+        wire.extend_from_slice(&post("two"));
+
+        let limits = Limits {
+            read_timeout: Duration::from_millis(400),
+            ..Default::default()
+        };
+        let (answer, _) = drive_trickled(
+            &wire,
+            0,
+            1,
+            Duration::from_millis(4),
+            limits,
+            echo_body(1024),
+        );
+        assert_eq!(answer.matches("HTTP/1.1 200 OK").count(), 2, "{answer}");
+        assert!(!answer.contains("408"), "{answer}");
     }
 
     #[test]

@@ -126,7 +126,7 @@ impl Transport for HttpTransport {
 use crate::server::{LogLevel, Server, ServerConfig, TaskContext};
 use crate::tasks::{TaskStore, random_hex_id};
 use crate::transport::OriginPolicy;
-use crate::transport::http1::{self, BodyError, Limits, Method, Request, Response};
+use crate::transport::http1::{self, BodyError, Limits, MIN_TIMEOUT, Method, Request, Response};
 use crate::types::{ASSUMED_PROTOCOL_VERSION, ClientCapabilities};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -533,19 +533,23 @@ where
 ///
 /// What a peer can make this process hold is bounded in every direction it can
 /// push: [`max_connections`](Self::max_connections) live connections, a
-/// [`read_timeout`](Self::read_timeout) on every read, an
-/// [`idle_timeout`](Self::idle_timeout) on a kept-alive connection, and
-/// [`ServerConfig::max_message_bytes`] on a body. A connection arriving when
-/// the ceiling is reached is answered `503` and closed, on a thread that is not
-/// the accept loop - because the accept loop waiting on a peer is how a
-/// saturated server becomes a deaf one.
+/// [`read_timeout`](Self::read_timeout) covering a whole request, an
+/// [`idle_timeout`](Self::idle_timeout) on a kept-alive connection between
+/// requests, and [`ServerConfig::max_message_bytes`] on a body. A connection
+/// arriving when the ceiling is reached is answered `503` and closed, on a
+/// thread that is not the accept loop - because the accept loop waiting on a
+/// peer is how a saturated server becomes a deaf one.
 ///
 /// # Exposure
 ///
-/// This is safe to expose directly. It was not always: until the deadlines
-/// above existed, a peer that declared a body and never sent it could hold a
-/// thread forever. Behind a reverse proxy, terminate TLS there and bind to
-/// loopback; in front of nothing, keep the defaults and set
+/// This is safe to expose directly. It was not always, twice: a peer that
+/// declared a body and never sent it used to hold a thread forever, and after
+/// that a peer that sent one *slowly* held a connection for as long as it cared
+/// to, because the deadline that replaced the first problem was renewed by
+/// every byte. [`read_timeout`](Self::read_timeout) is now the budget for a
+/// whole request and cannot be renewed by anything the peer sends. Behind a
+/// reverse proxy, terminate TLS there and bind to loopback; in front of
+/// nothing, keep the defaults and set
 /// [`origin_policy`](Self::origin_policy) deliberately.
 ///
 /// # Example (no auth)
@@ -653,14 +657,25 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         self.max_connections(threads)
     }
 
-    /// How long a peer may take to deliver a request head or body
-    /// (default: 30s).
+    /// How long a peer has to deliver a whole request (default: 30s).
     ///
-    /// This is the deadline that makes a half-sent request cost a connection
-    /// rather than a thread forever. It applies from the first byte of a
-    /// request line to the last byte of its body.
+    /// **This is an aggregate, not a per-read deadline.** It starts at the
+    /// first byte of the request line and covers the head *and* the body; a
+    /// request still unfinished when it runs out is answered `408` and its
+    /// connection is closed. A per-read deadline would be renewed by every byte
+    /// that arrives, which bounds a peer that has stopped talking and says
+    /// nothing at all about one that is talking slowly - and a few bytes a
+    /// second, times [`max_connections`](Self::max_connections) sockets, is a
+    /// server nobody else can reach.
+    ///
+    /// The trade is that a client on a slow enough link cannot deliver a large
+    /// body. Size this against [`ServerConfig::max_message_bytes`] and the
+    /// slowest link you intend to serve, not against a round trip.
+    ///
+    /// A zero duration is raised to 1 ms: `SO_RCVTIMEO` reads zero as *no
+    /// deadline at all*, which is the opposite of what asking for zero means.
     pub fn read_timeout(mut self, timeout: Duration) -> Self {
-        self.limits.read_timeout = timeout;
+        self.limits.read_timeout = timeout.max(MIN_TIMEOUT);
         self
     }
 
@@ -668,9 +683,15 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// (default: 2 minutes).
     ///
     /// A connection idle for longer is closed, which is what keeps a client
-    /// that opens sockets and forgets them from holding a slot each.
+    /// that opens sockets and forgets them from holding a slot each. It governs
+    /// the gap *between* requests only: the first byte of a request moves the
+    /// connection onto [`read_timeout`](Self::read_timeout), and it does not
+    /// come back until that request is answered.
+    ///
+    /// A zero duration is raised to 1 ms, for the reason on
+    /// [`read_timeout`](Self::read_timeout).
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.limits.idle_timeout = timeout;
+        self.limits.idle_timeout = timeout.max(MIN_TIMEOUT);
         self
     }
 
@@ -898,6 +919,19 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             Err(BodyError::Incomplete) => {
                 self.trace(|| "  Failed to read body: it stopped early".to_string());
                 Err(error_response(400, -32700, "Bad Request: the body ended early").closing())
+            }
+            // A peer that is still talking, just not fast enough to finish
+            // inside the budget its request started with. Worth its own status:
+            // a slow link is a thing a client can retry, and a `400` tells it
+            // to go and look for a bug in its framing instead.
+            Err(BodyError::TimedOut) => {
+                self.trace(|| "  Failed to read body: it ran out of time".to_string());
+                Err(error_response(
+                    408,
+                    -32600,
+                    "Request Timeout: the body did not arrive in time",
+                )
+                .closing())
             }
         }
     }
@@ -2575,6 +2609,114 @@ mod http_server_tests {
             started.elapsed()
         );
         drop(held);
+    }
+
+    #[test]
+    fn test_a_slowly_dribbled_request_is_cut_off_on_a_real_socket() {
+        // Slowloris, on the wire, against the claim the module doc makes. The
+        // peer below is *never silent*: it sends a byte, waits less than the
+        // deadline, and sends another - which is the whole point, because a
+        // per-`read()` deadline is renewed by every one of those bytes and
+        // never fires. Measured before the aggregate budget existed: a head
+        // dribbled at one byte per 300 ms against `read_timeout: 1s` was
+        // answered `200 OK` after 30.9 s.
+        //
+        // 512 sockets doing this is the process's whole thread budget for about
+        // four bytes a second, so the number that matters here is that it ends
+        // at all - and that it ends on our clock rather than the peer's.
+        let addr = spawn_server_bounded(4, Duration::from_millis(500));
+
+        let head = format!("POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 2\r\n\r\n");
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        let started = Instant::now();
+        // Deliberately slower than the deadline in total and faster than it per
+        // byte: 200 ms between bytes, against a 500 ms budget.
+        let mut refused = false;
+        for byte in head.as_bytes() {
+            if stream.write_all(&[*byte]).is_err() || stream.flush().is_err() {
+                refused = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+            if started.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+        }
+
+        // Whatever came back, it came back without the peer finishing, and it
+        // came back on the deadline rather than after the head.
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        let answer = String::from_utf8_lossy(&answer).into_owned();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the connection outlived its budget by {:?}",
+            started.elapsed()
+        );
+        assert!(
+            refused || status_of(&answer) == 408,
+            "a dribbled head was not cut off: {answer:?}"
+        );
+
+        // And the server is still there for everybody else.
+        let (status, _, body) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 200, "{body}");
+    }
+
+    #[test]
+    fn test_a_slowly_dribbled_body_is_cut_off_on_a_real_socket() {
+        // The same, one phase later. The head arrives in one write, so what is
+        // being measured is that reaching the blank line does not buy the peer
+        // a fresh budget - the head and the body spend one.
+        let addr = spawn_server_bounded(4, Duration::from_millis(500));
+
+        let body = PING.as_bytes();
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let started = Instant::now();
+        for byte in body {
+            if stream.write_all(&[*byte]).is_err() || stream.flush().is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+            if started.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+        }
+
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        let answer = String::from_utf8_lossy(&answer).into_owned();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the connection outlived its budget by {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            status_of(&answer),
+            408,
+            "a dribbled body was not cut off: {answer:?}"
+        );
+
+        let (status, _, body) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 200, "{body}");
     }
 
     #[test]

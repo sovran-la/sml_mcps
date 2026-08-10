@@ -162,9 +162,19 @@ Everything a peer controls has a ceiling, and each one is a knob:
 | Knob | Default | Bounds |
 |---|---|---|
 | `HttpServer::max_connections` | 512 | live connections, and so threads |
-| `HttpServer::read_timeout` | 30s | delivering a request head or body |
+| `HttpServer::read_timeout` | 30s | a whole request — head *and* body, from its first byte |
 | `HttpServer::idle_timeout` | 2m | a kept-alive connection between requests |
 | `ServerConfig::max_message_bytes` | 8 MiB | a request body |
+
+`read_timeout` is an aggregate, not a per-read deadline, and that distinction is
+the difference between bounding a peer that has *stopped* talking and bounding
+one that is talking *slowly*. A per-read deadline is renewed by every byte that
+arrives, so a request dribbled a byte at a time never meets one — and a few
+bytes a second, times `max_connections` sockets, is a server nobody else can
+reach. A request still unfinished when its budget runs out is answered `408` and
+its connection is closed. The trade is that a client on a slow enough link
+cannot deliver a large body; size this against `max_message_bytes` and the
+slowest link you intend to serve.
 
 A connection arriving when `max_connections` are already live is answered `503`
 and closed — by a thread of its own, never the accept loop. A body over the
