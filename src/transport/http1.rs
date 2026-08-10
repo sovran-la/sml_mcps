@@ -2400,6 +2400,54 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
     }
 
+    #[test]
+    fn a_few_leading_blank_lines_are_ignored_and_a_flood_is_not() {
+        // RFC 9112 §2.2 asks a recipient to ignore "at least one" empty line
+        // before a request line. Ignoring a *few* is politeness; the ceiling is
+        // where politeness stops.
+        let mut wire = b"\r\n".repeat(MAX_LEADING_BLANK_LINES);
+        wire.extend_from_slice(&post("hi"));
+        let answer = drive(&wire, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+
+        let mut wire = b"\r\n".repeat(MAX_LEADING_BLANK_LINES + 1);
+        wire.extend_from_slice(&post("hi"));
+        let answer = drive(&wire, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+        assert!(answer.contains("more empty lines"), "{answer}");
+
+        // Bare LFs count too. `httparse::skip_empty_lines` takes either, so a
+        // ceiling that only saw CRLF would be one `\n` wide.
+        let mut wire = b"\n".repeat(MAX_LEADING_BLANK_LINES + 1);
+        wire.extend_from_slice(&post("hi"));
+        let answer = drive(&wire, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+    }
+
+    #[test]
+    fn a_flood_of_leading_blank_lines_is_not_a_cpu_bill() {
+        // The reason for the ceiling, and the measurement it was written
+        // against. `read_head` hands the whole accumulator to `httparse` again
+        // on every round that ends a line, and every `\r\n` ends one - so a
+        // peer dribbling 32 KiB of them forces ~16k parses of an average 16 KiB
+        // buffer. Measured here, same build, same machine: **1.07 s** of CPU
+        // for 32 KiB of traffic, ending in a `431`. The peer picks the size.
+        // Bounded, the same bytes cost 5.6 ms and end on the ninth line.
+        //
+        // A `Dribble` rather than a `Fake`, because the quadratic term is the
+        // number of *rounds*, and a `Fake` delivers everything in one.
+        let wire = b"\r\n".repeat(16 * 1024);
+        let started = Instant::now();
+        let answer = drive_dribbled(&wire, 1, Limits::default(), echo_body(1024));
+        let took = started.elapsed();
+
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+        assert!(
+            took < Duration::from_millis(50),
+            "32 KiB of blank lines cost {took:?}"
+        );
+    }
+
     /// The budget the slowloris tests give a request, and a bound on how long
     /// answering one that blows it may take.
     ///
