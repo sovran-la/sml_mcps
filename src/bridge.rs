@@ -21,10 +21,12 @@
 //!
 //! Unix-only: gated behind `#[cfg(unix)]`.
 
+use crate::server::{error_id, is_malformed};
 use crate::transport::{Transport, UnixTransport, pid_path_for};
-use crate::types::{McpError, Result};
+use crate::types::{JsonRpcMessage, McpError, Result};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -103,28 +105,33 @@ impl Bridge {
         let mut client = client;
         let mut upstream = upstream;
 
-        let mut client_writer = client.try_clone_writer().ok_or_else(|| {
+        // Shared, because each direction answers unreadable input on the sink
+        // the *other* direction owns.
+        let client_sink = SharedWriter::new(client.try_clone_writer().ok_or_else(|| {
             McpError::Internal("client transport cannot be split for proxying".into())
-        })?;
-        let upstream_writer = upstream.try_clone_writer().ok_or_else(|| {
+        })?);
+        let upstream_sink = SharedWriter::new(upstream.try_clone_writer().ok_or_else(|| {
             McpError::Internal("upstream transport cannot be split for proxying".into())
-        })?;
+        })?);
 
         // client -> upstream (requests). Detached: ends when the client hits
         // EOF, at which point it half-closes the upstream so the daemon can
         // finish up. If the daemon vanished while the client is still talking,
         // this thread outlives `run` and dies when the process exits.
+        let mut to_upstream = upstream_sink.clone();
+        let mut to_client = client_sink.clone();
         let _c2u = thread::spawn(move || {
-            let mut writer = upstream_writer;
-            let _ = pump(&mut client, writer.as_mut());
-            let _ = writer.close_write();
+            let _ = pump(&mut client, &mut to_upstream, &mut to_client);
+            let _ = to_upstream.close_write();
         });
 
         // upstream -> client (responses). Joined: its completion means the
         // upstream connection has drained and closed - the definitive
         // end-of-session signal.
-        let result = pump(&mut upstream, client_writer.as_mut());
-        let _ = client_writer.close_write();
+        let mut to_client = client_sink;
+        let mut to_upstream = upstream_sink;
+        let result = pump(&mut upstream, &mut to_client, &mut to_upstream);
+        let _ = to_client.close_write();
         result
     }
 
@@ -143,12 +150,78 @@ impl Bridge {
     }
 }
 
+/// A write sink both pump directions can reach.
+///
+/// One lock per sink keeps two threads from interleaving halves of two
+/// messages into one unparseable line - the same invariant
+/// `Server::write_message` maintains now that task workers write too.
+#[derive(Clone)]
+struct SharedWriter(Arc<Mutex<Box<dyn Transport>>>);
+
+impl SharedWriter {
+    fn new(writer: Box<dyn Transport>) -> Self {
+        Self(Arc::new(Mutex::new(writer)))
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut dyn Transport) -> Result<T>) -> Result<T> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| McpError::Internal("Bridge writer lock poisoned".into()))?;
+        f(guard.as_mut())
+    }
+}
+
+impl Transport for SharedWriter {
+    /// Write-only by construction: the reads belong to the two owned handles.
+    fn read(&mut self) -> Result<JsonRpcMessage> {
+        Err(McpError::Internal(
+            "a bridge write handle cannot be read from".into(),
+        ))
+    }
+
+    fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
+        self.with(|writer| writer.write(message))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.with(|writer| writer.close())
+    }
+
+    fn close_write(&mut self) -> Result<()> {
+        self.with(|writer| writer.close_write())
+    }
+}
+
 /// Forward every message from `reader` to `writer` until end-of-stream.
-fn pump(reader: &mut dyn Transport, writer: &mut dyn Transport) -> Result<()> {
+///
+/// `back` is the way home to whoever sent the unreadable thing: a message the
+/// shim cannot parse is answered with a JSON-RPC error on the reader's own side
+/// and the pump continues, exactly as the server does. Tearing down instead
+/// meant one malformed line from the client half-closed the upstream, the
+/// daemon saw EOF, the response pump ended, and `Bridge::run` returned
+/// `Ok(())` - the session gone, with no error written and no diagnostic. The
+/// 8 MiB frame cap gave that the same trigger for a *legitimate* message the
+/// shim used to forward verbatim.
+///
+/// Teardown is reserved for the connection actually failing.
+fn pump(
+    reader: &mut dyn Transport,
+    writer: &mut dyn Transport,
+    back: &mut dyn Transport,
+) -> Result<()> {
     loop {
         match reader.read() {
             Ok(msg) => writer.write(&msg)?,
             Err(McpError::TransportClosed) => return Ok(()),
+            Err(e) if is_malformed(&e) => {
+                let answer = JsonRpcMessage::error(error_id(&e), e.to_jsonrpc_error());
+                // A shim that cannot even report the problem has lost the
+                // connection it would report it on; let the next read say so.
+                if back.write(&answer).is_err() {
+                    return Ok(());
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -483,6 +556,134 @@ mod tests {
         drop(daemon);
         let joined = bridge.join().unwrap();
         assert!(joined.is_ok());
+    }
+
+    #[test]
+    fn test_a_malformed_message_is_answered_and_the_shim_carries_on() {
+        // C1 taught the server to answer unreadable input and keep going; the
+        // shim in front of it was not taught the same thing. One malformed line
+        // ended the request pump, which half-closed the upstream, which made
+        // the daemon EOF, which ended the response pump - so `run` returned
+        // `Ok(())` with the session gone, nothing written, and no diagnostic.
+        let (client_bridge, client_peer) = UnixStream::pair().unwrap();
+        let (upstream_bridge, upstream_peer) = UnixStream::pair().unwrap();
+
+        let daemon = thread::spawn(move || {
+            let mut d = UnixTransport::from_stream(upstream_peer);
+            while let Ok(JsonRpcMessage::Request(req)) = d.read() {
+                d.write(&JsonRpcMessage::response(req.id, serde_json::json!({})))
+                    .unwrap();
+            }
+        });
+
+        let bridge = thread::spawn(move || {
+            Bridge::run(
+                UnixTransport::from_stream(client_bridge),
+                UnixTransport::from_stream(upstream_bridge),
+            )
+        });
+
+        let mut raw = client_peer.try_clone().unwrap();
+        let mut client = UnixTransport::from_stream(client_peer);
+
+        client
+            .write(&JsonRpcMessage::request(1i64, "ping", None))
+            .unwrap();
+        assert!(matches!(
+            client.read().unwrap(),
+            JsonRpcMessage::Response(_)
+        ));
+
+        // Garbage in. The answer comes back from the shim itself.
+        {
+            use std::io::Write;
+            raw.write_all(b"{not json\n").unwrap();
+            raw.flush().unwrap();
+        }
+        let JsonRpcMessage::Response(answered) = client.read().unwrap() else {
+            panic!("the shim must answer, not hang up");
+        };
+        assert_eq!(answered.error.unwrap().code, -32700);
+
+        // And the session is still usable, which is the whole point.
+        client
+            .write(&JsonRpcMessage::request(2i64, "ping", None))
+            .unwrap();
+        let JsonRpcMessage::Response(second) = client.read().unwrap() else {
+            panic!("expected a response");
+        };
+        assert_eq!(second.id, RequestId::Number(2));
+
+        drop(client);
+        drop(raw);
+        let _ = bridge.join().unwrap();
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn test_an_oversized_message_does_not_kill_the_shim() {
+        // S9's 8 MiB cap silently changed the bridge's contract: a message the
+        // shim used to forward verbatim now surfaces as `InvalidMessage`, which
+        // was fatal. It must be answerable like any other unreadable input.
+        let (client_bridge, client_peer) = UnixStream::pair().unwrap();
+        let (upstream_bridge, upstream_peer) = UnixStream::pair().unwrap();
+
+        let daemon = thread::spawn(move || {
+            let mut d = UnixTransport::from_stream(upstream_peer);
+            while let Ok(JsonRpcMessage::Request(req)) = d.read() {
+                d.write(&JsonRpcMessage::response(req.id, serde_json::json!({})))
+                    .unwrap();
+            }
+        });
+
+        let mut client_transport = UnixTransport::from_stream(client_bridge);
+        // A small ceiling, so the test does not have to push 8 MiB to make the
+        // point.
+        client_transport.set_max_message_bytes(256);
+
+        let bridge = thread::spawn(move || {
+            Bridge::run(
+                client_transport,
+                UnixTransport::from_stream(upstream_bridge),
+            )
+        });
+
+        let mut raw = client_peer.try_clone().unwrap();
+        let mut client = UnixTransport::from_stream(client_peer);
+
+        {
+            use std::io::Write;
+            let huge = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "big": "x".repeat(1024) },
+            });
+            raw.write_all(huge.to_string().as_bytes()).unwrap();
+            raw.write_all(b"\n").unwrap();
+            raw.flush().unwrap();
+        }
+
+        let JsonRpcMessage::Response(answered) = client.read().unwrap() else {
+            panic!("the shim must answer, not hang up");
+        };
+        let error = answered.error.unwrap();
+        assert_eq!(error.code, -32600);
+        assert!(error.message.contains("256 byte limit"), "{error:?}");
+
+        // Still alive.
+        client
+            .write(&JsonRpcMessage::request(2i64, "ping", None))
+            .unwrap();
+        assert!(matches!(
+            client.read().unwrap(),
+            JsonRpcMessage::Response(_)
+        ));
+
+        drop(client);
+        drop(raw);
+        let _ = bridge.join().unwrap();
+        daemon.join().unwrap();
     }
 
     #[test]

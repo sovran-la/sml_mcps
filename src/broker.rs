@@ -50,12 +50,35 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 /// oldest only costs one parked response.
 const MAX_ABANDONED: usize = 64;
 
+/// How many parked responses to keep.
+///
+/// A parked response is one a waiter further down the call stack will collect
+/// on its way back up, so at any moment there are as many useful entries as
+/// there are nested waiters - single digits, and in practice one. Keeping more
+/// than a handful buys nothing, and keeping them all is a remote OOM: every
+/// response a peer sends before the server has asked anything is unmatched by
+/// construction, so a client can park arbitrarily large values, arbitrarily
+/// many times, before the handshake.
+const MAX_PARKED: usize = 16;
+
+/// How many client-originated messages to hold for the main loop.
+///
+/// The queue only grows while something blocks the loop - a `tasks/result` on a
+/// task with a client-chosen TTL, or a server-initiated round trip - and it
+/// drains one message per iteration once that clears. Both windows are long
+/// enough (an hour, two minutes) for a client to fill memory with well-formed
+/// requests, so the queue has a ceiling and says so rather than growing.
+const MAX_DEFERRED: usize = 256;
+
 /// Routing state shared between the server loop and in-flight waiters.
 #[derive(Debug, Default)]
 pub(crate) struct RequestBroker {
     next_id: AtomicU64,
-    /// Responses that arrived while someone else was reading.
-    parked: Mutex<HashMap<RequestId, JsonRpcResponse>>,
+    /// Responses that arrived while someone else was reading, oldest first.
+    ///
+    /// A queue rather than a map: it is never more than [`MAX_PARKED`] long, so
+    /// a scan is free, and insertion order is what eviction needs.
+    parked: Mutex<VecDeque<JsonRpcResponse>>,
     /// Client-originated messages read by a waiter, owed back to the main loop.
     deferred: Mutex<VecDeque<JsonRpcMessage>>,
     /// Requests nobody is waiting for any more, newest last.
@@ -87,7 +110,25 @@ impl RequestBroker {
 
     /// Take a previously parked response for `id`, if one arrived.
     pub(crate) fn take_parked(&self, id: &RequestId) -> Option<JsonRpcResponse> {
-        self.parked.lock().ok()?.remove(id)
+        let mut parked = self.parked.lock().ok()?;
+        let at = parked.iter().position(|response| &response.id == id)?;
+        parked.remove(at)
+    }
+
+    /// Is `id` one this broker handed out?
+    ///
+    /// Server-initiated ids are `sml-N` for an `N` this counter has already
+    /// issued, and [`next_request_id`](Self::next_request_id) never reuses one.
+    /// Anything else is an answer to a request the server never sent - a
+    /// client's own id echoed back, or noise - and there is no waiter it could
+    /// ever belong to.
+    fn was_issued_here(&self, id: &RequestId) -> bool {
+        let RequestId::String(text) = id else {
+            return false;
+        };
+        text.strip_prefix("sml-")
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| n < self.next_id.load(Ordering::Relaxed))
     }
 
     /// Register a waiter that is not on the reading thread.
@@ -128,22 +169,43 @@ impl RequestBroker {
 
     /// Park a response nobody is currently waiting on this call stack for.
     ///
-    /// A response to a request that has since been abandoned is dropped: its
-    /// waiter gave up, so parking it would only fill the map with answers
-    /// nobody will ever collect.
+    /// Two things are dropped rather than kept:
+    ///
+    /// - a response to an id this broker never issued. Nothing can ever wait
+    ///   for it, so it is garbage by construction - and *every* response is
+    ///   garbage by construction until the server asks its first question,
+    ///   which is what made an unbounded map a pre-handshake remote OOM.
+    /// - a response to a request that has since been abandoned: its waiter gave
+    ///   up, so parking it would only fill the queue with answers nobody will
+    ///   ever collect.
+    ///
+    /// What survives both is bounded at [`MAX_PARKED`], oldest evicted first.
     pub(crate) fn park(&self, response: JsonRpcResponse) {
+        if !self.was_issued_here(&response.id) {
+            return;
+        }
         if self.forget_abandoned(&response.id) {
             return;
         }
         if let Ok(mut parked) = self.parked.lock() {
-            parked.insert(response.id.clone(), response);
+            // Ids are never reused, so a duplicate is a peer answering twice.
+            // The newer answer replaces the older in place rather than queuing
+            // behind it, since `take_parked` would only ever return the first.
+            if let Some(at) = parked.iter().position(|known| known.id == response.id) {
+                parked[at] = response;
+                return;
+            }
+            parked.push_back(response);
+            while parked.len() > MAX_PARKED {
+                parked.pop_front();
+            }
         }
     }
 
     /// Stop waiting for `id`, so a late response to it is discarded.
     pub(crate) fn abandon(&self, id: &RequestId) {
         if let Ok(mut parked) = self.parked.lock() {
-            parked.remove(id);
+            parked.retain(|response| &response.id != id);
         }
         if let Ok(mut waiters) = self.waiters.lock() {
             waiters.remove(id);
@@ -171,10 +233,22 @@ impl RequestBroker {
     }
 
     /// Set aside a client-originated message for the main loop.
-    pub(crate) fn defer(&self, message: JsonRpcMessage) {
-        if let Ok(mut deferred) = self.deferred.lock() {
-            deferred.push_back(message);
+    ///
+    /// Hands the message back as `Err` when there is no room for it, so the
+    /// caller can tell the client rather than lose the request silently. The
+    /// message refused is the *newest* - shedding at the door keeps whatever is
+    /// already queued moving in arrival order, and gives the client the
+    /// backpressure signal immediately instead of after an hour of queueing.
+    #[allow(clippy::result_large_err)] // The `Err` *is* the message handed back.
+    pub(crate) fn defer(&self, message: JsonRpcMessage) -> std::result::Result<(), JsonRpcMessage> {
+        let Ok(mut deferred) = self.deferred.lock() else {
+            return Err(message);
+        };
+        if deferred.len() >= MAX_DEFERRED {
+            return Err(message);
         }
+        deferred.push_back(message);
+        Ok(())
     }
 
     /// Take the next message the main loop still owes itself, if any.
@@ -183,6 +257,18 @@ impl RequestBroker {
     /// a tool was awaiting a response are handled in arrival order.
     pub(crate) fn next_deferred(&self) -> Option<JsonRpcMessage> {
         self.deferred.lock().ok()?.pop_front()
+    }
+
+    /// How many off-thread waiters are registered.
+    ///
+    /// Every one of them is a `SyncSender` held until its response arrives, so
+    /// "did that exit path clean up?" is a question worth being able to ask.
+    #[cfg(test)]
+    pub(crate) fn waiter_count(&self) -> usize {
+        self.waiters
+            .lock()
+            .map(|waiters| waiters.len())
+            .unwrap_or(0)
     }
 
     /// Turn a client's response into the result value, or the error it carried.
@@ -213,6 +299,16 @@ mod tests {
         }
     }
 
+    /// A broker that has already handed out `count` ids, so `sml-0` through
+    /// `sml-{count-1}` are answers it might legitimately receive.
+    fn broker_awaiting(count: usize) -> RequestBroker {
+        let broker = RequestBroker::new();
+        for _ in 0..count {
+            broker.next_request_id();
+        }
+        broker
+    }
+
     #[test]
     fn request_ids_are_unique_and_prefixed() {
         let broker = RequestBroker::new();
@@ -238,7 +334,7 @@ mod tests {
 
     #[test]
     fn parked_responses_round_trip_once() {
-        let broker = RequestBroker::new();
+        let broker = broker_awaiting(1);
         let id = RequestId::String("sml-0".into());
 
         assert!(broker.take_parked(&id).is_none());
@@ -251,7 +347,7 @@ mod tests {
 
     #[test]
     fn parked_responses_are_keyed_by_id() {
-        let broker = RequestBroker::new();
+        let broker = broker_awaiting(2);
         broker.park(response("sml-0"));
         broker.park(response("sml-1"));
 
@@ -275,8 +371,12 @@ mod tests {
     #[test]
     fn deferred_messages_replay_in_arrival_order() {
         let broker = RequestBroker::new();
-        broker.defer(JsonRpcMessage::notification("a", None));
-        broker.defer(JsonRpcMessage::notification("b", None));
+        broker
+            .defer(JsonRpcMessage::notification("a", None))
+            .unwrap();
+        broker
+            .defer(JsonRpcMessage::notification("b", None))
+            .unwrap();
 
         let JsonRpcMessage::Notification(first) = broker.next_deferred().unwrap() else {
             panic!("expected notification");
@@ -292,7 +392,7 @@ mod tests {
 
     #[test]
     fn an_abandoned_response_is_dropped_rather_than_parked() {
-        let broker = RequestBroker::new();
+        let broker = broker_awaiting(1);
         let id = RequestId::String("sml-0".into());
 
         broker.abandon(&id);
@@ -308,7 +408,7 @@ mod tests {
     fn abandoning_discards_a_response_that_already_arrived() {
         // The race that motivates this: the response lands between the waiter
         // deciding it has waited long enough and it saying so.
-        let broker = RequestBroker::new();
+        let broker = broker_awaiting(1);
         let id = RequestId::String("sml-0".into());
 
         broker.park(response("sml-0"));
@@ -319,7 +419,7 @@ mod tests {
 
     #[test]
     fn abandoning_one_request_does_not_affect_another() {
-        let broker = RequestBroker::new();
+        let broker = broker_awaiting(2);
         broker.abandon(&RequestId::String("sml-0".into()));
 
         broker.park(response("sml-1"));
@@ -334,7 +434,7 @@ mod tests {
     fn an_abandoned_id_is_only_honored_once() {
         // Ids are never reused, so this is theoretical - but a stale entry that
         // swallowed a *later* response would be a genuinely confusing bug.
-        let broker = RequestBroker::new();
+        let broker = broker_awaiting(1);
         let id = RequestId::String("sml-0".into());
 
         broker.abandon(&id);
@@ -345,9 +445,128 @@ mod tests {
     }
 
     #[test]
+    fn a_response_to_an_id_the_server_never_issued_is_not_parked() {
+        // The remote OOM: before the server asks its first question there is no
+        // id it could be answering, so every response a peer sends is garbage.
+        // Parking them was unbounded - ~48 messages of 8 MiB reached a
+        // gigabyte, and the server kept answering pings throughout.
+        let broker = RequestBroker::new();
+
+        broker.park(response("sml-0")); // never issued
+        broker.park(response("client-made-this-up"));
+        broker.park(JsonRpcResponse {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(7),
+            result: Some(serde_json::json!({})),
+            error: None,
+        });
+
+        assert_eq!(broker.parked.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_response_to_an_id_beyond_the_counter_is_not_parked() {
+        // Well-formed prefix, plausible shape, but the server has only issued
+        // `sml-0` - so `sml-999` answers nothing.
+        let broker = broker_awaiting(1);
+
+        broker.park(response("sml-999"));
+
+        assert!(
+            broker
+                .take_parked(&RequestId::String("sml-999".into()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_parked_queue_stays_bounded() {
+        // Even ids the server did issue cannot accumulate without limit: a
+        // client that answers every request twice, or a server whose waiters
+        // all timed out, must not grow this forever.
+        let broker = broker_awaiting(MAX_PARKED * 4);
+        for i in 0..(MAX_PARKED * 4) {
+            broker.park(response(&format!("sml-{i}")));
+        }
+
+        assert_eq!(broker.parked.lock().unwrap().len(), MAX_PARKED);
+
+        // The newest survive; the oldest were evicted to make room.
+        assert!(
+            broker
+                .take_parked(&RequestId::String("sml-0".into()))
+                .is_none()
+        );
+        let newest = format!("sml-{}", MAX_PARKED * 4 - 1);
+        assert!(broker.take_parked(&RequestId::String(newest)).is_some());
+    }
+
+    #[test]
+    fn a_repeated_answer_replaces_rather_than_accumulates() {
+        // Two answers to one id are one entry, not two - otherwise a peer that
+        // answers in a loop fills the queue with duplicates of a single id and
+        // evicts every other waiter's response.
+        let broker = broker_awaiting(2);
+        for _ in 0..100 {
+            broker.park(response("sml-0"));
+        }
+        broker.park(response("sml-1"));
+
+        assert_eq!(broker.parked.lock().unwrap().len(), 2);
+        assert!(
+            broker
+                .take_parked(&RequestId::String("sml-1".into()))
+                .is_some(),
+            "the other waiter's answer survived the flood"
+        );
+    }
+
+    #[test]
+    fn the_deferred_queue_stays_bounded_and_says_so() {
+        // While `tasks/result` blocks, everything the client sends is deferred
+        // to a loop that cannot run. That window is up to an hour, so the queue
+        // has to have an end - and refusing loudly is what lets the server
+        // answer `-32603 overloaded` instead of dropping the request.
+        let broker = RequestBroker::new();
+        for i in 0..MAX_DEFERRED {
+            broker
+                .defer(JsonRpcMessage::request(i as i64, "ping", None))
+                .expect("under the ceiling");
+        }
+
+        let refused = broker
+            .defer(JsonRpcMessage::request(9999i64, "ping", None))
+            .expect_err("the queue is full");
+
+        // What comes back is the message that could not be queued, so the
+        // caller knows which request to answer.
+        let JsonRpcMessage::Request(request) = refused else {
+            panic!("expected the request back");
+        };
+        assert_eq!(request.id, RequestId::Number(9999));
+        assert_eq!(broker.deferred.lock().unwrap().len(), MAX_DEFERRED);
+    }
+
+    #[test]
+    fn a_full_deferred_queue_still_replays_what_it_accepted() {
+        // Shedding the newest keeps the queue a FIFO: nothing already accepted
+        // is lost to make room for something newer.
+        let broker = RequestBroker::new();
+        for i in 0..MAX_DEFERRED {
+            let _ = broker.defer(JsonRpcMessage::request(i as i64, "ping", None));
+        }
+        let _ = broker.defer(JsonRpcMessage::request(9999i64, "ping", None));
+
+        let JsonRpcMessage::Request(first) = broker.next_deferred().unwrap() else {
+            panic!("expected a request");
+        };
+        assert_eq!(first.id, RequestId::Number(0));
+    }
+
+    #[test]
     fn the_abandoned_list_stays_bounded() {
         // A client that answers nothing must not grow this without limit.
-        let broker = RequestBroker::new();
+        let broker = broker_awaiting(MAX_ABANDONED * 4);
         for i in 0..(MAX_ABANDONED * 4) {
             broker.abandon(&RequestId::String(format!("sml-{i}")));
         }

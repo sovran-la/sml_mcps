@@ -15,6 +15,7 @@ mod unix;
 #[cfg(unix)]
 mod unix_server;
 
+pub use line::MAX_MESSAGE_BYTES;
 pub use origin::OriginPolicy;
 pub use stdio::StdioTransport;
 
@@ -96,6 +97,22 @@ pub trait Transport: Send + Sync {
         let _ = timeout;
         Ok(false)
     }
+
+    /// Bound how many bytes one incoming message may occupy.
+    ///
+    /// A message over the limit is reported as
+    /// [`McpError::InvalidMessage`](crate::McpError::InvalidMessage) and the
+    /// framing resynchronizes, so the connection survives an oversized message
+    /// rather than dying with it.
+    ///
+    /// [`Server`](crate::Server) pushes
+    /// [`ServerConfig::max_message_bytes`](crate::ServerConfig::max_message_bytes)
+    /// down through this, which is what makes the knob real for a transport the
+    /// caller constructed. Default: ignored, for transports whose framing is
+    /// bounded by something else (HTTP's `Content-Length`, say).
+    fn set_max_message_bytes(&mut self, max: usize) {
+        let _ = max;
+    }
 }
 
 /// A boxed transport is a transport.
@@ -127,5 +144,9 @@ impl Transport for Box<dyn Transport> {
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<bool> {
         (**self).set_read_timeout(timeout)
+    }
+
+    fn set_max_message_bytes(&mut self, max: usize) {
+        (**self).set_max_message_bytes(max)
     }
 }

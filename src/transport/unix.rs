@@ -133,6 +133,10 @@ impl Transport for UnixTransport {
         self.read_timeout = timeout;
         Ok(true)
     }
+
+    fn set_max_message_bytes(&mut self, max: usize) {
+        self.reader.set_limit(max);
+    }
 }
 
 #[cfg(test)]

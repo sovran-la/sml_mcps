@@ -36,7 +36,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::types::{JsonRpcError, McpError, Result};
 
@@ -176,8 +176,22 @@ pub struct TaskConfig {
     pub max_ttl_ms: u64,
     /// Polling interval suggested to requestors (default: 1s).
     pub poll_interval_ms: u64,
-    /// Ceiling on simultaneously running tasks (default: 16).
+    /// Ceiling on simultaneously running tasks, **per requestor**
+    /// (default: 16).
+    ///
+    /// tasks §Resource Management asks receivers to "Enforce limits on
+    /// concurrent tasks per requestor". Counting the whole store instead let
+    /// one tenant on a shared store fill every slot and deny all the others.
     pub max_concurrent: usize,
+    /// Ceiling on retained task records of any status (default: 1024).
+    ///
+    /// [`max_concurrent`](Self::max_concurrent) only counts tasks still
+    /// running, so a client creating instantly-completing tasks is limited by
+    /// nothing but its own request rate: each finished task holds its full
+    /// `CallToolResult` for up to its TTL. Terminal records are evicted oldest
+    /// first to make room; a store full of *running* tasks refuses instead,
+    /// since discarding those would lose work in progress.
+    pub max_records: usize,
 }
 
 impl Default for TaskConfig {
@@ -187,6 +201,7 @@ impl Default for TaskConfig {
             max_ttl_ms: 3_600_000,
             poll_interval_ms: 1_000,
             max_concurrent: 16,
+            max_records: 1_024,
         }
     }
 }
@@ -288,6 +303,37 @@ impl TaskStore {
         tasks.retain(|_, record| !record.expired(now));
     }
 
+    /// Evict finished tasks until there is room for one more record.
+    ///
+    /// A record that has reached a terminal status is still holding its whole
+    /// result until its TTL elapses, and nothing but the client's request rate
+    /// bounds how many of those pile up - `max_concurrent` counts only the ones
+    /// still running. Oldest goes first, so what a client is likeliest to still
+    /// want to collect is what survives.
+    fn make_room(tasks: &mut HashMap<String, TaskRecord>, max_records: usize) -> Result<()> {
+        while tasks.len() >= max_records.max(1) {
+            let oldest = tasks
+                .iter()
+                .filter(|(_, record)| record.task.status.is_terminal())
+                .min_by_key(|(id, record)| (record.created, (*id).clone()))
+                .map(|(id, _)| id.clone());
+
+            match oldest {
+                Some(id) => {
+                    tasks.remove(&id);
+                }
+                // Everything left is still running, and dropping a running task
+                // would abandon work the client is waiting on.
+                None => {
+                    return Err(McpError::Internal(format!(
+                        "the task store is full ({max_records} records)"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// How many tasks are currently running.
     pub fn running(&self) -> Result<usize> {
         let mut tasks = self.lock()?;
@@ -311,9 +357,14 @@ impl TaskStore {
         let mut tasks = self.lock()?;
         Self::sweep(&mut tasks, now);
 
+        // Counted for this requestor alone: on a store shared between tenants -
+        // which is what HTTP has - a store-wide count lets whoever gets there
+        // first lock everyone else out.
+        let requestor = owner.as_deref();
         let running = tasks
             .values()
             .filter(|record| !record.task.status.is_terminal())
+            .filter(|record| record.belongs_to(requestor))
             .count();
         if running >= self.config.max_concurrent {
             return Err(McpError::Internal(format!(
@@ -321,6 +372,8 @@ impl TaskStore {
                 running, self.config.max_concurrent
             )));
         }
+
+        Self::make_room(&mut tasks, self.config.max_records)?;
 
         // Receivers MAY override the requested ttl; we clamp rather than
         // reject, so a greedy request degrades instead of failing.
@@ -542,13 +595,24 @@ impl TaskStore {
     /// is used only where the transport cannot be pumped; see
     /// [`try_result`](Self::try_result).
     ///
-    /// The wait is bounded by the task's TTL. Nothing signals an expiry - it is
-    /// noticed by sweeping - so waiting on the condvar alone would sleep past
-    /// the deadline of a task that stopped making progress and never wake.
-    pub fn await_result(&self, task_id: &str, requestor: Requestor<'_>) -> Result<TaskOutcome> {
+    /// Two things bound the wait. The task's TTL, because nothing signals an
+    /// expiry - it is noticed by sweeping - so waiting on the condvar alone
+    /// would sleep past the deadline of a task that stopped making progress and
+    /// never wake. And `patience`, because the TTL is client-chosen and up to
+    /// an hour: on HTTP this call holds a connection and a worker thread the
+    /// whole time, so an unbounded wait is a denial of service one well-formed
+    /// request long. Running out of patience is [`McpError::Timeout`], which a
+    /// client can tell from a real failure and retry after polling.
+    pub fn await_result(
+        &self,
+        task_id: &str,
+        requestor: Requestor<'_>,
+        patience: Option<Duration>,
+    ) -> Result<TaskOutcome> {
         /// How often to look up from the condvar and re-sweep.
         const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
+        let deadline = patience.map(|p| Instant::now() + p);
         let mut tasks = self.lock()?;
 
         loop {
@@ -564,9 +628,23 @@ impl TaskStore {
                 });
             }
 
+            let slice = match deadline {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(McpError::Timeout(format!(
+                            "task {task_id} is still running; poll `tasks/get` and \
+                             call `tasks/result` again"
+                        )));
+                    }
+                    left.min(SWEEP_INTERVAL)
+                }
+                None => SWEEP_INTERVAL,
+            };
+
             tasks = self
                 .changed
-                .wait_timeout(tasks, SWEEP_INTERVAL)
+                .wait_timeout(tasks, slice)
                 .map_err(|_| McpError::Internal("Task store lock poisoned".into()))?
                 .0;
         }
@@ -849,6 +927,140 @@ mod tests {
     }
 
     #[test]
+    fn concurrency_is_bounded_per_requestor_not_per_store() {
+        // "Enforce limits on concurrent tasks per requestor." On the shared
+        // store HTTP uses, a store-wide count let whichever tenant got there
+        // first take every slot and deny all the others.
+        let store = TaskStore::new(TaskConfig {
+            max_concurrent: 2,
+            ..Default::default()
+        });
+
+        let alice = Some("alice".to_string());
+        let bob = Some("bob".to_string());
+
+        store.create(None, alice.clone()).unwrap();
+        store.create(None, alice.clone()).unwrap();
+        assert!(
+            store.create(None, alice).is_err(),
+            "alice has used her own allowance"
+        );
+
+        assert!(
+            store.create(None, bob.clone()).is_ok(),
+            "bob's allowance is his own"
+        );
+        assert!(store.create(None, bob.clone()).is_ok());
+        assert!(store.create(None, bob).is_err());
+    }
+
+    #[test]
+    fn finished_tasks_do_not_accumulate_without_limit() {
+        // `max_concurrent` counts only running tasks, so a client creating
+        // instantly-completing tasks was bounded by nothing but its own request
+        // rate - and each record holds its whole result until its TTL.
+        let store = TaskStore::new(TaskConfig {
+            max_records: 4,
+            ..Default::default()
+        });
+
+        let mut ids = Vec::new();
+        for _ in 0..20 {
+            let (task, _) = store.create(None, None).unwrap();
+            store
+                .finish(
+                    &task.task_id,
+                    TaskStatus::Completed,
+                    TaskOutcome::Value(serde_json::json!({ "big": "x".repeat(1024) })),
+                )
+                .unwrap();
+            ids.push(task.task_id);
+        }
+
+        assert!(store.lock().unwrap().len() <= 4, "the store has a ceiling");
+        // The newest survive: they are what a client is still likely to fetch.
+        assert!(store.get(ids.last().unwrap(), None).is_ok());
+        assert!(store.get(&ids[0], None).is_err());
+    }
+
+    #[test]
+    fn a_store_full_of_running_tasks_refuses_rather_than_discarding_work() {
+        // Eviction only ever takes finished records. Dropping a running one
+        // would abandon work a client is actively waiting on.
+        let store = TaskStore::new(TaskConfig {
+            max_records: 3,
+            max_concurrent: 100,
+            ..Default::default()
+        });
+
+        for _ in 0..3 {
+            store.create(None, None).unwrap();
+        }
+        let error = store.create(None, None).unwrap_err();
+
+        assert!(error.to_string().contains("full"), "{error}");
+    }
+
+    #[test]
+    fn awaiting_a_result_gives_up_when_it_runs_out_of_patience() {
+        // On a transport that cannot be pumped, this call holds a connection
+        // and a worker thread, and the natural bound is the task's TTL:
+        // client-chosen, an hour by default. One request would be a denial of
+        // service against every other client.
+        let store = store();
+        let (task, _) = store.create(None, None).unwrap();
+
+        let started = Instant::now();
+        let error = store
+            .await_result(&task.task_id, None, Some(Duration::from_millis(150)))
+            .unwrap_err();
+
+        assert!(
+            matches!(error, McpError::Timeout(_)),
+            "a client that is told to poll can poll: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it gave up promptly"
+        );
+        assert_eq!(
+            error.to_jsonrpc_error().data.unwrap()["reason"],
+            crate::types::TIMEOUT_REASON
+        );
+
+        // The task itself is untouched, and still collectable later.
+        assert_eq!(
+            store.get(&task.task_id, None).unwrap().status,
+            TaskStatus::Working
+        );
+    }
+
+    #[test]
+    fn patience_does_not_shorten_a_wait_that_finishes_in_time() {
+        let store = Arc::new(store());
+        let (task, _) = store.create(None, None).unwrap();
+
+        let finisher = Arc::clone(&store);
+        let id = task.task_id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = finisher.finish(
+                &id,
+                TaskStatus::Completed,
+                TaskOutcome::Value(serde_json::json!({ "ok": true })),
+            );
+        });
+
+        let outcome = store
+            .await_result(&task.task_id, None, Some(Duration::from_secs(10)))
+            .unwrap();
+        let TaskOutcome::Value(value) = outcome else {
+            panic!("expected a value");
+        };
+        assert_eq!(value["ok"], true);
+    }
+
+    #[test]
     fn task_ids_are_unique_and_high_entropy() {
         let ids: HashSet<String> = (0..1000).map(|_| new_task_id()).collect();
         assert_eq!(ids.len(), 1000, "task ids must not repeat");
@@ -950,7 +1162,8 @@ mod tests {
             store.get(&task.task_id, None).unwrap().status,
             TaskStatus::Completed
         );
-        let TaskOutcome::Value(value) = store.await_result(&task.task_id, None).unwrap() else {
+        let TaskOutcome::Value(value) = store.await_result(&task.task_id, None, None).unwrap()
+        else {
             panic!("expected a value");
         };
         assert_eq!(value["done"], true);
@@ -1078,7 +1291,8 @@ mod tests {
         let (task, _) = store.create(None, None).unwrap();
         store.cancel(&task.task_id, None).unwrap();
 
-        let TaskOutcome::Error(error) = store.await_result(&task.task_id, None).unwrap() else {
+        let TaskOutcome::Error(error) = store.await_result(&task.task_id, None, None).unwrap()
+        else {
             panic!("expected an error outcome");
         };
         assert!(error.message.contains("cancelled"));
@@ -1093,7 +1307,7 @@ mod tests {
         let store = store();
         for err in [
             store.get("nope", None).unwrap_err(),
-            store.await_result("nope", None).unwrap_err(),
+            store.await_result("nope", None, None).unwrap_err(),
             store.cancel("nope", None).unwrap_err(),
         ] {
             assert_eq!(err.to_jsonrpc_error().code, -32602);
@@ -1141,7 +1355,7 @@ mod tests {
         let (done, waited) = std::sync::mpsc::channel();
         let waiting = store.clone();
         std::thread::spawn(move || {
-            let _ = done.send(waiting.await_result(&task.task_id, None));
+            let _ = done.send(waiting.await_result(&task.task_id, None, None));
         });
 
         let outcome = waited
@@ -1227,7 +1441,8 @@ mod tests {
             )
             .unwrap();
 
-        let TaskOutcome::Value(value) = store.await_result(&task.task_id, None).unwrap() else {
+        let TaskOutcome::Value(value) = store.await_result(&task.task_id, None, None).unwrap()
+        else {
             panic!("expected a value");
         };
         assert_eq!(value["n"], 1);
@@ -1255,7 +1470,7 @@ mod tests {
         };
 
         let started = SystemTime::now();
-        let outcome = store.await_result(&task.task_id, None).unwrap();
+        let outcome = store.await_result(&task.task_id, None, None).unwrap();
         let waited = started.elapsed().unwrap();
 
         let TaskOutcome::Value(value) = outcome else {
@@ -1281,7 +1496,7 @@ mod tests {
             })
         };
 
-        let outcome = store.await_result(&task.task_id, None).unwrap();
+        let outcome = store.await_result(&task.task_id, None, None).unwrap();
         assert!(matches!(outcome, TaskOutcome::Error(_)));
         canceller.join().unwrap();
     }

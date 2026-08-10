@@ -32,6 +32,13 @@ pub const AUTH_ERROR: i32 = -32003;
 /// every other server-side failure. This lets a client tell them apart.
 pub const TIMEOUT_REASON: &str = "timeout";
 
+/// `error.data.reason` marking a request refused because the server is full.
+///
+/// Also `-32603`, and also worth telling apart: a client that sees this knows
+/// the request was never attempted and can retry it, where a generic internal
+/// error says nothing about whether retrying is sane.
+pub const OVERLOADED_REASON: &str = "overloaded";
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum McpError {
@@ -55,6 +62,22 @@ pub enum McpError {
 
     #[error("Invalid message: {0}")]
     InvalidMessage(String),
+
+    /// [`InvalidMessage`](Self::InvalidMessage) for a request whose id was
+    /// readable even though the rest of it was not.
+    ///
+    /// Base protocol §Error Responses: "Error responses **MUST** include the
+    /// same ID as the request they correspond to (except in error cases where
+    /// the ID could not be read due a malformed request)." A client that omits
+    /// `jsonrpc`, or sends `"method": 123`, has still said which request it
+    /// meant - answering with `id: null` leaves it unable to match the error to
+    /// anything and waiting out its own timeout instead of failing fast.
+    #[error("Invalid message: {message}")]
+    InvalidRequest {
+        /// The id to answer with.
+        id: crate::types::RequestId,
+        message: String,
+    },
 
     #[error("Method not found: {0}")]
     MethodNotFound(String),
@@ -92,6 +115,7 @@ impl McpError {
         match self {
             McpError::Json(e) => JsonRpcError::parse_error(e.to_string()),
             McpError::InvalidMessage(msg) => JsonRpcError::invalid_request(msg),
+            McpError::InvalidRequest { message, .. } => JsonRpcError::invalid_request(message),
             McpError::MethodNotFound(method) => {
                 JsonRpcError::method_not_found(format!("Method not found: {}", method))
             }

@@ -31,14 +31,18 @@ pub(crate) trait DeadlineRead: Read {
     fn set_deadline(&mut self, deadline: Option<Instant>) -> std::io::Result<()>;
 }
 
-/// Largest message this reader will accumulate, in bytes.
+/// Largest message a transport will accept by default, in bytes.
 ///
 /// Without a bound, a peer that streams bytes and never sends a newline grows
 /// the buffer until the process is OOM-killed - and on a `UnixServer` anyone
 /// who can connect gets their own reader, so N connections multiply it. The
 /// framing rule ("**MUST NOT** contain embedded newlines") means a legitimate
 /// message is exactly one line, so a generous cap costs nothing real.
-pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+///
+/// Override it per server with
+/// [`ServerConfig::max_message_bytes`](crate::ServerConfig::max_message_bytes),
+/// which is threaded down to whichever transport the server is driven over.
+pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Reads newline-delimited messages, optionally under a deadline.
 pub(crate) struct LineReader<R> {
@@ -70,16 +74,27 @@ impl<R: DeadlineRead> LineReader<R> {
         Self::with_limit(source, MAX_MESSAGE_BYTES)
     }
 
-    /// A reader with a different ceiling, for tests that would rather not
-    /// allocate eight megabytes to prove a point.
+    /// A reader with a different ceiling.
+    ///
+    /// A zero ceiling would refuse every message, including the error response
+    /// explaining why, so it is clamped to one byte.
     pub(crate) fn with_limit(source: R, max_bytes: usize) -> Self {
         Self {
             inner: BufReader::new(source),
             partial: Vec::new(),
-            max_bytes,
+            max_bytes: max_bytes.max(1),
             overflowed: false,
             armed: false,
         }
+    }
+
+    /// Change the ceiling on a reader already in use.
+    ///
+    /// Applies from the next message on: a message already half-accumulated
+    /// keeps the budget it started with, since retroactively overflowing it
+    /// would discard bytes that were legal when they arrived.
+    pub(crate) fn set_limit(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes.max(1);
     }
 
     /// Push `deadline` down to the source, if that changes anything.
@@ -141,8 +156,19 @@ impl<R: DeadlineRead> LineReader<R> {
 
                 match available.iter().position(|&byte| byte == b'\n') {
                     Some(index) => {
+                        // Checked on this branch too, not just the one that
+                        // keeps reading: appending a chunk that happens to
+                        // contain the newline used to skip the ceiling
+                        // entirely, so an accepted message could reach
+                        // `max_bytes` plus one buffer refill. The constant now
+                        // means what it says.
                         if !self.overflowed {
-                            self.partial.extend_from_slice(&available[..=index]);
+                            if self.partial.len() + index + 1 > self.max_bytes {
+                                self.overflowed = true;
+                                self.partial = Vec::new();
+                            } else {
+                                self.partial.extend_from_slice(&available[..=index]);
+                            }
                         }
                         (true, index + 1)
                     }
@@ -292,6 +318,53 @@ mod tests {
             bytes: bytes.as_bytes().to_vec(),
             available_at: now() + delay,
         }
+    }
+
+    #[test]
+    fn the_cap_is_not_overshot_by_a_chunk_that_carries_the_newline() {
+        // The ceiling was only checked on the branch that keeps reading, so a
+        // refill that happened to contain the terminating newline was appended
+        // unchecked - an accepted message could reach the limit plus one whole
+        // buffer refill, and the constant did not mean what it said.
+        let mut reader = LineReader::with_limit(
+            Scripted::new(vec![
+                chunk(&"x".repeat(40)),
+                chunk(&format!("{}\n", "y".repeat(40))),
+            ]),
+            50,
+        );
+
+        let error = reader.read_message(None).unwrap_err();
+        assert!(
+            matches!(&error, McpError::InvalidMessage(m) if m.contains("50 byte limit")),
+            "80 bytes must not sneak past a 50 byte cap: {error}"
+        );
+        assert!(reader.partial.is_empty());
+    }
+
+    #[test]
+    fn the_cap_can_be_changed_on_a_reader_already_in_use() {
+        // `ServerConfig::max_message_bytes` is only real if it reaches the
+        // transport the caller constructed, which is after the fact.
+        let line = request_line(3);
+        let mut reader = LineReader::with_limit(Scripted::new(vec![chunk(&line)]), 8);
+        reader.set_limit(line.len());
+
+        assert!(reader.read_message(None).is_ok());
+    }
+
+    #[test]
+    fn a_zero_cap_is_clamped_rather_than_refusing_everything() {
+        let line = request_line(4);
+        let mut reader = LineReader::with_limit(Scripted::new(vec![chunk(&line)]), 0);
+
+        // Still refused - one byte is a very small ceiling - but as an
+        // answerable message rather than a reader that can never make progress.
+        assert!(matches!(
+            reader.read_message(None),
+            Err(McpError::InvalidMessage(_))
+        ));
+        assert_eq!(reader.max_bytes, 1);
     }
 
     #[test]

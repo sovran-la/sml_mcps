@@ -83,13 +83,29 @@ fn decode_cursor(cursor: &str) -> Option<usize> {
         .and_then(|s| s.parse().ok())
 }
 
-/// Apply pagination to a slice, returning the page and whether there are more items
-pub fn paginate<T: Clone>(items: &[T], state: &PageState) -> (Vec<T>, Option<String>) {
+/// Apply pagination to a slice, returning the page and whether there are more
+/// items.
+///
+/// A cursor pointing past the end is `-32602`, not an empty page. Pagination
+/// §Error Handling asks for exactly that ("Invalid cursors **SHOULD** result in
+/// error code -32602"), and a cursor that decodes to an offset the list no
+/// longer reaches is as invalid as one that does not decode - the list shrank
+/// under it. An empty page is indistinguishable from "you have read
+/// everything", which is what a client would conclude while quietly missing the
+/// items that moved.
+///
+/// Offset zero is exempt: an empty list is not an error, it is an empty list.
+pub fn paginate<T: Clone>(items: &[T], state: &PageState) -> Result<(Vec<T>, Option<String>)> {
     let total = items.len();
 
-    // Handle offset beyond bounds
+    if state.offset > 0 && state.offset >= total {
+        return Err(McpError::InvalidParams(format!(
+            "Invalid cursor: no item at offset {}",
+            state.offset
+        )));
+    }
     if state.offset >= total {
-        return (Vec::new(), None);
+        return Ok((Vec::new(), None));
     }
 
     // Get the page slice
@@ -100,7 +116,7 @@ pub fn paginate<T: Clone>(items: &[T], state: &PageState) -> (Vec<T>, Option<Str
     // Calculate next cursor
     let next_cursor = state.next_cursor(total, returned_count);
 
-    (page, next_cursor)
+    Ok((page, next_cursor))
 }
 
 #[cfg(test)]
@@ -156,7 +172,7 @@ mod tests {
         assert_eq!(state.limit, 1);
 
         let items: Vec<i32> = (0..3).collect();
-        let (page, next) = paginate(&items, &state);
+        let (page, next) = paginate(&items, &state).unwrap();
         assert_eq!(page, [0]);
         assert_eq!(decode_cursor(&next.unwrap()), Some(1));
     }
@@ -199,7 +215,7 @@ mod tests {
     fn test_paginate_first_page() {
         let items: Vec<i32> = (0..100).collect();
         let state = PageState::from_cursor(None, 10).unwrap();
-        let (page, next) = paginate(&items, &state);
+        let (page, next) = paginate(&items, &state).unwrap();
 
         assert_eq!(page.len(), 10);
         assert_eq!(page[0], 0);
@@ -212,7 +228,7 @@ mod tests {
         let items: Vec<i32> = (0..100).collect();
         let cursor = encode_cursor(50);
         let state = PageState::from_cursor(Some(&cursor), 10).unwrap();
-        let (page, next) = paginate(&items, &state);
+        let (page, next) = paginate(&items, &state).unwrap();
 
         assert_eq!(page.len(), 10);
         assert_eq!(page[0], 50);
@@ -225,7 +241,7 @@ mod tests {
         let items: Vec<i32> = (0..100).collect();
         let cursor = encode_cursor(95);
         let state = PageState::from_cursor(Some(&cursor), 10).unwrap();
-        let (page, next) = paginate(&items, &state);
+        let (page, next) = paginate(&items, &state).unwrap();
 
         assert_eq!(page.len(), 5); // Only 5 items left
         assert_eq!(page[0], 95);
@@ -235,20 +251,54 @@ mod tests {
 
     #[test]
     fn test_paginate_beyond_bounds() {
+        // A cursor past the end is as invalid as one that does not decode: the
+        // empty page it used to return is indistinguishable from "that was
+        // everything", so a client whose list shrank under it silently misses
+        // the items that moved instead of being told to start over.
         let items: Vec<i32> = (0..10).collect();
         let cursor = encode_cursor(100);
         let state = PageState::from_cursor(Some(&cursor), 10).unwrap();
-        let (page, next) = paginate(&items, &state);
 
+        let error = paginate(&items, &state).unwrap_err();
+        assert_eq!(error.to_jsonrpc_error().code, -32602);
+        assert!(error.to_string().contains("offset 100"), "{error}");
+    }
+
+    #[test]
+    fn test_paginating_an_empty_list_from_the_start_is_not_an_error() {
+        // Offset zero is the one place "past the end" is ordinary: a server
+        // with no tools has an empty tools list, and no cursor was involved.
+        let items: Vec<i32> = Vec::new();
+        let state = PageState::from_cursor(None, 10).unwrap();
+
+        let (page, next) = paginate(&items, &state).unwrap();
         assert!(page.is_empty());
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn test_a_cursor_to_exactly_the_end_is_rejected() {
+        // The boundary: 10 items, a cursor to offset 10. There is nothing
+        // there, and the cursor was never one this server would have issued -
+        // `next_cursor` stops at the last page.
+        let items: Vec<i32> = (0..10).collect();
+        let cursor = encode_cursor(10);
+        let state = PageState::from_cursor(Some(&cursor), 10).unwrap();
+
+        assert_eq!(
+            paginate(&items, &state)
+                .unwrap_err()
+                .to_jsonrpc_error()
+                .code,
+            -32602
+        );
     }
 
     #[test]
     fn test_paginate_empty_slice() {
         let items: Vec<i32> = vec![];
         let state = PageState::from_cursor(None, 10).unwrap();
-        let (page, next) = paginate(&items, &state);
+        let (page, next) = paginate(&items, &state).unwrap();
 
         assert!(page.is_empty());
         assert!(next.is_none());
@@ -258,7 +308,7 @@ mod tests {
     fn test_paginate_smaller_than_page_size() {
         let items: Vec<i32> = (0..5).collect();
         let state = PageState::from_cursor(None, 10).unwrap();
-        let (page, next) = paginate(&items, &state);
+        let (page, next) = paginate(&items, &state).unwrap();
 
         assert_eq!(page.len(), 5);
         assert!(next.is_none());

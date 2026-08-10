@@ -70,6 +70,10 @@ impl Transport for StdioTransport {
         self.read_timeout = timeout;
         Ok(cfg!(unix))
     }
+
+    fn set_max_message_bytes(&mut self, max: usize) {
+        self.reader.set_limit(max);
+    }
 }
 
 /// Reader over the process's standard input.

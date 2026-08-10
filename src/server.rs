@@ -339,11 +339,18 @@ impl<'a> ToolEnv<'a> {
             _ => None,
         };
 
-        {
-            let mut guard = transport
-                .lock()
-                .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
-            guard.write(&request)?;
+        // A request that never went out will never be answered, so the waiter
+        // registered a moment ago has to come back off the books here too -
+        // otherwise a failing write leaves its `SyncSender` in the broker for
+        // the life of the process. Same discipline as the timeout path, one
+        // exit earlier.
+        let sent = match transport.lock() {
+            Ok(mut guard) => guard.write(&request),
+            Err(_) => Err(McpError::Internal("Transport lock poisoned".into())),
+        };
+        if let Err(e) = sent {
+            self.broker.abandon(&id);
+            return Err(e);
         }
 
         let outcome = match delegated {
@@ -505,8 +512,24 @@ impl<'a> ToolEnv<'a> {
                 // Might belong to a task worker blocked on a channel, which
                 // would never come back to collect a parked response.
                 JsonRpcMessage::Response(response) => self.broker.deliver(response),
-                other => self.broker.defer(other),
+                other => self.shed_or_defer(other),
             }
+        }
+    }
+
+    /// Queue a client message for the main loop, or tell the client we cannot.
+    fn shed_or_defer(&self, message: JsonRpcMessage) {
+        let Err(refused) = self.broker.defer(message) else {
+            return;
+        };
+        let Some(answer) = overloaded_response(refused) else {
+            return;
+        };
+        let Some(transport) = self.transport else {
+            return;
+        };
+        if let Ok(mut guard) = transport.lock() {
+            let _ = guard.write(&answer);
         }
     }
 
@@ -1025,6 +1048,33 @@ pub struct ServerConfig {
     /// conformance, and it is off by default because a server that has been
     /// driven without a handshake (a test harness, a shim) should keep working.
     pub require_initialization: bool,
+    /// Longest a `tasks/result` may block on a transport that cannot be pumped
+    /// (default: 30 seconds). `None` waits for the task's full TTL.
+    ///
+    /// tasks §Result Retrieval makes blocking a MUST, and where the transport
+    /// has a back-channel this server blocks *while reading*, so the wait costs
+    /// nothing. HTTP has no back-channel: the call holds a connection and a
+    /// worker thread and can do nothing useful with them, and the natural bound
+    /// is the task's TTL - client-chosen, an hour by default. Capping it turns
+    /// a hostage situation into "poll and ask again", which is what the spec's
+    /// `input_required` flow tells requestors to do regardless.
+    ///
+    /// Raise it for a server whose tasks reliably finish in a minute and whose
+    /// clients would rather hold the connection than poll.
+    pub task_result_timeout: Option<std::time::Duration>,
+    /// Largest single message this server will accept, in bytes
+    /// (default: 8 MiB).
+    ///
+    /// A peer that streams bytes and never finishes a message would otherwise
+    /// grow a buffer until the process is OOM-killed, once per connection. The
+    /// value applies to every transport this server is driven over: the line
+    /// framing on stdio and Unix sockets, and the request body over HTTP - a
+    /// cap that only covered the transports *not* exposed to the network would
+    /// be exactly the wrong way round.
+    ///
+    /// Raise it for clients that legitimately send large arguments; a base64
+    /// image or PDF as a tool argument is not exotic.
+    pub max_message_bytes: usize,
 }
 
 impl Default for ServerConfig {
@@ -1047,6 +1097,8 @@ impl Default for ServerConfig {
             request_timeout: Some(std::time::Duration::from_secs(120)),
             validate_tool_input: true,
             require_initialization: false,
+            task_result_timeout: Some(std::time::Duration::from_secs(30)),
+            max_message_bytes: crate::transport::MAX_MESSAGE_BYTES,
         }
     }
 }
@@ -1112,8 +1164,48 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// The distinction decides whether the session survives: a message we could not
 /// parse gets an error response and the loop continues, while a broken socket
 /// ends it.
-fn is_malformed(error: &McpError) -> bool {
-    matches!(error, McpError::Json(_) | McpError::InvalidMessage(_))
+pub(crate) fn is_malformed(error: &McpError) -> bool {
+    matches!(
+        error,
+        McpError::Json(_) | McpError::InvalidMessage(_) | McpError::InvalidRequest { .. }
+    )
+}
+
+/// The id an unreadable message carried, for the error response answering it.
+///
+/// "Error responses **MUST** include the same ID as the request they correspond
+/// to (except in error cases where the ID could not be read due a malformed
+/// request)." The exception is narrow: a client that omits `jsonrpc` or sends
+/// `"method": 123` still told us which request it meant, and answering that
+/// with `id: null` leaves it waiting out its own timeout on an error it cannot
+/// correlate. `RequestId::Null` is for the cases where the id genuinely could
+/// not be read - a float id, a body that is not JSON at all.
+pub(crate) fn error_id(error: &McpError) -> RequestId {
+    match error {
+        McpError::InvalidRequest { id, .. } => id.clone(),
+        _ => RequestId::Null,
+    }
+}
+
+/// The answer to a request the server has no room to queue.
+///
+/// Refusing out loud is the point: the deferred queue only fills while
+/// something else blocks the loop, and a client told "too busy, try again"
+/// recovers, where one whose request was silently dropped waits out its own
+/// timeout. Notifications and responses expect no answer, so shedding one is
+/// invisible by design.
+fn overloaded_response(refused: JsonRpcMessage) -> Option<JsonRpcMessage> {
+    let JsonRpcMessage::Request(request) = refused else {
+        return None;
+    };
+    Some(JsonRpcMessage::error(
+        request.id,
+        JsonRpcError::internal_error(format!(
+            "`{}` was refused: too many requests are already queued behind a blocking call",
+            request.method
+        ))
+        .with_data(serde_json::json!({ "reason": OVERLOADED_REASON })),
+    ))
 }
 
 /// Parse a request's params, treating an absent `params` as invalid.
@@ -1588,6 +1680,10 @@ impl<C: Send + Sync + 'static> Server<C> {
     pub fn start<T: Transport + 'static>(&mut self, transport: T, mut context: C) -> Result<()> {
         let mut transport = transport;
 
+        // The caller built the transport, so the configured ceiling only
+        // becomes real once the server has it in hand.
+        transport.set_max_message_bytes(self.config.max_message_bytes);
+
         // A second handle on the same sink, so a task worker can write while
         // this loop is parked inside `read` holding the read handle.
         let writer: Option<Arc<Mutex<dyn Transport>>> = transport
@@ -1638,7 +1734,7 @@ impl<C: Send + Sync + 'static> Server<C> {
                         // read, and the session carries on.
                         Err(e) if is_malformed(&e) => {
                             self.write_message(&JsonRpcMessage::error(
-                                RequestId::Null,
+                                error_id(&e),
                                 e.to_jsonrpc_error(),
                             ))?;
                             continue;
@@ -1713,6 +1809,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             let mut t = transport
                 .lock()
                 .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
+            t.set_max_message_bytes(self.config.max_message_bytes);
             t.read()?
         };
 
@@ -1760,28 +1857,34 @@ impl<C: Send + Sync + 'static> Server<C> {
         }
     }
 
+    /// Refuse anything that is not allowed before the handshake.
+    ///
+    /// `&self`, and factored out of [`dispatch_request`](Self::dispatch_request),
+    /// so the inline dispatch inside a blocking `tasks/result` is held to the
+    /// same rule. An invariant enforced on one path is not an invariant.
+    fn check_initialized(&self, method: &str) -> Result<()> {
+        if !self.config.require_initialization {
+            return Ok(());
+        }
+        match method {
+            // Ping is explicitly exempt: "the client SHOULD NOT send
+            // requests other than pings before the server has responded to
+            // the initialize request."
+            "ping" => Ok(()),
+            "initialize" if self.initialized => Err(McpError::InvalidMessage(
+                "already initialized; the handshake happens once per session".into(),
+            )),
+            "initialize" => Ok(()),
+            method if !self.initialized => Err(McpError::InvalidMessage(format!(
+                "`{method}` before `initialize`"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Dispatch a request to the appropriate handler
     fn dispatch_request(&mut self, request: &JsonRpcRequest, context: &mut C) -> Result<Value> {
-        if self.config.require_initialization {
-            match request.method.as_str() {
-                // Ping is explicitly exempt: "the client SHOULD NOT send
-                // requests other than pings before the server has responded to
-                // the initialize request."
-                "ping" => {}
-                "initialize" if self.initialized => {
-                    return Err(McpError::InvalidMessage(
-                        "already initialized; the handshake happens once per session".into(),
-                    ));
-                }
-                "initialize" => {}
-                method if !self.initialized => {
-                    return Err(McpError::InvalidMessage(format!(
-                        "`{method}` before `initialize`"
-                    )));
-                }
-                _ => {}
-            }
-        }
+        self.check_initialized(&request.method)?;
 
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request),
@@ -1886,14 +1989,22 @@ impl<C: Send + Sync + 'static> Server<C> {
     /// wire announces it.
     ///
     /// Where the transport cannot do deadlines there is nothing to pump with,
-    /// so this falls back to the plain block. That is safe because such a
-    /// server also refuses task workers any server-initiated request.
+    /// so this falls back to blocking on the store alone - *bounded*, and this
+    /// is the important part. That transport is HTTP, where the blocked call
+    /// holds a connection and a worker thread, and the wait it would otherwise
+    /// inherit is the task's TTL: client-chosen, up to an hour by default. One
+    /// well-formed, fully authorized `tasks/result` would then be a denial of
+    /// service against every other client. So it waits
+    /// [`ServerConfig::task_result_timeout`] at most and returns `-32603`
+    /// (`data.reason = "timeout"`) if the task is still running - a client that
+    /// is told to poll can poll, which is what the spec's own `input_required`
+    /// flow expects of it anyway.
     fn await_task(&self, store: &Arc<TaskStore>, task_id: &str) -> Result<TaskOutcome> {
         /// How long a pumped read waits before re-checking the task.
         const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
         let (Some(transport), true) = (self.transport.as_ref(), self.can_pump) else {
-            return store.await_result(task_id, self.requestor());
+            return store.await_result(task_id, self.requestor(), self.config.task_result_timeout);
         };
 
         loop {
@@ -1916,27 +2027,39 @@ impl<C: Send + Sync + 'static> Server<C> {
             match message {
                 // Nothing arrived in this slice; look at the task again.
                 Err(McpError::Timeout(_)) => continue,
-                // The client hung up. Fall back to waiting on the task alone -
-                // it is still running, and its result may still be wanted.
-                Err(McpError::TransportClosed) => {
-                    return store.await_result(task_id, self.requestor());
-                }
+                // The client hung up. There is nobody left to give the answer
+                // to, so waiting out the task's TTL would pin this thread - and
+                // on a `UnixServer`, this connection's whole `Server` - for up
+                // to an hour on behalf of nobody. The worker finishes on its
+                // own; its result stays in the store for whoever asks next.
+                Err(McpError::TransportClosed) => return Err(McpError::TransportClosed),
                 // Unreadable input is the client's problem, not a reason to
                 // abandon the task. Answer it and keep pumping.
                 Err(e) if is_malformed(&e) => {
-                    self.write_message(&JsonRpcMessage::error(
-                        RequestId::Null,
-                        e.to_jsonrpc_error(),
-                    ))?;
+                    self.write_message(&JsonRpcMessage::error(error_id(&e), e.to_jsonrpc_error()))?;
                 }
                 Err(e) => return Err(e),
                 Ok(JsonRpcMessage::Response(response)) => self.broker.deliver(response),
                 Ok(JsonRpcMessage::Request(request)) => match self.answer_inline(&request) {
                     Some(response) => self.write_message(&response)?,
-                    None => self.broker.defer(JsonRpcMessage::Request(request)),
+                    None => self.shed_or_defer(JsonRpcMessage::Request(request))?,
                 },
-                Ok(other) => self.broker.defer(other),
+                Ok(other) => self.shed_or_defer(other)?,
             }
+        }
+    }
+
+    /// Queue a client message for the main loop, or tell the client we cannot.
+    ///
+    /// The queue behind a blocking `tasks/result` is bounded, and a refused
+    /// request is answered rather than dropped - see [`overloaded_response`].
+    fn shed_or_defer(&self, message: JsonRpcMessage) -> Result<()> {
+        let Err(refused) = self.broker.defer(message) else {
+            return Ok(());
+        };
+        match overloaded_response(refused) {
+            Some(answer) => self.write_message(&answer),
+            None => Ok(()),
         }
     }
 
@@ -1956,13 +2079,25 @@ impl<C: Send + Sync + 'static> Server<C> {
     /// cannot re-enter this function. Everything else - including a second
     /// `tasks/result` - keeps being deferred.
     fn answer_inline(&self, request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
-        let outcome = match request.method.as_str() {
-            "ping" => self.handle_ping(),
-            "tasks/get" => self.handle_task_get(request),
-            "tasks/list" => self.handle_task_list(request),
-            "tasks/cancel" => self.handle_task_cancel(request),
-            _ => return None,
-        };
+        // Not one of the four: back to the queue, whatever the handshake state.
+        if !matches!(
+            request.method.as_str(),
+            "ping" | "tasks/get" | "tasks/list" | "tasks/cancel"
+        ) {
+            return None;
+        }
+
+        // Unreachable in practice - you cannot have a `tasks/result`
+        // outstanding without having initialized - but the gate belongs in
+        // every path that dispatches, not just the one it was written on.
+        let outcome =
+            self.check_initialized(&request.method)
+                .and_then(|()| match request.method.as_str() {
+                    "ping" => self.handle_ping(),
+                    "tasks/get" => self.handle_task_get(request),
+                    "tasks/list" => self.handle_task_list(request),
+                    _ => self.handle_task_cancel(request),
+                });
 
         Some(match outcome {
             Ok(result) => JsonRpcMessage::response(request.id.clone(), result),
@@ -1992,7 +2127,7 @@ impl<C: Send + Sync + 'static> Server<C> {
             )));
         }
 
-        let (tasks, next_cursor) = paginate(&all, &state);
+        let (tasks, next_cursor) = paginate(&all, &state)?;
 
         Ok(serde_json::to_value(ListTasksResult {
             tasks,
@@ -2353,7 +2488,7 @@ impl<C: Send + Sync + 'static> Server<C> {
 
         // Apply pagination
         let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
-        let (tools, next_cursor) = paginate(&all_tools, &state);
+        let (tools, next_cursor) = paginate(&all_tools, &state)?;
 
         Ok(serde_json::to_value(ListToolsResult {
             tools,
@@ -2477,7 +2612,7 @@ impl<C: Send + Sync + 'static> Server<C> {
 
         // Apply pagination
         let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
-        let (resources, next_cursor) = paginate(&all_resources, &state);
+        let (resources, next_cursor) = paginate(&all_resources, &state)?;
 
         Ok(serde_json::to_value(ListResourcesResult {
             resources,
@@ -2493,7 +2628,7 @@ impl<C: Send + Sync + 'static> Server<C> {
         all.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
 
         let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
-        let (resource_templates, next_cursor) = paginate(&all, &state);
+        let (resource_templates, next_cursor) = paginate(&all, &state)?;
 
         Ok(serde_json::to_value(ListResourceTemplatesResult {
             resource_templates,
@@ -2526,7 +2661,7 @@ impl<C: Send + Sync + 'static> Server<C> {
 
         // Apply pagination
         let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
-        let (prompts, next_cursor) = paginate(&all_prompts, &state);
+        let (prompts, next_cursor) = paginate(&all_prompts, &state)?;
 
         Ok(serde_json::to_value(ListPromptsResult {
             prompts,
@@ -5020,7 +5155,40 @@ mod tests {
 
     #[test]
     fn test_round_trip_parks_responses_for_other_requests() {
-        // A response for a different in-flight id must be kept, not dropped.
+        // A response for a different in-flight id must be kept, not dropped:
+        // the waiter it belongs to is further down this call stack and collects
+        // it on the way back up.
+        let stray = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: Default::default(),
+            id: RequestId::String("sml-0".into()),
+            result: Some(serde_json::json!({ "action": "accept" })),
+            error: None,
+        });
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "cancel" })])
+            .with_injected(vec![stray]);
+        let (server, _w, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        // Stand in for the outer request that `sml-0` answers; the elicitation
+        // below is then `sml-1`.
+        let outer = server.broker.next_request_id();
+
+        let env = server.tool_env();
+        let result = env.elicit_form("m", serde_json::json!({})).unwrap();
+        assert_eq!(result.action, ElicitAction::Cancel);
+
+        // The stray response is parked, not discarded.
+        assert!(server.broker.take_parked(&outer).is_some());
+    }
+
+    #[test]
+    fn test_a_response_to_an_unissued_id_is_dropped_not_parked() {
+        // The pre-handshake remote OOM: the server has asked nothing, so every
+        // response a client sends answers nothing, and parking them was
+        // unbounded - ~48 messages of 8 MiB reached a gigabyte while the server
+        // went on answering pings.
         let stray = JsonRpcMessage::Response(JsonRpcResponse {
             jsonrpc: Default::default(),
             id: RequestId::String("sml-999".into()),
@@ -5035,15 +5203,17 @@ mod tests {
         );
 
         let env = server.tool_env();
-        let result = env.elicit_form("m", serde_json::json!({})).unwrap();
-        assert_eq!(result.action, ElicitAction::Cancel);
+        assert_eq!(
+            env.elicit_form("m", serde_json::json!({})).unwrap().action,
+            ElicitAction::Cancel,
+            "the round trip still completes; the garbage is simply not retained"
+        );
 
-        // The stray response is parked, not discarded.
         assert!(
             server
                 .broker
                 .take_parked(&RequestId::String("sml-999".into()))
-                .is_some()
+                .is_none()
         );
     }
 
@@ -7685,5 +7855,178 @@ mod tests {
         let message = JsonRpcMessage::error(RequestId::Null, JsonRpcError::parse_error("bad"));
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"id\":null"), "{json}");
+    }
+
+    #[test]
+    fn test_a_hung_up_client_does_not_pin_the_thread_for_the_tasks_ttl() {
+        // `tasks/result` fell back to waiting on the store when the client
+        // disconnected mid-pump - blocking until the task went terminal, up to
+        // its full TTL, on behalf of nobody. On a `UnixServer` that is one
+        // thread and one whole `Server` held for up to an hour.
+        let store = Arc::new(TaskStore::new(TaskConfig::default()));
+        let (task, _cancelled) = store.create(None, None).unwrap();
+
+        // Reads report a closed peer; the task itself is still running.
+        let transport: Arc<Mutex<dyn Transport>> =
+            Arc::new(Mutex::new(RecordingTransport::default()));
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        server.transport = Some(transport.clone());
+        server.writer = Some(transport);
+        server.can_pump = true;
+
+        let started = std::time::Instant::now();
+        let error = server.await_task(&store, &task.task_id).unwrap_err();
+
+        assert!(matches!(error, McpError::TransportClosed), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "returned in {:?}; the default TTL is five minutes",
+            started.elapsed()
+        );
+        // The worker keeps its result for whoever asks next.
+        assert_eq!(
+            store.get(&task.task_id, None).unwrap().status,
+            TaskStatus::Working
+        );
+    }
+
+    #[test]
+    fn test_a_request_that_could_not_be_written_leaves_no_waiter_behind() {
+        // The waiter is registered *before* the request goes out, because the
+        // answer can land the instant it does. A write that then fails used to
+        // return without unregistering, leaving the `SyncSender` in the broker
+        // for the life of the process - the same shape S14 fixed one exit
+        // lower.
+        let resources: HashMap<String, Arc<dyn Resource>> = HashMap::new();
+        let transport: Arc<Mutex<dyn Transport>> = Arc::new(Mutex::new(FailingTransport));
+        let broker = RequestBroker::new();
+
+        let env = ToolEnv {
+            transport: Some(&transport),
+            reader: Some(&transport),
+            resources: &resources,
+            log_level: LogLevel::Info,
+            stderr_logging: StderrLogging::Never,
+            logger: "test-logger",
+            client_capabilities: &NO_CAPABILITIES,
+            broker: &broker,
+            mode: RequestMode::Delegated,
+            request_timeout: Some(std::time::Duration::from_millis(50)),
+            task: None,
+            progress_token: None,
+        };
+
+        let error = env
+            .send_request_with_timeout("roots/list", serde_json::json!({}), None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("write failed"), "{error}");
+        assert_eq!(
+            broker.waiter_count(),
+            0,
+            "a request that never went out has nothing to wait for"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_an_unreadable_request_is_answered_with_the_id_it_carried() {
+        // The C1 fix answered instead of hanging up, but always with
+        // `id: null` - so a client whose request *was* identifiable could not
+        // match the error to it and waited out its own timeout instead.
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let error = exchange_raw(&mut client, br#"{"jsonrpc":"2.0","id":7,"method":123}"#);
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+        assert_eq!(error["id"], 7, "the id was right there: {error}");
+
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_request_missing_jsonrpc_is_answered_normally() {
+        // Forgetting `jsonrpc` used to be an uncorrelatable `-32600`, while
+        // announcing the *wrong* version was answered as if it were right.
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let response = exchange_raw(&mut client, br#"{"id":8,"method":"ping"}"#);
+        assert_eq!(response["id"], 8, "{response}");
+        assert!(response["result"].is_object(), "{response}");
+
+        assert_still_alive(&mut client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_wrong_jsonrpc_version_is_refused_with_its_id() {
+        let (mut client, _server) = server_on_a_raw_socket();
+
+        let error = exchange_raw(&mut client, br#"{"jsonrpc":"1.0","id":9,"method":"ping"}"#);
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+        assert_eq!(error["id"], 9, "{error}");
+        assert!(
+            error["error"]["message"].as_str().unwrap().contains("1.0"),
+            "{error}"
+        );
+
+        assert_still_alive(&mut client);
+    }
+
+    #[test]
+    fn test_a_refused_request_is_answered_rather_than_dropped() {
+        // What the client sees when the deferred queue is full: a distinct,
+        // retryable reason, not silence and then its own timeout.
+        let answer =
+            overloaded_response(JsonRpcMessage::request(4i64, "tools/list", None)).unwrap();
+
+        let JsonRpcMessage::Response(response) = answer else {
+            panic!("expected a response");
+        };
+        let error = response.error.unwrap();
+        assert_eq!(response.id, RequestId::Number(4));
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.data.unwrap()["reason"], OVERLOADED_REASON);
+        assert!(error.message.contains("tools/list"), "{}", error.message);
+    }
+
+    #[test]
+    fn test_a_refused_notification_is_simply_dropped() {
+        // Nobody is waiting on an answer to a notification, so there is nothing
+        // to say.
+        assert!(
+            overloaded_response(JsonRpcMessage::notification(
+                "notifications/cancelled",
+                None
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_the_initialization_gate_is_one_rule_for_every_path() {
+        // `answer_inline` dispatches four methods without going through
+        // `dispatch_request`. An invariant enforced on one path is not one.
+        let server: Server<TestContext> = Server::new(ServerConfig {
+            require_initialization: true,
+            ..Default::default()
+        });
+
+        assert!(server.check_initialized("ping").is_ok(), "ping is exempt");
+        assert!(server.check_initialized("tasks/get").is_err());
+        assert!(server.check_initialized("tasks/cancel").is_err());
+
+        let request = JsonRpcRequest {
+            id: RequestId::Number(1),
+            method: "tasks/get".into(),
+            params: Some(serde_json::json!({ "taskId": "t" })),
+            jsonrpc: Default::default(),
+        };
+        let JsonRpcMessage::Response(answer) = server.answer_inline(&request).unwrap() else {
+            panic!("expected a response");
+        };
+        let error = answer.error.expect("refused before `initialize`");
+        assert_eq!(error.code, -32600);
+        assert!(error.message.contains("before `initialize`"), "{error:?}");
     }
 }
