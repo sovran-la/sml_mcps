@@ -126,17 +126,24 @@ impl Transport for HttpTransport {
 use crate::server::{LogLevel, Server, ServerConfig, TaskContext};
 use crate::tasks::{TaskStore, random_hex_id};
 use crate::transport::OriginPolicy;
+use crate::transport::pool::WorkerPool;
 use crate::types::{ASSUMED_PROTOCOL_VERSION, ClientCapabilities};
-use rouille::{Request, Response, Server as RouilleServer};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
+use tiny_http::{Header, Method, Request, Response, Server as TinyServer};
 
 #[cfg(feature = "auth")]
 use crate::auth::{Claims, JwtValidator, ProtectedResourceMetadata, unauthorized_challenge};
 
 /// Setup function type for configuring tools on each request
 type SetupFn<C> = Box<dyn Fn(&mut Server<C>) -> Result<()> + Send + Sync>;
+
+/// A ready-to-send HTTP response with an owned body.
+///
+/// Owned, rather than borrowing from the request, because the response travels
+/// to a worker thread and outlives whatever built it.
+type HttpResponse = Response<Cursor<Vec<u8>>>;
 
 /// The header carrying the session id, per transports §Session Management.
 const SESSION_HEADER: &str = "Mcp-Session-Id";
@@ -152,11 +159,46 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// The path of a request URL, without any query string or fragment.
 ///
-/// `/mcp?sessionId=abc` is not `/mcp` by string comparison, and the spec asks
-/// for "a single HTTP endpoint *path*". The well-known metadata route has the
-/// same problem, and it is a URL intermediaries append cache busters to.
+/// `tiny_http` hands back the raw request target, so `/mcp?sessionId=abc` is
+/// not `/mcp` by string comparison - and the spec asks for "a single HTTP
+/// endpoint *path*". The well-known metadata route has the same problem, and it
+/// is a URL intermediaries append cache busters to.
 fn path_of(url: &str) -> &str {
     url.split(['?', '#']).next().unwrap_or("")
+}
+
+/// Look up a request header, case-insensitively as HTTP requires.
+fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str())
+}
+
+/// Attach a header, or leave the response alone if the value cannot be one.
+///
+/// Nothing here builds a header value a client controls, so the failing arm is
+/// unreachable in practice - but dropping one header beats refusing to answer.
+fn with_header(response: HttpResponse, name: &'static str, value: impl AsRef<str>) -> HttpResponse {
+    match Header::from_bytes(name, value.as_ref()) {
+        Ok(header) => response.with_header(header),
+        Err(()) => response,
+    }
+}
+
+/// A `200 OK` carrying this body, as this content type.
+fn body_response(content_type: &'static str, body: String) -> HttpResponse {
+    with_header(
+        Response::from_data(body.into_bytes()),
+        "Content-Type",
+        content_type,
+    )
+}
+
+/// A response with no body at all, for the statuses that must not carry one.
+fn empty_response(status: u16) -> HttpResponse {
+    Response::from_data(Vec::new()).with_status_code(status)
 }
 
 /// State that belongs to one client's session rather than to one request.
@@ -361,14 +403,14 @@ enum Processed {
 /// The spec permits (and dual-era clients benefit from) HTTP error responses
 /// carrying a JSON-RPC *error response* with no `id` - a plain-text body forces
 /// clients to guess why the request failed.
-fn error_response(status: u16, code: i32, message: impl AsRef<str>) -> Response {
+fn error_response(status: u16, code: i32, message: impl AsRef<str>) -> HttpResponse {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "error": { "code": code, "message": message.as_ref() },
     })
     .to_string();
 
-    Response::from_data("application/json", body).with_status_code(status)
+    body_response("application/json", body).with_status_code(status)
 }
 
 /// How the listening socket is set up.
@@ -384,32 +426,70 @@ enum Binding {
 
 /// Threads to keep for serving requests.
 ///
-/// rouille's own default. It wants to be comfortably larger than the number of
-/// clients that might sit in a blocking `tasks/result` at once - that call is
-/// bounded by [`ServerConfig::task_result_timeout`], but while it waits it
-/// holds one of these.
+/// It wants to be comfortably larger than the number of clients that might sit
+/// in a blocking `tasks/result` at once - that call is bounded by
+/// [`ServerConfig::task_result_timeout`], but while it waits it holds one of
+/// these.
 fn default_pool_size() -> usize {
     8 * std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
 }
 
-/// Bind, then serve forever on a fixed pool of threads.
-fn listen<H>(addr: &str, pool_size: usize, binding: Binding, handler: H) -> Result<()>
+/// The answer to a request that arrived with nowhere to run.
+///
+/// Every worker busy *and* the queue behind them full is the one case a bounded
+/// pool has to have an answer for. Queueing without limit would let a peer make
+/// the server hold arbitrarily many accepted requests; blocking the accept loop
+/// would make the whole listener as slow as its slowest request, which is the
+/// thing this design exists to prevent. So it is said out loud, in the shape
+/// clients already parse.
+fn overloaded() -> HttpResponse {
+    error_response(
+        503,
+        -32603,
+        "Service Unavailable: every request thread is busy; retry shortly",
+    )
+}
+
+/// Bind, then serve forever: accept on this thread, answer on the pool.
+///
+/// The accept loop does exactly two things - take a request and hand it to a
+/// worker - so how long any one request takes cannot affect when the next is
+/// picked up. That is the whole difference from the loop this replaced.
+fn listen<H>(addr: &str, pool_size: usize, binding: Binding, handle: H) -> Result<()>
 where
-    H: Send + Sync + 'static + Fn(&Request) -> Response,
+    H: Fn(Request) + Send + Sync + 'static,
 {
     let server = match binding {
-        Binding::Plain => RouilleServer::new(addr, handler),
+        Binding::Plain => TinyServer::http(addr),
         #[cfg(feature = "tls")]
         Binding::Tls {
             certificate,
             private_key,
-        } => RouilleServer::new_ssl(addr, handler, certificate, private_key),
+        } => TinyServer::https(
+            addr,
+            tiny_http::SslConfig {
+                certificate,
+                private_key,
+            },
+        ),
     }
     .map_err(|e| McpError::Internal(format!("Failed to start HTTP server: {}", e)))?;
 
-    server.pool_size(pool_size.max(1)).run();
+    // Room for one waiting request per thread. Big enough that a burst of short
+    // requests queues instead of being refused, small enough that "the server
+    // is saturated" is answered rather than hidden behind an ever-growing
+    // backlog nobody is getting to.
+    let threads = pool_size.max(1);
+    let pool = WorkerPool::new(threads, threads, handle);
+
+    for request in server.incoming_requests() {
+        if let Err(request) = pool.dispatch(request) {
+            let _ = request.respond(overloaded());
+        }
+    }
+
     Ok(())
 }
 
@@ -572,7 +652,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
     /// A 403 for a token that authenticated but is not permitted here.
     #[cfg(feature = "auth")]
-    fn forbidden(&self, missing: &[&str]) -> Response {
+    fn forbidden(&self, missing: &[&str]) -> HttpResponse {
         let response = error_response(
             403,
             -32600,
@@ -591,7 +671,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         });
 
         match challenge {
-            Some(challenge) => response.with_additional_header("WWW-Authenticate", challenge),
+            Some(challenge) => with_header(response, "WWW-Authenticate", challenge),
             None => response,
         }
     }
@@ -607,21 +687,21 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
     /// Serve the metadata document when this request is asking for it.
     #[cfg(feature = "auth")]
-    fn protected_resource_response(&self, request: &Request) -> Option<Response> {
+    fn protected_resource_response(&self, request: &Request) -> Option<HttpResponse> {
         let metadata = self.protected_resource.as_ref()?;
         let path = metadata.resource_uri().ok()?.metadata_path();
-        if path_of(&request.url()) != path {
+        if path_of(request.url()) != path {
             return None;
         }
 
         // Discovery must work before the client has a token, so this endpoint
         // is deliberately unauthenticated - it contains nothing secret.
-        if request.method() != "GET" {
+        if !matches!(request.method(), Method::Get) {
             return Some(error_response(405, -32600, "Method Not Allowed"));
         }
 
         let body = serde_json::to_string(metadata).ok()?;
-        Some(Response::from_data("application/json", body))
+        Some(body_response("application/json", body))
     }
 
     /// Configure tools via a setup closure
@@ -639,7 +719,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// authentication: endpoint path, HTTP method, and `Origin`.
     ///
     /// Returns `Some(response)` when the request must be rejected.
-    fn precheck(&self, request: &Request) -> Option<Response> {
+    fn precheck(&self, request: &Request) -> Option<HttpResponse> {
         // Discovery is served before the endpoint check, since it lives at a
         // different path by design.
         #[cfg(feature = "auth")]
@@ -647,21 +727,20 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             return Some(response);
         }
 
-        if path_of(&request.url()) != self.endpoint {
+        if path_of(request.url()) != self.endpoint {
             return Some(error_response(404, -32600, "Not Found"));
         }
 
         // POST carries messages; DELETE ends a session.
-        if !matches!(request.method(), "POST" | "DELETE") {
+        if !matches!(request.method(), Method::Post | Method::Delete) {
             return Some(error_response(405, -32600, "Method Not Allowed"));
         }
 
         // "If the server receives a request with an invalid or unsupported
         // MCP-Protocol-Version, it MUST respond with 400 Bad Request." An
         // absent header is not an error: it means 2025-03-26, which we speak.
-        let version = request
-            .header("MCP-Protocol-Version")
-            .unwrap_or(ASSUMED_PROTOCOL_VERSION);
+        let version =
+            header_value(request, "MCP-Protocol-Version").unwrap_or(ASSUMED_PROTOCOL_VERSION);
         if !self.config.supported_versions.iter().any(|v| v == version) {
             self.trace(|| format!("  ✗ Unsupported MCP-Protocol-Version: {}", version));
             return Some(error_response(
@@ -677,7 +756,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
         // Only a *present* Origin is validated. Non-browser clients omit it,
         // and DNS rebinding requires a browser, which always sends it.
-        if let Some(origin) = request.header("Origin") {
+        if let Some(origin) = header_value(request, "Origin") {
             if !self.origin_policy.is_allowed(origin) {
                 eprintln!("  ✗ Rejected Origin: {}", origin);
                 return Some(error_response(
@@ -694,10 +773,10 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// A 401 carrying the `WWW-Authenticate` challenge, when metadata is
     /// published for clients to discover the authorization server from.
     #[cfg(feature = "auth")]
-    fn unauthorized(&self, message: impl AsRef<str>) -> Response {
+    fn unauthorized(&self, message: impl AsRef<str>) -> HttpResponse {
         let response = error_response(401, -32600, message);
         match self.challenge() {
-            Some(challenge) => response.with_additional_header("WWW-Authenticate", challenge),
+            Some(challenge) => with_header(response, "WWW-Authenticate", challenge),
             None => response,
         }
     }
@@ -710,26 +789,27 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// cap. The declared length is checked before a byte is read, and the read
     /// itself is capped as well, since a chunked body declares no length and a
     /// `Content-Length` can lie.
-    fn read_body(&self, request: &Request) -> std::result::Result<String, Response> {
+    fn read_body(&self, request: &mut Request) -> std::result::Result<String, HttpResponse> {
         let limit = self.config.max_message_bytes;
 
-        if let Some(declared) = request
-            .header("Content-Length")
-            .and_then(|value| value.trim().parse::<u64>().ok())
+        // `body_length` is the declared `Content-Length`, and `None` for a
+        // chunked body - which declares nothing and is exactly why the read
+        // below is capped too.
+        if request
+            .body_length()
+            .is_some_and(|declared| declared > limit)
         {
-            if declared > limit as u64 {
-                return Err(self.too_large(limit));
-            }
+            return Err(self.too_large(limit));
         }
-
-        let Some(data) = request.data() else {
-            return Err(error_response(400, -32700, "Bad Request: no body"));
-        };
 
         let mut body = String::new();
         // One byte over the limit is enough to know it was exceeded, and is all
         // that is ever read past it.
-        if let Err(e) = data.take(limit as u64 + 1).read_to_string(&mut body) {
+        if let Err(e) = request
+            .as_reader()
+            .take(limit as u64 + 1)
+            .read_to_string(&mut body)
+        {
             eprintln!("  Failed to read body: {}", e);
             return Err(error_response(400, -32700, "Bad Request: unreadable body"));
         }
@@ -741,7 +821,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     }
 
     /// The answer to a body bigger than this server will accept.
-    fn too_large(&self, limit: usize) -> Response {
+    fn too_large(&self, limit: usize) -> HttpResponse {
         error_response(
             413,
             -32600,
@@ -768,15 +848,15 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     }
 
     /// Turn a processed result into the HTTP response to send.
-    fn finish(&self, outcome: Result<Processed>) -> Response {
+    fn finish(&self, outcome: Result<Processed>) -> HttpResponse {
         match outcome {
             Ok(Processed::Body(response_body, content_type)) => {
                 self.trace(|| format!("  Response ({}): {}", content_type, response_body));
-                Response::from_data(content_type, response_body)
+                body_response(content_type, response_body)
             }
             // 202 with *no body*: `{}` is not a valid JSON-RPC message, so a
             // strict client parsing it fails.
-            Ok(Processed::Accepted) => Response::empty_204().with_status_code(202),
+            Ok(Processed::Accepted) => empty_response(202),
             Err(e) => {
                 eprintln!("  Error: {}", e);
                 // A client's syntax error is not the server's internal error.
@@ -838,19 +918,20 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         );
 
         let pool_size = self.pool_size.unwrap_or_else(default_pool_size);
-        listen(addr, pool_size, binding, move |request| {
+        listen(addr, pool_size, binding, move |mut request| {
             self.trace(|| format!("{} {}", request.method(), request.url()));
 
-            if let Some(rejection) = self.precheck(request) {
-                return rejection;
-            }
-            if request.method() == "DELETE" {
-                return self.end_session(request);
-            }
+            let response = if let Some(rejection) = self.precheck(&request) {
+                rejection
+            } else if matches!(request.method(), Method::Delete) {
+                self.end_session(&request)
+            } else {
+                // No authorization context, so requestors cannot be told apart:
+                // tasks stay reachable by id but are not listable.
+                self.respond(&mut request, TaskContext::Anonymous, &context_factory)
+            };
 
-            // No authorization context, so requestors cannot be told apart:
-            // tasks stay reachable by id but are not listable.
-            self.respond(request, TaskContext::Anonymous, &context_factory)
+            self.send(request, response);
         })
     }
 
@@ -924,64 +1005,92 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         );
 
         let pool_size = self.pool_size.unwrap_or_else(default_pool_size);
-        listen(addr, pool_size, binding, move |request| {
+        listen(addr, pool_size, binding, move |mut request| {
             self.trace(|| format!("{} {}", request.method(), request.url()));
 
-            if let Some(rejection) = self.precheck(request) {
-                return rejection;
-            }
-
-            // JWT Authentication
-            let claims = match request.header("Authorization") {
-                Some(header) => match validator.validate_header(header) {
-                    Ok(claims) => {
-                        // The subject and tenant identify a person; they go
-                        // behind the same gate as request bodies.
-                        self.trace(|| {
-                            format!(
-                                "  ✓ Authenticated: user={}, tenant={}",
-                                claims.user_id(),
-                                claims.tenant_id()
-                            )
-                        });
-                        claims
-                    }
-                    Err(e) => {
-                        eprintln!("  ✗ Auth failed: {}", e);
-                        return self.unauthorized(format!("Unauthorized: {}", e));
-                    }
-                },
-                None => {
-                    eprintln!("  ✗ No Authorization header");
-                    return self.unauthorized("Unauthorized: Missing Authorization header");
-                }
-            };
-
-            // Authenticated is not authorized.
-            let missing = claims.missing_scopes(&self.required_scopes);
-            if !missing.is_empty() {
-                eprintln!("  ✗ Missing scope(s): {}", missing.join(" "));
-                return self.forbidden(&missing);
-            }
-
-            if request.method() == "DELETE" {
-                return self.end_session(request);
-            }
-
-            // Tasks bind to the identity the token carries, which is what makes
-            // them isolatable.
-            let owner = format!("{}\u{1}{}", claims.user_id(), claims.tenant_id());
-            self.respond(request, TaskContext::Owner(owner), || {
-                context_factory(&claims)
-            })
+            let response = self.authenticated_response(&mut request, &validator, &context_factory);
+            self.send(request, response);
         })
+    }
+
+    /// Authenticate, authorize, and answer - or say why not.
+    ///
+    /// Split out of the accept closure only so the early returns can stay early
+    /// returns while the caller still ends up holding the request to answer on.
+    #[cfg(feature = "auth")]
+    fn authenticated_response<F>(
+        &self,
+        request: &mut Request,
+        validator: &JwtValidator,
+        context_factory: &F,
+    ) -> HttpResponse
+    where
+        F: Fn(&Claims) -> C,
+    {
+        if let Some(rejection) = self.precheck(request) {
+            return rejection;
+        }
+
+        // JWT Authentication
+        let claims = match header_value(request, "Authorization") {
+            Some(header) => match validator.validate_header(header) {
+                Ok(claims) => {
+                    // The subject and tenant identify a person; they go behind
+                    // the same gate as request bodies.
+                    self.trace(|| {
+                        format!(
+                            "  ✓ Authenticated: user={}, tenant={}",
+                            claims.user_id(),
+                            claims.tenant_id()
+                        )
+                    });
+                    claims
+                }
+                Err(e) => {
+                    eprintln!("  ✗ Auth failed: {}", e);
+                    return self.unauthorized(format!("Unauthorized: {}", e));
+                }
+            },
+            None => {
+                eprintln!("  ✗ No Authorization header");
+                return self.unauthorized("Unauthorized: Missing Authorization header");
+            }
+        };
+
+        // Authenticated is not authorized.
+        let missing = claims.missing_scopes(&self.required_scopes);
+        if !missing.is_empty() {
+            eprintln!("  ✗ Missing scope(s): {}", missing.join(" "));
+            return self.forbidden(&missing);
+        }
+
+        if matches!(request.method(), Method::Delete) {
+            return self.end_session(request);
+        }
+
+        // Tasks bind to the identity the token carries, which is what makes
+        // them isolatable.
+        let owner = format!("{}\u{1}{}", claims.user_id(), claims.tenant_id());
+        self.respond(request, TaskContext::Owner(owner), || {
+            context_factory(&claims)
+        })
+    }
+
+    /// Write the answer, and note it if the peer is no longer there to read it.
+    ///
+    /// A peer hanging up mid-answer is its business, not an incident - and it
+    /// is peer-controlled, so it does not get to write to stderr on demand.
+    fn send(&self, request: Request, response: HttpResponse) {
+        if let Err(e) = request.respond(response) {
+            self.trace(|| format!("  Failed to send response: {}", e));
+        }
     }
 
     /// `DELETE` on the endpoint: "Clients that no longer need a particular
     /// session **SHOULD** send an HTTP DELETE ... to explicitly terminate it."
-    fn end_session(&self, request: &Request) -> Response {
-        match request.header(SESSION_HEADER) {
-            Some(id) if self.sessions.terminate(id) => Response::empty_204(),
+    fn end_session(&self, request: &Request) -> HttpResponse {
+        match header_value(request, SESSION_HEADER) {
+            Some(id) if self.sessions.terminate(id) => empty_response(204),
             Some(_) => error_response(404, -32600, "Not Found: no such session"),
             None => error_response(
                 400,
@@ -994,11 +1103,14 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// Answer one message, in the session it belongs to.
     fn respond(
         &self,
-        request: &Request,
+        request: &mut Request,
         task_context: TaskContext,
         make_context: impl FnOnce() -> C,
-    ) -> Response {
-        let Ok((id, session)) = self.sessions.checkout(request.header(SESSION_HEADER)) else {
+    ) -> HttpResponse {
+        let Ok((id, session)) = self
+            .sessions
+            .checkout(header_value(request, SESSION_HEADER))
+        else {
             // "The server MAY terminate the session at any time, after which it
             // MUST respond to requests containing that session ID with HTTP 404
             // Not Found."
@@ -1016,7 +1128,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         // A session is only advertised once it holds something a later request
         // could want, so a client that only ever pings is never handed an id.
         match self.sessions.check_in(id, session) {
-            Some(id) => response.with_additional_header(SESSION_HEADER, id),
+            Some(id) => with_header(response, SESSION_HEADER, id),
             None => response,
         }
     }
@@ -1027,8 +1139,8 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// An unwinding tool, setup closure, or context factory used to take the
     /// accept loop with it: the client saw a dropped connection and the server
     /// stopped serving *everyone*. Thread-per-request narrows the blast radius
-    /// to one request, but a panic still has to come back as a JSON-RPC error
-    /// rather than rouille's generic HTML 500.
+    /// to one worker, but a panic still has to come back as a JSON-RPC error
+    /// rather than the bare `500` a dropped `Request` produces.
     fn guarded(
         &self,
         body: String,
@@ -1383,6 +1495,63 @@ mod http_server_tests {
         }
     }
 
+    /// A latch a test holds request threads on, and can count arrivals at.
+    ///
+    /// The pool is bounded, so "every worker is busy" has to be reachable on
+    /// purpose rather than by hoping a sleep is long enough.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        changed: std::sync::Condvar,
+        arrived: AtomicI64,
+    }
+
+    impl Gate {
+        fn wait(&self) {
+            self.arrived.fetch_add(1, Ordering::SeqCst);
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                open = self.changed.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.changed.notify_all();
+        }
+
+        fn arrivals(&self) -> i64 {
+            self.arrived.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Tool that parks the request thread it runs on until the test says
+    /// otherwise, so saturation is a fact rather than a race.
+    struct GateTool {
+        gate: Arc<Gate>,
+    }
+
+    impl Tool<TestContext> for GateTool {
+        fn name(&self) -> &str {
+            "gate"
+        }
+        fn description(&self) -> &str {
+            "Blocks until the test releases it"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            self.gate.wait();
+            Ok(CallToolResult::text("released"))
+        }
+    }
+
     // Tool that reports what the client said it could do, to prove one
     // client's declaration never reaches another
     struct CapsTool;
@@ -1553,6 +1722,44 @@ mod http_server_tests {
         Ok((status_code, content_type, body, session))
     }
 
+    /// Read exactly one HTTP response off a connection that is staying open.
+    ///
+    /// `read_to_string` works everywhere else because those requests ask for the
+    /// connection to be closed, which is what ends the read. A reused connection
+    /// never closes, so the response has to be framed by its own
+    /// `Content-Length` instead.
+    fn read_one_response(stream: &mut TcpStream) -> (u16, String) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(
+                stream.read(&mut byte).expect("reading response headers"),
+                1,
+                "the connection closed mid-response"
+            );
+            head.push(byte[0]);
+        }
+
+        let head = String::from_utf8(head).expect("headers are text");
+        let status: u16 = head
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let length: usize = head
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split(':').nth(1)?.trim().parse().ok())
+            .expect("a framed response carries its length");
+
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).expect("reading response body");
+        (status, String::from_utf8(body).expect("the body is text"))
+    }
+
     /// Helper to make raw HTTP POST request
     fn http_post(addr: &str, path: &str, body: &str) -> std::io::Result<(u16, String, String)> {
         http_request(addr, "POST", path, body, &[])
@@ -1658,6 +1865,21 @@ mod http_server_tests {
         assert_eq!(status, 400);
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn test_a_body_less_post_is_400_parse_error() {
+        // There is no request with no body at this layer - there is a request
+        // whose body is empty, and an empty body is not a JSON-RPC message.
+        // Worth pinning because the check that used to catch it lived in the
+        // HTTP layer and now lives in the parser; the answer must not change.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let (status, _, body) = http_post(&addr, "/mcp", "").unwrap();
+
+        assert_eq!(status, 400, "{body}");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], -32700, "{body}");
     }
 
     #[test]
@@ -1941,6 +2163,221 @@ mod http_server_tests {
         assert!(
             blocked_took > ping_took,
             "the blocking call really did block: {blocked_took:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_saturated_server_says_so_rather_than_queueing_without_limit() {
+        // The pool is bounded in both directions, so there is a state where a
+        // request arrives with nowhere to run. The two alternatives are worse:
+        // an unbounded queue is a peer-controlled amount of memory and a
+        // growing pile of requests nobody is getting to, and blocking the
+        // accept loop makes the listener as slow as its slowest request, which
+        // is the failure this whole design exists to prevent.
+        let gate = Arc::new(Gate::default());
+        let addr = format!("127.0.0.1:{}", next_port());
+
+        let server_addr = addr.clone();
+        let their_gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            let counter = Arc::new(AtomicI64::new(0));
+            let _ = HttpServer::new(ServerConfig::default())
+                // One thread, and room for one more request behind it.
+                .pool_size(1)
+                .with_tools(move |s: &mut Server<TestContext>| {
+                    s.add_tool(GateTool {
+                        gate: Arc::clone(&their_gate),
+                    })?;
+                    Ok(())
+                })
+                .serve(&server_addr, move || TestContext {
+                    counter: counter.clone(),
+                });
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        // Occupy the only worker, and wait until it really is occupied.
+        let blocked_addr = addr.clone();
+        let blocked = thread::spawn(move || {
+            http_post(
+                &blocked_addr,
+                "/mcp",
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"gate"}}"#,
+            )
+            .unwrap()
+        });
+        for _ in 0..500 {
+            if gate.arrivals() == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(gate.arrivals(), 1, "the worker never picked up the request");
+
+        // Four more, against one worker and one queue slot.
+        let pings: Vec<_> = (0..4)
+            .map(|_| {
+                let addr = addr.clone();
+                thread::spawn(move || http_post(&addr, "/mcp", PING).unwrap())
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(300));
+        gate.open();
+
+        let answers: Vec<(u16, String, String)> =
+            pings.into_iter().map(|p| p.join().unwrap()).collect();
+        let statuses: Vec<u16> = answers.iter().map(|(status, ..)| *status).collect();
+        let shed: Vec<&(u16, String, String)> = answers
+            .iter()
+            .filter(|(status, ..)| *status == 503)
+            .collect();
+        let served = statuses.iter().filter(|status| **status == 200).count();
+
+        assert!(
+            shed.len() >= 2,
+            "a saturated server must refuse rather than absorb: {statuses:?}"
+        );
+        assert_eq!(
+            shed.len() + served,
+            4,
+            "every request got one of the two answers: {statuses:?}"
+        );
+        assert!(
+            served >= 1,
+            "the queued request was still served once a worker freed up: {statuses:?}"
+        );
+
+        // The refusal is a JSON-RPC body like every other rejection here, not a
+        // dropped connection or a bare status line.
+        let (_, content_type, body) = shed[0];
+        assert_eq!(content_type, "application/json");
+        let parsed: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["error"]["code"], -32603, "{body}");
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("busy"),
+            "{body}"
+        );
+
+        // And the server is unharmed by having refused.
+        let (status, _, body) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 200, "{body}");
+
+        let (_, _, body) = blocked.join().unwrap();
+        assert!(body.contains("released"), "{body}");
+    }
+
+    #[test]
+    fn test_two_requests_on_one_connection_are_both_answered() {
+        // Every other test here closes the connection after one request. A
+        // request now travels to a worker thread to be answered, and `tiny_http`
+        // only reads the next request on a connection once the previous one has
+        // been responded to - so a handoff that lost the request, or answered
+        // out of band, would wedge the connection rather than fail loudly.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        for id in 1..=2 {
+            let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n{}",
+                addr,
+                body.len(),
+                body
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.flush().unwrap();
+
+            let (status, response_body) = read_one_response(&mut stream);
+            assert_eq!(status, 200, "request {id} on a reused connection");
+            let parsed: Value = serde_json::from_str(&response_body).unwrap();
+            assert_eq!(parsed["id"], id, "answers stay matched to their requests");
+        }
+    }
+
+    #[test]
+    fn test_a_chunked_body_over_the_limit_is_refused() {
+        // A chunked body declares no length, so the `Content-Length` check has
+        // nothing to look at and the cap on the read itself is the only thing
+        // standing between a peer and an unbounded allocation.
+        let addr = spawn_server_with(
+            OriginPolicy::Loopback,
+            ServerConfig {
+                name: "test-server".into(),
+                max_message_bytes: 1024,
+                ..Default::default()
+            },
+        );
+
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let chunk = "x".repeat(4096);
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            addr,
+            chunk.len(),
+            chunk
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        let status: u16 = response
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        assert_eq!(status, 413, "{response}");
+        assert!(response.contains("1024"), "{response}");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn test_serve_tls_refuses_a_certificate_it_cannot_use() {
+        // The one thing a mis-wired TLS path would do silently is bind *plain*
+        // HTTP on the HTTPS port. An unusable certificate has to be an error,
+        // which means the request never reached a listener at all.
+        let addr = format!("127.0.0.1:{}", next_port());
+
+        let error = HttpServer::new(ServerConfig::default())
+            .with_tools(|s: &mut Server<TestContext>| {
+                s.add_tool(EchoTool)?;
+                Ok(())
+            })
+            .serve_tls(
+                &addr,
+                b"-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n"
+                    .to_vec(),
+                b"-----BEGIN PRIVATE KEY-----\nnot a key\n-----END PRIVATE KEY-----\n".to_vec(),
+                || TestContext {
+                    counter: Arc::new(AtomicI64::new(0)),
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Failed to start HTTP server"),
+            "{error}"
+        );
+        assert!(
+            TcpStream::connect(&addr).is_err(),
+            "nothing may be listening after a refused certificate"
         );
     }
 

@@ -9,6 +9,9 @@ mod stdio;
 #[cfg(feature = "http")]
 mod http;
 
+#[cfg(feature = "http")]
+mod pool;
+
 #[cfg(unix)]
 mod unix;
 

@@ -22,9 +22,9 @@ schemars = { version = "1.0", optional = true }
 # JWT validation for hosted auth
 jsonwebtoken = { version = "9", optional = true }
 
-# HTTP server: thread-per-request on top of tiny_http, sync, no runtime.
-# default-features off drops gzip/brotli, which an MCP endpoint has no use for.
-rouille = { version = "3.6", optional = true, default-features = false }
+# HTTP server: tiny_http accepts, our own bounded thread pool answers. Sync, no
+# runtime, and four transitive deps (ascii, chunked_transfer, httpdate, log).
+tiny_http = { version = "0.12", optional = true }
 boon = "0.6"
 getrandom = "0.3"
 
@@ -36,12 +36,12 @@ libc = "0.2"
 [features]
 default = ["schema"]
 schema = ["dep:schemars"]
-http = ["dep:rouille"]
+http = ["dep:tiny_http"]
 auth = ["dep:jsonwebtoken"]
 hosted = ["http", "auth"]
 # HTTPS via rustls. Pure Rust - no system OpenSSL - and off by default,
 # because most deployments terminate TLS at a proxy and should not pay for it.
-tls = ["http", "rouille/rustls"]
+tls = ["http", "tiny_http/ssl-rustls"]
 
 [dev-dependencies]
 
