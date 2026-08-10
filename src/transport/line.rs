@@ -31,6 +31,15 @@ pub(crate) trait DeadlineRead: Read {
     fn set_deadline(&mut self, deadline: Option<Instant>) -> std::io::Result<()>;
 }
 
+/// Largest message this reader will accumulate, in bytes.
+///
+/// Without a bound, a peer that streams bytes and never sends a newline grows
+/// the buffer until the process is OOM-killed - and on a `UnixServer` anyone
+/// who can connect gets their own reader, so N connections multiply it. The
+/// framing rule ("**MUST NOT** contain embedded newlines") means a legitimate
+/// message is exactly one line, so a generous cap costs nothing real.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Reads newline-delimited messages, optionally under a deadline.
 pub(crate) struct LineReader<R> {
     inner: BufReader<R>,
@@ -38,6 +47,14 @@ pub(crate) struct LineReader<R> {
     ///
     /// Survives a timeout: the next read continues where this one stopped.
     partial: Vec<u8>,
+    /// Ceiling on `partial`.
+    max_bytes: usize,
+    /// Set when the current message blew the ceiling.
+    ///
+    /// Bytes keep being consumed and discarded until its newline arrives, so
+    /// framing resynchronizes on the next message rather than the connection
+    /// dying or the buffer growing.
+    overflowed: bool,
     /// Whether a deadline is currently applied to the source.
     ///
     /// Tracked so an untimed read never touches the source's settings. That is
@@ -50,9 +67,17 @@ pub(crate) struct LineReader<R> {
 
 impl<R: DeadlineRead> LineReader<R> {
     pub(crate) fn new(source: R) -> Self {
+        Self::with_limit(source, MAX_MESSAGE_BYTES)
+    }
+
+    /// A reader with a different ceiling, for tests that would rather not
+    /// allocate eight megabytes to prove a point.
+    pub(crate) fn with_limit(source: R, max_bytes: usize) -> Self {
         Self {
             inner: BufReader::new(source),
             partial: Vec::new(),
+            max_bytes,
+            overflowed: false,
             armed: false,
         }
     }
@@ -116,8 +141,19 @@ impl<R: DeadlineRead> LineReader<R> {
 
                 match available.iter().position(|&byte| byte == b'\n') {
                     Some(index) => {
-                        self.partial.extend_from_slice(&available[..=index]);
+                        if !self.overflowed {
+                            self.partial.extend_from_slice(&available[..=index]);
+                        }
                         (true, index + 1)
+                    }
+                    None if self.overflowed => (false, available.len()),
+                    None if self.partial.len() + available.len() > self.max_bytes => {
+                        // Stop accumulating, but keep reading: the rest of this
+                        // message still has to be skipped past so the next one
+                        // starts on a message boundary.
+                        self.overflowed = true;
+                        self.partial = Vec::new();
+                        (false, available.len())
                     }
                     None => {
                         self.partial.extend_from_slice(available);
@@ -128,6 +164,13 @@ impl<R: DeadlineRead> LineReader<R> {
             self.inner.consume(consumed);
 
             if line_ended {
+                if std::mem::take(&mut self.overflowed) {
+                    self.partial.clear();
+                    return Err(McpError::InvalidMessage(format!(
+                        "message exceeds the {} byte limit",
+                        self.max_bytes
+                    )));
+                }
                 let line = std::mem::take(&mut self.partial);
                 let text = String::from_utf8(line)
                     .map_err(|e| McpError::InvalidMessage(format!("message is not UTF-8: {e}")))?;
@@ -249,6 +292,49 @@ mod tests {
             bytes: bytes.as_bytes().to_vec(),
             available_at: now() + delay,
         }
+    }
+
+    #[test]
+    fn an_oversized_message_is_refused_without_growing_the_buffer() {
+        // A peer that streams bytes and never sends a newline used to grow
+        // `partial` until the process was OOM-killed - reachable by anyone who
+        // can open a Unix socket, once per connection.
+        let filler = "x".repeat(64);
+        let mut reader = LineReader::with_limit(
+            Scripted::new(vec![
+                chunk(&filler),
+                chunk(&filler),
+                chunk(&filler),
+                chunk("still going"),
+                chunk("\n"),
+                chunk(&request_line(7)),
+            ]),
+            100,
+        );
+
+        let error = reader.read_message(None).unwrap_err();
+        assert!(
+            matches!(&error, McpError::InvalidMessage(m) if m.contains("100 byte limit")),
+            "{error}"
+        );
+        assert!(
+            reader.partial.is_empty(),
+            "the oversized bytes must not be retained"
+        );
+
+        // Framing resynchronizes: the next message parses normally.
+        let recovered = reader.read_message(None).unwrap();
+        let JsonRpcMessage::Request(request) = recovered else {
+            panic!("expected a request");
+        };
+        assert_eq!(request.id, crate::types::RequestId::Number(7));
+    }
+
+    #[test]
+    fn a_message_at_the_limit_is_still_accepted() {
+        let line = request_line(1);
+        let mut reader = LineReader::with_limit(Scripted::new(vec![chunk(&line)]), line.len());
+        assert!(reader.read_message(None).is_ok());
     }
 
     fn request_line(id: i64) -> String {

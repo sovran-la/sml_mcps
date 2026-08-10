@@ -338,20 +338,34 @@ impl<'a> ToolEnv<'a> {
             }
         };
 
-        if let Err(McpError::Timeout(_)) = &outcome {
-            self.broker.abandon(&id);
-            // Best-effort: the client SHOULD stop working on something nobody
-            // is waiting for. A failure here changes nothing for us.
-            let _ = self.send_notification(
-                "notifications/cancelled",
-                Some(serde_json::json!({
-                    "requestId": id,
-                    "reason": format!("no response within {:?}", timeout.unwrap_or_default()),
-                })),
-            );
+        // Every exit where nobody will collect the answer any more, not just
+        // the timeout. A task cancelled mid-elicitation used to leave its
+        // `SyncSender` in the broker for the life of the process, and left a
+        // form on the user's screen for a request nobody was waiting for.
+        match &outcome {
+            Err(McpError::Timeout(_)) => self.give_up(
+                &id,
+                format!("no response within {:?}", timeout.unwrap_or_default()),
+            ),
+            Err(_) if self.is_cancelled() => self.give_up(&id, "the task was cancelled".into()),
+            _ => {}
         }
 
         outcome
+    }
+
+    /// Stop waiting for `id`, and tell the client so.
+    ///
+    /// Abandoning is what stops a late answer being mistaken for the next
+    /// request's, and lifecycle §Timeouts asks the giving-up party to "issue a
+    /// cancellation notification for that request and stop waiting for a
+    /// response". Best-effort: a failed notification changes nothing for us.
+    fn give_up(&self, id: &RequestId, reason: String) {
+        self.broker.abandon(id);
+        let _ = self.send_notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({ "requestId": id, "reason": reason })),
+        );
     }
 
     /// Wait for the reading thread to hand our response over.
@@ -2229,7 +2243,17 @@ impl<C: Send + Sync + 'static> Server<C> {
         let mut all_tools: Vec<crate::types::Tool> = self
             .tools
             .values()
-            .map(|entry| entry.tool.as_protocol_tool())
+            .map(|entry| {
+                let mut tool = entry.tool.as_protocol_tool();
+                // A server that declares no `tasks` capability but ships
+                // `taskSupport: "required"` tells the client two contradictory
+                // things: rule 1 of tool-level negotiation forbids
+                // task-augmenting at all, rule 2.3 demands it for this tool.
+                if self.tasks.is_none() {
+                    tool.execution = None;
+                }
+                tool
+            })
             .collect();
         all_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -6443,6 +6467,70 @@ mod tests {
         // And the blocked `tasks/result` unblocks with the cancellation.
         let result = read_until_response(&mut client, 3, |_, other| seen.push(other));
         assert!(result.error.is_some(), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cancelling_a_task_gives_up_on_its_outstanding_elicitation() {
+        // Two things used to be skipped on this exit: `broker.abandon`, so the
+        // waiter's `SyncSender` stayed in the map for the life of the process
+        // with a dead receiver, and the notification, so the client kept a form
+        // on screen for a request nobody was waiting for. Lifecycle §Timeouts:
+        // "the sender SHOULD issue a cancellation notification for that request
+        // and stop waiting for a response."
+        let (mut client, _server) = task_server_on_a_socket();
+        let (task_id, elicitation) = task_blocked_on_input(&mut client);
+
+        send(
+            &mut client,
+            3,
+            "tasks/cancel",
+            serde_json::json!({ "taskId": task_id }),
+        );
+
+        let mut cancelled_notification = None;
+        for _ in 0..50 {
+            match client.read().expect("client read") {
+                JsonRpcMessage::Notification(n) if n.method == "notifications/cancelled" => {
+                    cancelled_notification = Some(n);
+                    break;
+                }
+                JsonRpcMessage::Notification(_) | JsonRpcMessage::Response(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        let notification = cancelled_notification.expect("the client is owed a cancellation");
+        let params = notification.params.expect("params");
+        assert_eq!(
+            params["requestId"],
+            serde_json::to_value(&elicitation.id).unwrap()
+        );
+        assert!(
+            params["reason"].as_str().unwrap().contains("cancelled"),
+            "{params}"
+        );
+    }
+
+    #[test]
+    fn test_execution_is_not_advertised_without_the_tasks_capability() {
+        // Tool-level negotiation rule 1 forbids task-augmenting when
+        // `tasks.requests.tools.call` is absent, and rule 2.3 demands it for a
+        // `"required"` tool - so advertising one without the other tells the
+        // client two contradictory things.
+        let mut plain: Server<TestContext> = Server::new(ServerConfig::default());
+        plain.add_tool(TaskOnlyTool).unwrap();
+        let listed = dispatch(&mut plain, "tools/list", serde_json::json!({})).unwrap();
+        assert!(
+            listed["tools"][0]["execution"].is_null(),
+            "{}",
+            listed["tools"][0]
+        );
+
+        let mut enabled = task_server();
+        enabled.add_tool(TaskOnlyTool).unwrap();
+        let listed = dispatch(&mut enabled, "tools/list", serde_json::json!({})).unwrap();
+        assert_eq!(listed["tools"][0]["execution"]["taskSupport"], "required");
     }
 
     #[cfg(unix)]
