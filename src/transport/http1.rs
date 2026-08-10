@@ -1708,6 +1708,78 @@ mod tests {
         fn shutdown_write(&self) {}
     }
 
+    /// A socket that hands over what it has and then goes quiet *without*
+    /// hanging up - a client waiting to be told it may send its body.
+    ///
+    /// The opposite choice from [`Trickle`]: this one honours the deadline it
+    /// is given, and answers `WouldBlock` when it runs out, exactly as a real
+    /// socket does. That makes the wait itself the measurement - whatever an
+    /// answer costs here, it costs because something read from a peer that had
+    /// nothing to send.
+    struct Mute {
+        incoming: std::io::Cursor<Vec<u8>>,
+        outgoing: Arc<Mutex<Vec<u8>>>,
+        deadline: Mutex<Duration>,
+    }
+
+    impl Read for Mute {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.incoming.read(buffer)? {
+                0 => {
+                    let wait = *self.deadline.lock().unwrap_or_else(|e| e.into_inner());
+                    std::thread::sleep(wait);
+                    Err(std::io::Error::from(ErrorKind::WouldBlock))
+                }
+                read => Ok(read),
+            }
+        }
+    }
+
+    impl Write for Mute {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.outgoing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Socket for Mute {
+        fn set_read_timeout(&self, timeout: Option<Duration>) {
+            if let Some(timeout) = timeout {
+                *self.deadline.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
+            }
+        }
+        fn set_write_timeout(&self, _: Option<Duration>) {}
+        fn shutdown_write(&self) {}
+    }
+
+    /// Drive one request through a peer that then goes quiet, and say how long
+    /// the answer took to come back.
+    fn drive_mute<H>(request: &[u8], limits: Limits, handle: H) -> (String, Duration)
+    where
+        H: for<'a> Fn(&mut Request<'a>) -> Response,
+    {
+        let outgoing = Arc::new(Mutex::new(Vec::new()));
+        let socket = Mute {
+            incoming: std::io::Cursor::new(request.to_vec()),
+            outgoing: Arc::clone(&outgoing),
+            deadline: Mutex::new(Duration::from_secs(1)),
+        };
+
+        let started = Instant::now();
+        serve_connection(Box::new(socket), &limits, &handle);
+        let took = started.elapsed();
+
+        let written = outgoing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (String::from_utf8_lossy(&written).into_owned(), took)
+    }
+
     /// Drive one connection's worth of bytes through the loop and return what
     /// came back.
     fn drive<H>(request: &[u8], limits: Limits, handle: H) -> String
@@ -2141,6 +2213,43 @@ mod tests {
         let answer = drive(request, Limits::default(), echo_body(1024));
         assert!(!answer.contains("100 Continue"), "{answer}");
         assert!(answer.starts_with("HTTP/1.1 413 "), "{answer}");
+    }
+
+    #[test]
+    fn a_rejected_continue_is_answered_now_rather_than_waited_out() {
+        // A client that sent `Expect: 100-continue` is doing exactly what the
+        // spec asks: waiting for permission before it sends a body. The handler
+        // here declines to read, so permission never comes - and the drain then
+        // sat on `read_exactly` for the whole deadline waiting for bytes that
+        // were, correctly, never in flight. Measured at 3.0016 s against a
+        // 3-second timeout, on every `400`/`401`/`403`/`404`/`405` - all of
+        // which are on the unauthenticated path, so it was also a
+        // connection-holding primitive for about a hundred bytes.
+        let wire = b"POST /nope HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\
+                     Content-Length: 40\r\n\r\n";
+        let limits = Limits {
+            read_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+
+        // The peer hands over its head and then goes quiet without hanging up,
+        // which is precisely what the spec told it to do. If the drain waits on
+        // that, it waits out the whole thirty seconds - which is the default,
+        // and so what a real deployment paid per rejected request.
+        let (answer, took) = drive_mute(wire, limits, |_: &mut Request| {
+            Response::new(404).with_body("text/plain", b"no\n".to_vec())
+        });
+
+        assert!(answer.starts_with("HTTP/1.1 404 "), "{answer}");
+        assert!(
+            took < Duration::from_secs(1),
+            "the answer waited {took:?} for a body the client was told not to send"
+        );
+        assert!(!answer.contains("100 Continue"), "{answer}");
+        // `finished` stays false, so the connection ends - which is right: the
+        // peer's body was never framed onto the wire, and there is no agreed
+        // answer to where a next request would start.
+        assert!(answer.contains("Connection: close"), "{answer}");
     }
 
     #[test]
