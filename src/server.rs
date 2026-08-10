@@ -995,7 +995,7 @@ fn with_related_task_data(mut error: JsonRpcError, task_id: &str) -> JsonRpcErro
 ///
 /// `panic!("text")` and `panic!("{fmt}")` produce a `&str` and a `String`
 /// respectively; anything else is a custom payload nobody can render.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
         return (*text).to_string();
     }

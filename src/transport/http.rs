@@ -26,6 +26,16 @@ impl HttpTransport {
         }
     }
 
+    /// The buffered messages, tolerating a poisoned lock.
+    ///
+    /// Poisoning is exactly what a panic mid-request produces, and it is what
+    /// the caught panic then needs to report on. A `Vec<String>` has no
+    /// invariant an interrupted write can break, so there is nothing to protect
+    /// by refusing to look at it.
+    fn buffered(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.messages.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Take the response as an SSE stream body
     ///
     /// Returns the messages formatted as SSE events:
@@ -36,8 +46,7 @@ impl HttpTransport {
     ///
     /// ```
     pub fn take_sse_response(&mut self) -> String {
-        let messages = self.messages.lock().unwrap();
-        messages
+        self.buffered()
             .iter()
             .map(|msg| format!("data: {}\n\n", msg))
             .collect()
@@ -45,16 +54,16 @@ impl HttpTransport {
 
     /// Take response as plain JSON (for single response, no notifications)
     ///
-    /// Returns just the last message (the actual response), or empty if none.
+    /// Returns just the last message (the actual response), or `None` when the
+    /// server wrote nothing - which is what a notification or a response looks
+    /// like, and is answered with `202 Accepted`.
     pub fn take_response(&mut self) -> Option<String> {
-        let messages = self.messages.lock().unwrap();
-        messages.last().cloned()
+        self.buffered().last().cloned()
     }
 
     /// Check if there are multiple messages (notifications + response)
     pub fn has_notifications(&self) -> bool {
-        let messages = self.messages.lock().unwrap();
-        messages.len() > 1
+        self.buffered().len() > 1
     }
 }
 
@@ -67,11 +76,7 @@ impl Transport for HttpTransport {
 
     fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
         let json = serde_json::to_string(message)?;
-        let mut messages = self
-            .messages
-            .lock()
-            .map_err(|_| McpError::Internal("Lock poisoned".into()))?;
-        messages.push(json);
+        self.buffered().push(json);
         Ok(())
     }
 
@@ -106,6 +111,26 @@ fn header_value<'a>(request: &'a TinyRequest, name: &'static str) -> Option<&'a 
         .iter()
         .find(|h| h.field.equiv(name))
         .map(|h| h.value.as_str())
+}
+
+/// The path of a request URL, without any query string or fragment.
+///
+/// `tiny_http` hands back the raw request target, so `/mcp?sessionId=abc` is
+/// not `/mcp` by string comparison - and the spec asks for "a single HTTP
+/// endpoint *path*". The well-known metadata route has the same problem, and
+/// it is a URL intermediaries append cache busters to.
+fn path_of(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or("")
+}
+
+/// What a processed request produced.
+enum Processed {
+    /// A body to send with `200 OK`.
+    Body(String, &'static str),
+    /// Nothing to send. The input was a JSON-RPC response or notification, and
+    /// the spec is specific: "If the server accepts the input, the server
+    /// **MUST** return HTTP status code 202 Accepted with no body."
+    Accepted,
 }
 
 /// Build an error response whose body is a JSON-RPC error object.
@@ -252,7 +277,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     fn protected_resource_response(&self, request: &TinyRequest) -> Option<HttpResponse> {
         let metadata = self.protected_resource.as_ref()?;
         let path = metadata.resource_uri().ok()?.metadata_path();
-        if request.url() != path {
+        if path_of(request.url()) != path {
             return None;
         }
 
@@ -294,7 +319,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             return Some(response);
         }
 
-        if request.url() != self.endpoint {
+        if path_of(request.url()) != self.endpoint {
             return Some(error_response(404, -32600, "Not Found"));
         }
 
@@ -362,18 +387,46 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         }
     }
 
+    /// Write a diagnostic that may contain request or response bodies.
+    ///
+    /// Logging §Security: "Log messages **MUST NOT** contain: Credentials or
+    /// secrets; Personal identifying information". Tool arguments routinely
+    /// carry both, so full bodies are only written when the server was
+    /// configured for `debug` in the first place.
+    fn trace(&self, message: impl FnOnce() -> String) {
+        if self.logs_bodies() {
+            eprintln!("{}", message());
+        }
+    }
+
+    /// Whether this server was configured verbosely enough to print bodies.
+    fn logs_bodies(&self) -> bool {
+        self.config.default_log_level == crate::server::LogLevel::Debug
+    }
+
     /// Turn a processed result into the HTTP response to send.
-    fn finish(&self, outcome: Result<(String, &'static str)>) -> HttpResponse {
+    fn finish(&self, outcome: Result<Processed>) -> HttpResponse {
         match outcome {
-            Ok((response_body, content_type)) => {
-                eprintln!("  Response ({}): {}", content_type, response_body);
+            Ok(Processed::Body(response_body, content_type)) => {
+                self.trace(|| format!("  Response ({}): {}", content_type, response_body));
                 let header = Header::from_bytes("Content-Type", content_type)
                     .expect("static Content-Type header is valid");
                 Response::from_data(response_body.into_bytes()).with_header(header)
             }
+            // 202 with *no body*: `{}` is not a valid JSON-RPC message, so a
+            // strict client parsing it fails.
+            Ok(Processed::Accepted) => Response::from_data(Vec::new()).with_status_code(202),
             Err(e) => {
                 eprintln!("  Error: {}", e);
-                error_response(500, -32603, format!("Internal error: {}", e))
+                // A client's syntax error is not the server's internal error.
+                // The -32600 the batch path carefully builds used to be thrown
+                // away by this wrapper.
+                let (status, code) = match &e {
+                    McpError::Json(_) => (400, -32700),
+                    McpError::InvalidMessage(_) => (400, -32600),
+                    _ => (500, -32603),
+                };
+                error_response(status, code, e.to_string())
             }
         }
     }
@@ -409,10 +462,9 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
                 }
             };
 
-            eprintln!("  Request: {}", body);
+            self.trace(|| format!("  Request: {}", body));
 
-            let mut ctx = context_factory();
-            let response = self.finish(self.process_request(body, &mut ctx));
+            let response = self.finish(self.guarded(body, &context_factory));
             if let Err(e) = request.respond(response) {
                 eprintln!("  Failed to send response: {}", e);
             }
@@ -485,11 +537,10 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
                 }
             };
 
-            eprintln!("  Request: {}", body);
+            self.trace(|| format!("  Request: {}", body));
 
             // Process request with auth context
-            let mut ctx = context_factory(&claims);
-            let response = self.finish(self.process_request(body, &mut ctx));
+            let response = self.finish(self.guarded(body, || context_factory(&claims)));
             if let Err(e) = request.respond(response) {
                 eprintln!("  Failed to send response: {}", e);
             }
@@ -498,8 +549,28 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         Ok(())
     }
 
-    /// Process a single request and return (body, content_type)
-    fn process_request(&self, body: String, ctx: &mut C) -> Result<(String, &'static str)> {
+    /// [`process_request`](Self::process_request) with the request's panics
+    /// contained.
+    ///
+    /// `process_request` is called straight out of `incoming_requests()`, so an
+    /// unwinding tool, setup closure, or context factory used to take the
+    /// accept loop with it: the client saw a dropped connection and the server
+    /// stopped serving *everyone*.
+    fn guarded(&self, body: String, make_context: impl FnOnce() -> C) -> Result<Processed> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ctx = make_context();
+            self.process_request(body, &mut ctx)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(McpError::Internal(format!(
+                "request handler panicked: {}",
+                crate::server::panic_message(payload.as_ref())
+            )))
+        })
+    }
+
+    /// Process a single request and return the body to send, if any.
+    fn process_request(&self, body: String, ctx: &mut C) -> Result<Processed> {
         // Create fresh server
         let mut server: Server<C> = Server::new(self.config.clone());
 
@@ -518,14 +589,18 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             .map_err(|_| McpError::Internal("Transport lock poisoned".into()))?;
 
         if transport_guard.has_notifications() {
-            Ok((transport_guard.take_sse_response(), "text/event-stream"))
-        } else {
-            Ok((
-                transport_guard
-                    .take_response()
-                    .unwrap_or_else(|| "{}".to_string()),
-                "application/json",
-            ))
+            return Ok(Processed::Body(
+                transport_guard.take_sse_response(),
+                "text/event-stream",
+            ));
+        }
+
+        // Nothing written means the input was a notification or a response,
+        // which is the 202 case. It used to be answered `200 {}`, and `{}` is
+        // not a JSON-RPC message.
+        match transport_guard.take_response() {
+            Some(body) => Ok(Processed::Body(body, "application/json")),
+            None => Ok(Processed::Accepted),
         }
     }
 }
@@ -658,6 +733,28 @@ mod http_server_tests {
         }
     }
 
+    // Tool that panics, to prove one bad call cannot end the accept loop
+    struct PanicTool;
+    impl Tool<TestContext> for PanicTool {
+        fn name(&self) -> &str {
+            "panic"
+        }
+        fn description(&self) -> &str {
+            "Panics on purpose"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            panic!("http tool exploded");
+        }
+    }
+
     // Counter tool that uses context
     struct CounterTool;
     impl Tool<TestContext> for CounterTool {
@@ -774,6 +871,7 @@ mod http_server_tests {
                 .origin_policy(policy)
                 .with_tools(|s: &mut Server<TestContext>| {
                     s.add_tool(EchoTool)?;
+                    s.add_tool(PanicTool)?;
                     Ok(())
                 })
                 .serve(&server_addr, move || TestContext {
@@ -786,6 +884,152 @@ mod http_server_tests {
     }
 
     const PING: &str = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    //
+    // Transport-level conformance
+    //
+
+    #[test]
+    fn test_a_notification_is_202_with_no_body() {
+        // "If the input is a JSON-RPC response or notification: If the server
+        // accepts the input, the server MUST return HTTP status code 202
+        // Accepted with no body." It used to answer `200 {}`, and `{}` is not a
+        // JSON-RPC message, so a strict client fails parsing it.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let (status, _, body) = http_post(
+            &addr,
+            "/mcp",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(status, 202);
+        assert!(body.is_empty(), "202 must have no body, got {body:?}");
+    }
+
+    #[test]
+    fn test_a_client_response_is_202_with_no_body() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let (status, _, body) =
+            http_post(&addr, "/mcp", r#"{"jsonrpc":"2.0","id":7,"result":{}}"#).unwrap();
+
+        assert_eq!(status, 202);
+        assert!(body.is_empty(), "202 must have no body, got {body:?}");
+    }
+
+    #[test]
+    fn test_an_unparseable_body_is_400_parse_error() {
+        // A client's syntax error is not the server's internal error.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let (status, _, body) = http_post(&addr, "/mcp", "{not json").unwrap();
+
+        assert_eq!(status, 400);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn test_a_batch_body_is_400_invalid_request() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let (status, _, body) = http_post(
+            &addr,
+            "/mcp",
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(status, 400);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], -32600);
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("batching"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn test_the_endpoint_is_a_path_not_a_request_target() {
+        // "The server MUST provide a single HTTP endpoint *path*". `tiny_http`
+        // hands back the raw target, so `/mcp?sessionId=abc` used to 404.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        for target in ["/mcp?sessionId=abc", "/mcp?", "/mcp#frag"] {
+            let (status, _, body) = http_post(&addr, target, PING).unwrap();
+            assert_eq!(status, 200, "{target} should reach the endpoint: {body}");
+        }
+    }
+
+    #[test]
+    fn test_a_panicking_tool_does_not_kill_the_accept_loop() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        // Caught at the dispatch layer, so the client gets a well-formed
+        // JSON-RPC error rather than a dropped connection.
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"panic"}}"#;
+        let (status, _, body) = http_post(&addr, "/mcp", call).unwrap();
+        assert_eq!(status, 200);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], -32603, "{body}");
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("panicked"),
+            "{body}"
+        );
+
+        // The listener must still be there for everyone else.
+        let (status, _, _) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 200, "the accept loop died with the tool");
+    }
+
+    #[test]
+    fn test_a_panic_outside_dispatch_does_not_kill_the_accept_loop() {
+        // The outer guard's job: anything that unwinds through
+        // `process_request` - a setup closure, a context factory, a `schema()`
+        // implementation - used to terminate the listener thread.
+        let addr = format!("127.0.0.1:{}", next_port());
+
+        let server_addr = addr.clone();
+        thread::spawn(move || {
+            let counter = Arc::new(AtomicI64::new(0));
+            let _ = HttpServer::new(ServerConfig::default())
+                .with_tools(|_: &mut Server<TestContext>| panic!("setup exploded"))
+                .serve(&server_addr, move || TestContext {
+                    counter: counter.clone(),
+                });
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        let (status, _, body) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 500);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], -32603);
+
+        let (status, _, _) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 500, "the accept loop died with the setup closure");
+    }
+
+    #[test]
+    fn test_request_bodies_are_only_logged_at_debug() {
+        // Logging §Security: log messages MUST NOT contain credentials or PII,
+        // and tool arguments routinely carry both.
+        let quiet: HttpServer<TestContext> = HttpServer::new(ServerConfig::default());
+        assert!(!quiet.logs_bodies());
+
+        let verbose: HttpServer<TestContext> = HttpServer::new(ServerConfig {
+            default_log_level: crate::server::LogLevel::Debug,
+            ..Default::default()
+        });
+        assert!(verbose.logs_bodies());
+    }
 
     #[test]
     fn test_origin_absent_is_allowed() {
