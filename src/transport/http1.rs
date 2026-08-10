@@ -1096,6 +1096,11 @@ fn read_line(
 ) -> std::io::Result<Line> {
     // An exhausted budget is a line too long, not a connection that ended -
     // reading zero bytes because we asked for zero says nothing about the peer.
+    //
+    // Unreachable as written: both callers pass a fresh non-zero constant. It
+    // stays because the alternative is a caller that shares a budget across
+    // lines - which is what the head used to do here - reading `Eof` off a
+    // peer that is still talking, and that is a desync rather than a bug.
     if *budget == 0 {
         return Ok(Line::TooLong);
     }

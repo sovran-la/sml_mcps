@@ -2919,11 +2919,11 @@ mod http_server_tests {
 
     #[test]
     fn test_two_requests_on_one_connection_are_both_answered() {
-        // Every other test here closes the connection after one request. A
-        // request now travels to a worker thread to be answered, and `tiny_http`
-        // only reads the next request on a connection once the previous one has
-        // been responded to - so a handoff that lost the request, or answered
-        // out of band, would wedge the connection rather than fail loudly.
+        // Every other test here closes the connection after one request. There
+        // is no pipelining: `serve_connection` answers a request before it
+        // reads the next one, so anything that lost a request, or answered out
+        // of band, or left the connection framed at the wrong byte, would wedge
+        // this rather than fail loudly.
         let addr = spawn_server(OriginPolicy::Loopback);
 
         let mut stream = TcpStream::connect(&addr).unwrap();
