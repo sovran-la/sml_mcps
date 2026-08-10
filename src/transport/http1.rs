@@ -990,7 +990,11 @@ fn rejection(error: httparse::Error) -> Response {
         // An extra space in the request line, a method that is not a token, a
         // control character in the target.
         Error::Token => bad_request("a malformed request line"),
-        Error::NewLine => bad_request("a line ending that is not CRLF"),
+        // Not "a line ending that is not CRLF", which is what this used to say:
+        // `httparse` raises `NewLine` for a `\r` that is *not* followed by a
+        // `\n`, and accepts a bare `\n` (RFC 9112 §2.2 permits that in a head).
+        // A stray carriage return is the thing a client can go and find.
+        Error::NewLine => bad_request("a stray carriage return"),
         // `Error::Status` is response-only, so unreachable from here; the
         // wildcard is for whatever a later `httparse` adds.
         _ => bad_request("a malformed request head"),
@@ -2580,6 +2584,63 @@ mod tests {
     }
 
     #[test]
+    fn chunked_framing_requires_a_crlf_at_every_line() {
+        // RFC 9112 §2.2 lets a recipient accept a bare LF, and this server does
+        // - in "the start-line and fields", which is the scope of that
+        // permission and is `httparse`'s business. §7.1's chunked grammar is
+        // strict CRLF, and bare-LF chunk framing is one of the better-known
+        // smuggling differentials precisely because front-ends disagree about
+        // it. This module's whole stated position is being the strict side.
+        //
+        // The claim that used to cover this was that `httparse` rejects a bare
+        // LF in a chunk size - true of `httparse`, and never reached, because
+        // `read_line` had already stripped the LF and `parse_chunk_size`
+        // re-appended a CRLF before handing it over. The check the comment
+        // relied on could not run. It is ours now, so it does.
+        let head = "POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        // Bare LF after the chunk size, after the chunk data, and after the
+        // last chunk - each on its own, so no case is passing for another's
+        // reason.
+        for body in [
+            "5\nhello\r\n0\r\n\r\n",
+            "5\r\nhello\n0\r\n\r\n",
+            "5\r\nhello\r\n0\n\r\n",
+            "5\r\nhello\r\n0\r\n\n",
+        ] {
+            let request = format!("{head}{body}");
+            let answer = drive(request.as_bytes(), Limits::default(), echo_body(1024));
+            assert!(
+                answer.starts_with("HTTP/1.1 400 "),
+                "bare LF accepted in {body:?}: {answer}"
+            );
+        }
+
+        // And the all-CRLF version of the same body is still read.
+        let request = format!("{head}5\r\nhello\r\n0\r\n\r\n");
+        let answer = drive(request.as_bytes(), Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.ends_with("hello"), "{answer}");
+    }
+
+    #[test]
+    fn a_trailer_section_is_held_to_the_same_crlf() {
+        // The blank line ending the trailers is the byte the next request
+        // starts after, so it is framing like any other.
+        let head = "POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        let request = format!("{head}5\r\nhello\r\n0\r\nX-Trailer: v\n\r\n");
+        let answer = drive(request.as_bytes(), Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+
+        // Trailers themselves are still parsed and discarded when well formed.
+        let request = format!("{head}5\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n");
+        let answer = drive(request.as_bytes(), Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.ends_with("hello"), "{answer}");
+    }
+
+    #[test]
     fn a_chunked_body_ending_on_a_blank_line_is_refused() {
         // The guard above, reached the way an attacker would rather than by
         // calling it directly. The body here is a blank line where a chunk size
@@ -2592,6 +2653,18 @@ mod tests {
                         Transfer-Encoding: chunked\r\n\r\n\r\n\r\n";
         let answer = drive(request, Limits::default(), echo_body(1024));
         assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+    }
+
+    #[test]
+    fn a_stray_carriage_return_is_named_as_one() {
+        // What `Error::NewLine` actually is, and what the diagnostic used to
+        // get wrong. `httparse` raises it for a `\r` with no `\n` behind it;
+        // "a line ending that is not CRLF" described a bare LF, which is the
+        // one thing it *accepts*.
+        let request = b"POST /mcp HTTP/1.1\rHost: x\r\n\r\n";
+        let answer = drive(request, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+        assert!(answer.contains("a stray carriage return"), "{answer}");
     }
 
     #[test]
