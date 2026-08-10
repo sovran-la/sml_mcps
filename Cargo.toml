@@ -22,9 +22,15 @@ schemars = { version = "1.0", optional = true }
 # JWT validation for hosted auth
 jsonwebtoken = { version = "9", optional = true }
 
-# HTTP server: tiny_http accepts, our own bounded thread pool answers. Sync, no
-# runtime, and four transitive deps (ascii, chunked_transfer, httpdate, log).
-tiny_http = { version = "0.12", optional = true }
+# TLS for the HTTP server. Pure Rust, and only pulled in by the `tls` feature -
+# most deployments terminate TLS at a proxy and should not pay for it.
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "std",
+    "ring",
+    "tls12",
+    "logging",
+] }
+rustls-pemfile = { version = "2", optional = true }
 boon = "0.6"
 getrandom = "0.3"
 
@@ -36,12 +42,15 @@ libc = "0.2"
 [features]
 default = ["schema"]
 schema = ["dep:schemars"]
-http = ["dep:tiny_http"]
+# The HTTP/1.1 server is ours, on std::net, so this feature costs no
+# dependencies at all. See src/transport/http1.rs for why it is not somebody
+# else's.
+http = []
 auth = ["dep:jsonwebtoken"]
 hosted = ["http", "auth"]
 # HTTPS via rustls. Pure Rust - no system OpenSSL - and off by default,
 # because most deployments terminate TLS at a proxy and should not pay for it.
-tls = ["http", "tiny_http/ssl-rustls"]
+tls = ["http", "dep:rustls", "dep:rustls-pemfile"]
 
 [dev-dependencies]
 

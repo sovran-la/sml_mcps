@@ -126,12 +126,10 @@ impl Transport for HttpTransport {
 use crate::server::{LogLevel, Server, ServerConfig, TaskContext};
 use crate::tasks::{TaskStore, random_hex_id};
 use crate::transport::OriginPolicy;
-use crate::transport::pool::WorkerPool;
+use crate::transport::http1::{self, BodyError, Limits, Method, Request, Response};
 use crate::types::{ASSUMED_PROTOCOL_VERSION, ClientCapabilities};
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
-use tiny_http::{Header, Method, Request, Response, Server as TinyServer};
 
 #[cfg(feature = "auth")]
 use crate::auth::{Claims, JwtValidator, ProtectedResourceMetadata, unauthorized_challenge};
@@ -140,10 +138,7 @@ use crate::auth::{Claims, JwtValidator, ProtectedResourceMetadata, unauthorized_
 type SetupFn<C> = Box<dyn Fn(&mut Server<C>) -> Result<()> + Send + Sync>;
 
 /// A ready-to-send HTTP response with an owned body.
-///
-/// Owned, rather than borrowing from the request, because the response travels
-/// to a worker thread and outlives whatever built it.
-type HttpResponse = Response<Cursor<Vec<u8>>>;
+type HttpResponse = Response;
 
 /// The header carrying the session id, per transports §Session Management.
 const SESSION_HEADER: &str = "Mcp-Session-Id";
@@ -168,37 +163,18 @@ fn path_of(url: &str) -> &str {
 }
 
 /// Look up a request header, case-insensitively as HTTP requires.
-fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
-    request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv(name))
-        .map(|header| header.value.as_str())
-}
-
-/// Attach a header, or leave the response alone if the value cannot be one.
-///
-/// Nothing here builds a header value a client controls, so the failing arm is
-/// unreachable in practice - but dropping one header beats refusing to answer.
-fn with_header(response: HttpResponse, name: &'static str, value: impl AsRef<str>) -> HttpResponse {
-    match Header::from_bytes(name, value.as_ref()) {
-        Ok(header) => response.with_header(header),
-        Err(()) => response,
-    }
+fn header_value<'a>(request: &'a Request<'_>, name: &'static str) -> Option<&'a str> {
+    request.header(name)
 }
 
 /// A `200 OK` carrying this body, as this content type.
 fn body_response(content_type: &'static str, body: String) -> HttpResponse {
-    with_header(
-        Response::from_data(body.into_bytes()),
-        "Content-Type",
-        content_type,
-    )
+    Response::new(200).with_body(content_type, body.into_bytes())
 }
 
 /// A response with no body at all, for the statuses that must not carry one.
 fn empty_response(status: u16) -> HttpResponse {
-    Response::from_data(Vec::new()).with_status_code(status)
+    Response::new(status)
 }
 
 /// State that belongs to one client's session rather than to one request.
@@ -259,7 +235,14 @@ impl Session {
         if server.log_level() != default_level {
             self.log_level = Some(server.log_level());
         }
-        self.client_capabilities = server.client_capabilities().clone();
+        // Merged, not assigned. Requests in one session run in parallel now, so
+        // a `ping` that restored an empty set and absorbed it back could
+        // otherwise land on top of a concurrent `initialize` and erase what the
+        // client had just declared. A request that declares nothing has nothing
+        // to say about capabilities.
+        if declares_something(server.client_capabilities()) {
+            self.client_capabilities = server.client_capabilities().clone();
+        }
         if let Some(version) = server.negotiated_version() {
             self.negotiated_version = Some(version.to_string());
         }
@@ -273,6 +256,14 @@ impl Session {
     /// table. A handshake, a log level, or a live task is worth an entry; the
     /// bare task *store* is not, since every request on a tasks-enabled server
     /// donates one whether or not a task was ever created.
+    ///
+    /// **A session can therefore end without a `DELETE`.** A client that never
+    /// sent `initialize`, never set a log level, and whose tasks have all
+    /// expired holds nothing, so its id stops being one this server knows and
+    /// its next request is answered `404` - which the spec defines as
+    /// "terminated", so the client's move is to start again. A client that
+    /// handshakes keeps `initialized` forever and never sees this; the case it
+    /// bites is one that creates tasks without initializing.
     fn worth_keeping(&self) -> bool {
         self.initialized
             || self.log_level.is_some()
@@ -282,6 +273,19 @@ impl Session {
                 .as_ref()
                 .is_some_and(|store| !store.is_empty().unwrap_or(true))
     }
+}
+
+/// Whether this capability set says anything at all.
+///
+/// An all-absent set is what a request that never sent `initialize` carries, so
+/// it is indistinguishable from "I have nothing to add" - and treating it as
+/// "the client supports nothing" is how a concurrent request erases a
+/// handshake.
+fn declares_something(capabilities: &ClientCapabilities) -> bool {
+    !capabilities.experimental.is_empty()
+        || capabilities.sampling.is_some()
+        || capabilities.elicitation.is_some()
+        || capabilities.roots.is_some()
 }
 
 /// One entry in the session table.
@@ -313,16 +317,37 @@ impl Sessions {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The key a session is filed under.
+    ///
+    /// Under `serve_with_auth` the authenticated identity is part of it, which
+    /// is what security_best_practices §Session Hijacking asks for: "combine
+    /// the session ID with information unique to the authorized user, such as
+    /// their internal user ID. Use a key format like `<user_id>:<session_id>`.
+    /// This ensures that even if an attacker guesses a session ID, they cannot
+    /// impersonate another user as the user ID is derived from the user token
+    /// and not provided by the client."
+    ///
+    /// Without authentication there is no identity to bind to, so the id stands
+    /// alone - and that server has no tenants to keep apart.
+    fn key(owner: Option<&str>, id: &str) -> String {
+        match owner {
+            Some(owner) => format!("{owner}\u{1}{id}"),
+            None => id.to_string(),
+        }
+    }
+
     /// The session this request belongs to.
     ///
     /// A request that names a session gets that one, or `Err` if it has been
-    /// terminated or expired - which the spec answers with `404`. A request
-    /// that names none gets a brand-new one rather than sharing anybody's:
-    /// a client that does not participate in session management then behaves
-    /// exactly as it did before sessions existed, with no state carried and
-    /// nothing inherited.
+    /// terminated or expired - which the spec answers with `404`. A session id
+    /// belonging to somebody else is *also* `Err`, because it is not a key this
+    /// identity can name. A request that names none gets a brand-new one rather
+    /// than sharing anybody's: a client that does not participate in session
+    /// management then behaves exactly as it did before sessions existed, with
+    /// no state carried and nothing inherited.
     fn checkout(
         &self,
+        owner: Option<&str>,
         id: Option<&str>,
     ) -> std::result::Result<(String, Arc<Mutex<Session>>), UnknownSession> {
         let mut table = self.table();
@@ -330,7 +355,7 @@ impl Sessions {
 
         match id {
             Some(id) => {
-                let entry = table.get_mut(id).ok_or(UnknownSession)?;
+                let entry = table.get_mut(&Self::key(owner, id)).ok_or(UnknownSession)?;
                 entry.last_used = Instant::now();
                 Ok((id.to_string(), entry.state.clone()))
             }
@@ -340,19 +365,30 @@ impl Sessions {
 
     /// Put the session back, and say whether it is worth telling the client
     /// about.
-    fn check_in(&self, id: String, state: Arc<Mutex<Session>>) -> Option<String> {
+    fn check_in(
+        &self,
+        owner: Option<&str>,
+        id: String,
+        state: Arc<Mutex<Session>>,
+    ) -> Option<String> {
+        // Poison-tolerant, like every other lock here. Mapping a poisoned
+        // session to "nothing worth keeping" is indistinguishable from an
+        // ordinary sweep, so one panic anywhere would silently delete the
+        // client's session and `404` its next request.
         let keep = state
             .lock()
-            .map(|session| session.worth_keeping())
-            .unwrap_or(false);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .worth_keeping();
+
+        let key = Self::key(owner, &id);
         if !keep {
-            self.table().remove(&id);
+            self.table().remove(&key);
             return None;
         }
 
         let mut table = self.table();
         table.insert(
-            id.clone(),
+            key,
             SessionEntry {
                 state,
                 last_used: Instant::now(),
@@ -363,8 +399,8 @@ impl Sessions {
     }
 
     /// Forget a session, as `DELETE` asks.
-    fn terminate(&self, id: &str) -> bool {
-        self.table().remove(id).is_some()
+    fn terminate(&self, owner: Option<&str>, id: &str) -> bool {
+        self.table().remove(&Self::key(owner, id)).is_some()
     }
 
     /// Drop sessions nobody has touched in a while.
@@ -376,9 +412,16 @@ impl Sessions {
     /// Keep the table under its ceiling, least recently used first.
     fn evict_oldest(table: &mut HashMap<String, SessionEntry>) {
         while table.len() > MAX_SESSIONS {
+            // Compared, not keyed: `min_by_key` would clone every id it looked
+            // at, on every eviction, to break a tie between two identical
+            // instants.
             let Some(oldest) = table
                 .iter()
-                .min_by_key(|(id, entry)| (entry.last_used, (*id).clone()))
+                .min_by(|(left_id, left), (right_id, right)| {
+                    left.last_used
+                        .cmp(&right.last_used)
+                        .then_with(|| left_id.cmp(right_id))
+                })
                 .map(|(id, _)| id.clone())
             else {
                 return;
@@ -410,7 +453,17 @@ fn error_response(status: u16, code: i32, message: impl AsRef<str>) -> HttpRespo
     })
     .to_string();
 
-    body_response("application/json", body).with_status_code(status)
+    Response::new(status).with_body("application/json", body.into_bytes())
+}
+
+/// A `405` naming what this path *does* answer.
+///
+/// RFC 9110 §15.5.6: "The origin server **MUST** generate an `Allow` header
+/// field in a 405 response containing a list of the target resource's currently
+/// supported methods." Clients probing for the older HTTP+SSE transport read
+/// these.
+fn method_not_allowed(allow: &'static str) -> HttpResponse {
+    error_response(405, -32600, "Method Not Allowed").with_header("Allow", allow)
 }
 
 /// How the listening socket is set up.
@@ -424,87 +477,76 @@ enum Binding {
     },
 }
 
-/// Threads to keep for serving requests.
+/// The answer to a connection that arrived with nowhere to run.
 ///
-/// It wants to be comfortably larger than the number of clients that might sit
-/// in a blocking `tasks/result` at once - that call is bounded by
-/// [`ServerConfig::task_result_timeout`], but while it waits it holds one of
-/// these.
-fn default_pool_size() -> usize {
-    8 * std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-}
-
-/// The answer to a request that arrived with nowhere to run.
-///
-/// Every worker busy *and* the queue behind them full is the one case a bounded
-/// pool has to have an answer for. Queueing without limit would let a peer make
-/// the server hold arbitrarily many accepted requests; blocking the accept loop
-/// would make the whole listener as slow as its slowest request, which is the
-/// thing this design exists to prevent. So it is said out loud, in the shape
-/// clients already parse.
+/// A ceiling on live connections is the one thing standing between a peer and
+/// deciding how many threads this process has, so there is a state where a
+/// connection arrives and there is no room. Saying so beats accepting it and
+/// never getting to it.
 fn overloaded() -> HttpResponse {
     error_response(
         503,
         -32603,
-        "Service Unavailable: every request thread is busy; retry shortly",
+        "Service Unavailable: too many connections; retry shortly",
     )
 }
 
-/// Bind, then serve forever: accept on this thread, answer on the pool.
+/// Bind, then serve forever: accept on this thread, answer on one thread per
+/// connection.
 ///
-/// The accept loop does exactly two things - take a request and hand it to a
-/// worker - so how long any one request takes cannot affect when the next is
-/// picked up. That is the whole difference from the loop this replaced.
-fn listen<H>(addr: &str, pool_size: usize, binding: Binding, handle: H) -> Result<()>
+/// The accept loop does exactly two things - take a connection and hand it to a
+/// thread - and neither of them waits on a peer. A refused connection is
+/// answered by a thread of its own for the same reason.
+fn listen<H>(addr: &str, limits: Limits, binding: Binding, handle: H) -> Result<()>
 where
-    H: Fn(Request) + Send + Sync + 'static,
+    H: for<'a> Fn(&mut Request<'a>) -> HttpResponse + Send + Sync + 'static,
 {
-    let server = match binding {
-        Binding::Plain => TinyServer::http(addr),
-        #[cfg(feature = "tls")]
+    #[cfg(feature = "tls")]
+    let tls = match binding {
+        Binding::Plain => None,
         Binding::Tls {
             certificate,
             private_key,
-        } => TinyServer::https(
-            addr,
-            tiny_http::SslConfig {
-                certificate,
-                private_key,
-            },
-        ),
-    }
-    .map_err(|e| McpError::Internal(format!("Failed to start HTTP server: {}", e)))?;
+        } => Some(http1::TlsSettings {
+            certificate,
+            private_key,
+        }),
+    };
+    #[cfg(not(feature = "tls"))]
+    let Binding::Plain = binding;
 
-    // Room for one waiting request per thread. Big enough that a burst of short
-    // requests queues instead of being refused, small enough that "the server
-    // is saturated" is answered rather than hidden behind an ever-growing
-    // backlog nobody is getting to.
-    let threads = pool_size.max(1);
-    let pool = WorkerPool::new(threads, threads, handle);
-
-    for request in server.incoming_requests() {
-        if let Err(request) = pool.dispatch(request) {
-            let _ = request.respond(overloaded());
-        }
-    }
-
-    Ok(())
+    http1::serve(
+        addr,
+        #[cfg(feature = "tls")]
+        tls,
+        limits,
+        overloaded(),
+        handle,
+    )
 }
 
 /// High-level HTTP MCP server
 ///
-/// Wraps the request loop boilerplate for serving MCP over HTTP. `tiny_http`
-/// accepts; a fixed pool of threads answers, one request each, so a client
-/// blocked in `tasks/result` cannot hold up anybody else.
+/// Wraps the request loop boilerplate for serving MCP over HTTP. One thread
+/// accepts; each connection gets a thread of its own, so a client blocked in
+/// `tasks/result` cannot hold up anybody else.
 ///
-/// The pool is bounded in both directions - [`pool_size`](Self::pool_size)
-/// threads, and one waiting request per thread behind them. A request arriving
-/// when both are full is answered `503` rather than queued, because a queue
-/// with no ceiling is a peer deciding how much this server holds, and blocking
-/// the accept loop instead would make the listener as slow as its slowest
-/// request.
+/// What a peer can make this process hold is bounded in every direction it can
+/// push: [`max_connections`](Self::max_connections) live connections, a
+/// [`read_timeout`](Self::read_timeout) on every read, an
+/// [`idle_timeout`](Self::idle_timeout) on a kept-alive connection, and
+/// [`ServerConfig::max_message_bytes`] on a body. A connection arriving when
+/// the ceiling is reached is answered `503` and closed, on a thread that is not
+/// the accept loop - because the accept loop waiting on a peer is how a
+/// saturated server becomes a deaf one.
+///
+/// # Exposure
+///
+/// This is safe to expose directly. It was not always: until the deadlines
+/// above existed, a peer that declared a body and never sent it could hold a
+/// thread forever. Behind a reverse proxy, terminate TLS there and bind to
+/// loopback; in front of nothing, keep the defaults and set
+/// [`origin_policy`](Self::origin_policy) deliberately.
 ///
 /// # Example (no auth)
 /// ```ignore
@@ -549,8 +591,8 @@ pub struct HttpServer<C> {
     required_scopes: Vec<String>,
     /// Everything that outlives a single request, per client.
     sessions: Sessions,
-    /// Threads serving requests; `None` picks a default from the CPU count.
-    pool_size: Option<usize>,
+    /// What a peer is allowed to make this process hold.
+    limits: Limits,
 }
 
 impl<C: Send + Sync + 'static> HttpServer<C> {
@@ -559,6 +601,12 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// The `Origin` policy defaults to [`OriginPolicy::Loopback`]. Bind to
     /// `127.0.0.1` unless you specifically intend to be reachable off-host.
     pub fn new(config: ServerConfig) -> Self {
+        let limits = Limits {
+            // The two transports agree on one ceiling: what stdio refuses,
+            // HTTP refuses.
+            max_body_bytes: config.max_message_bytes,
+            ..Limits::default()
+        };
         Self {
             config,
             endpoint: "/mcp".to_string(),
@@ -569,7 +617,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             #[cfg(feature = "auth")]
             required_scopes: Vec::new(),
             sessions: Sessions::default(),
-            pool_size: None,
+            limits,
         }
     }
 
@@ -579,20 +627,50 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         self
     }
 
-    /// How many threads serve requests (default: `8 ×` the CPU count).
+    /// How many connections may be live at once (default: 512).
     ///
-    /// Each in-flight request occupies one for its whole duration, including a
-    /// `tasks/result` that is waiting for a task to finish - bounded by
-    /// [`ServerConfig::task_result_timeout`], but a wait all the same. Size
-    /// this above the number of clients you expect to be blocked at once.
+    /// Each one costs a thread for as long as the client keeps it open, so this
+    /// is the ceiling on what a peer can make this process hold. A connection
+    /// arriving when this many are already live is answered `503` and closed.
     ///
-    /// It also sets how deep the queue behind those threads runs: one waiting
-    /// request per thread, so a burst queues rather than being refused. A
-    /// request that arrives with every thread busy *and* that queue full is
-    /// answered `503` - see [`HttpServer`] for why that beats queueing without
-    /// limit.
-    pub fn pool_size(mut self, threads: usize) -> Self {
-        self.pool_size = Some(threads.max(1));
+    /// It is also the ceiling on concurrent *work*, since a connection carries
+    /// one request at a time: an in-flight request - including a `tasks/result`
+    /// waiting for its task, bounded by
+    /// [`ServerConfig::task_result_timeout`] - holds its connection for its
+    /// whole duration. Size this above the number of clients you expect to be
+    /// blocked at once.
+    pub fn max_connections(mut self, connections: usize) -> Self {
+        self.limits.max_connections = connections.max(1);
+        self
+    }
+
+    /// How many threads serve requests.
+    #[deprecated(
+        since = "0.6.0",
+        note = "requests are served one thread per connection now; use `max_connections`"
+    )]
+    pub fn pool_size(self, threads: usize) -> Self {
+        self.max_connections(threads)
+    }
+
+    /// How long a peer may take to deliver a request head or body
+    /// (default: 30s).
+    ///
+    /// This is the deadline that makes a half-sent request cost a connection
+    /// rather than a thread forever. It applies from the first byte of a
+    /// request line to the last byte of its body.
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.limits.read_timeout = timeout;
+        self
+    }
+
+    /// How long a kept-alive connection may sit between requests
+    /// (default: 2 minutes).
+    ///
+    /// A connection idle for longer is closed, which is what keeps a client
+    /// that opens sockets and forgets them from holding a slot each.
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.limits.idle_timeout = timeout;
         self
     }
 
@@ -684,7 +762,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         });
 
         match challenge {
-            Some(challenge) => with_header(response, "WWW-Authenticate", challenge),
+            Some(challenge) => response.with_header("WWW-Authenticate", challenge),
             None => response,
         }
     }
@@ -700,17 +778,17 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
     /// Serve the metadata document when this request is asking for it.
     #[cfg(feature = "auth")]
-    fn protected_resource_response(&self, request: &Request) -> Option<HttpResponse> {
+    fn protected_resource_response(&self, request: &Request<'_>) -> Option<HttpResponse> {
         let metadata = self.protected_resource.as_ref()?;
         let path = metadata.resource_uri().ok()?.metadata_path();
-        if path_of(request.url()) != path {
+        if path_of(request.target()) != path {
             return None;
         }
 
         // Discovery must work before the client has a token, so this endpoint
         // is deliberately unauthenticated - it contains nothing secret.
         if !matches!(request.method(), Method::Get) {
-            return Some(error_response(405, -32600, "Method Not Allowed"));
+            return Some(method_not_allowed("GET"));
         }
 
         let body = serde_json::to_string(metadata).ok()?;
@@ -732,7 +810,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// authentication: endpoint path, HTTP method, and `Origin`.
     ///
     /// Returns `Some(response)` when the request must be rejected.
-    fn precheck(&self, request: &Request) -> Option<HttpResponse> {
+    fn precheck(&self, request: &Request<'_>) -> Option<HttpResponse> {
         // Discovery is served before the endpoint check, since it lives at a
         // different path by design.
         #[cfg(feature = "auth")]
@@ -740,13 +818,13 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             return Some(response);
         }
 
-        if path_of(request.url()) != self.endpoint {
+        if path_of(request.target()) != self.endpoint {
             return Some(error_response(404, -32600, "Not Found"));
         }
 
         // POST carries messages; DELETE ends a session.
         if !matches!(request.method(), Method::Post | Method::Delete) {
-            return Some(error_response(405, -32600, "Method Not Allowed"));
+            return Some(method_not_allowed("POST, DELETE"));
         }
 
         // "If the server receives a request with an invalid or unsupported
@@ -771,7 +849,10 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         // and DNS rebinding requires a browser, which always sends it.
         if let Some(origin) = header_value(request, "Origin") {
             if !self.origin_policy.is_allowed(origin) {
-                eprintln!("  ✗ Rejected Origin: {}", origin);
+                // Behind the gate, and only there: this is a line any peer can
+                // make the server write, without authenticating, once per
+                // request - carrying text the peer chose.
+                self.trace(|| format!("  ✗ Rejected Origin: {}", origin));
                 return Some(error_response(
                     403,
                     -32600,
@@ -789,7 +870,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     fn unauthorized(&self, message: impl AsRef<str>) -> HttpResponse {
         let response = error_response(401, -32600, message);
         match self.challenge() {
-            Some(challenge) => with_header(response, "WWW-Authenticate", challenge),
+            Some(challenge) => response.with_header("WWW-Authenticate", challenge),
             None => response,
         }
     }
@@ -799,47 +880,41 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// Bounded by [`ServerConfig::max_message_bytes`], the same ceiling the
     /// line transports use. It had none: 48 MiB was accepted and echoed back,
     /// so the transport actually exposed to the network was the one *without* a
-    /// cap. The declared length is checked before a byte is read, and the read
-    /// itself is capped as well, since a chunked body declares no length and a
-    /// `Content-Length` can lie.
-    fn read_body(&self, request: &mut Request) -> std::result::Result<String, HttpResponse> {
+    /// cap.
+    ///
+    /// A declared length over the ceiling is refused without reading a byte
+    /// *and without draining one*, which is the whole reason this transport
+    /// owns its HTTP layer - see `http1`.
+    fn read_body(&self, request: &mut Request<'_>) -> std::result::Result<String, HttpResponse> {
         let limit = self.config.max_message_bytes;
 
-        // `body_length` is the declared `Content-Length`, and `None` for a
-        // chunked body - which declares nothing and is exactly why the read
-        // below is capped too.
-        if request
-            .body_length()
-            .is_some_and(|declared| declared > limit)
-        {
-            return Err(self.too_large(limit));
+        match request.read_body(limit) {
+            Ok(body) => Ok(body),
+            Err(BodyError::TooLarge) => Err(self.too_large(limit)),
+            Err(BodyError::Malformed) => {
+                self.trace(|| "  Failed to read body: it is not UTF-8 or not framed".to_string());
+                Err(error_response(400, -32700, "Bad Request: unreadable body").closing())
+            }
+            Err(BodyError::Incomplete) => {
+                self.trace(|| "  Failed to read body: it stopped early".to_string());
+                Err(error_response(400, -32700, "Bad Request: the body ended early").closing())
+            }
         }
-
-        let mut body = String::new();
-        // One byte over the limit is enough to know it was exceeded, and is all
-        // that is ever read past it.
-        if let Err(e) = request
-            .as_reader()
-            .take(limit as u64 + 1)
-            .read_to_string(&mut body)
-        {
-            eprintln!("  Failed to read body: {}", e);
-            return Err(error_response(400, -32700, "Bad Request: unreadable body"));
-        }
-        if body.len() > limit {
-            return Err(self.too_large(limit));
-        }
-
-        Ok(body)
     }
 
     /// The answer to a body bigger than this server will accept.
+    ///
+    /// It ends the connection. The bytes the peer promised are still coming (or
+    /// never will), and guessing where the next request starts on a connection
+    /// whose framing was abandoned is how a desynchronised connection becomes a
+    /// smuggling primitive.
     fn too_large(&self, limit: usize) -> HttpResponse {
         error_response(
             413,
             -32600,
             format!("Payload Too Large: the body exceeds the {limit} byte limit"),
         )
+        .closing()
     }
 
     /// Write a diagnostic that may contain request or response bodies.
@@ -871,7 +946,9 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             // strict client parsing it fails.
             Ok(Processed::Accepted) => empty_response(202),
             Err(e) => {
-                eprintln!("  Error: {}", e);
+                // Gated: a client's syntax error is a line the client can ask
+                // for as often as it likes, and the text quotes what it sent.
+                self.trace(|| format!("  Error: {}", e));
                 // A client's syntax error is not the server's internal error.
                 // The -32600 the batch path carefully builds used to be thrown
                 // away by this wrapper.
@@ -930,21 +1007,21 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             self.config.name, addr, self.endpoint
         );
 
-        let pool_size = self.pool_size.unwrap_or_else(default_pool_size);
-        listen(addr, pool_size, binding, move |mut request| {
-            self.trace(|| format!("{} {}", request.method(), request.url()));
+        let limits = self.limits.clone();
+        listen(addr, limits, binding, move |request| {
+            self.trace(|| format!("{} {}", request.method(), request.target()));
 
-            let response = if let Some(rejection) = self.precheck(&request) {
-                rejection
-            } else if matches!(request.method(), Method::Delete) {
-                self.end_session(&request)
-            } else {
-                // No authorization context, so requestors cannot be told apart:
-                // tasks stay reachable by id but are not listable.
-                self.respond(&mut request, TaskContext::Anonymous, &context_factory)
-            };
-
-            self.send(request, response);
+            self.contained(request, |request| {
+                if let Some(rejection) = self.precheck(request) {
+                    rejection
+                } else if matches!(request.method(), Method::Delete) {
+                    self.end_session(request)
+                } else {
+                    // No authorization context, so requestors cannot be told
+                    // apart: tasks stay reachable by id but are not listable.
+                    self.respond(request, TaskContext::Anonymous, None, &context_factory)
+                }
+            })
         })
     }
 
@@ -1017,12 +1094,13 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             self.config.name, addr, self.endpoint
         );
 
-        let pool_size = self.pool_size.unwrap_or_else(default_pool_size);
-        listen(addr, pool_size, binding, move |mut request| {
-            self.trace(|| format!("{} {}", request.method(), request.url()));
+        let limits = self.limits.clone();
+        listen(addr, limits, binding, move |request| {
+            self.trace(|| format!("{} {}", request.method(), request.target()));
 
-            let response = self.authenticated_response(&mut request, &validator, &context_factory);
-            self.send(request, response);
+            self.contained(request, |request| {
+                self.authenticated_response(request, &validator, &context_factory)
+            })
         })
     }
 
@@ -1033,7 +1111,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     #[cfg(feature = "auth")]
     fn authenticated_response<F>(
         &self,
-        request: &mut Request,
+        request: &mut Request<'_>,
         validator: &JwtValidator,
         context_factory: &F,
     ) -> HttpResponse
@@ -1078,32 +1156,31 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
         }
 
         if matches!(request.method(), Method::Delete) {
-            return self.end_session(request);
+            let owner = format!("{}\u{1}{}", claims.user_id(), claims.tenant_id());
+            return self.end_session_for(request, Some(&owner));
         }
 
         // Tasks bind to the identity the token carries, which is what makes
-        // them isolatable.
+        // them isolatable. So do sessions - see `Sessions::checkout`.
         let owner = format!("{}\u{1}{}", claims.user_id(), claims.tenant_id());
-        self.respond(request, TaskContext::Owner(owner), || {
-            context_factory(&claims)
-        })
-    }
-
-    /// Write the answer, and note it if the peer is no longer there to read it.
-    ///
-    /// A peer hanging up mid-answer is its business, not an incident - and it
-    /// is peer-controlled, so it does not get to write to stderr on demand.
-    fn send(&self, request: Request, response: HttpResponse) {
-        if let Err(e) = request.respond(response) {
-            self.trace(|| format!("  Failed to send response: {}", e));
-        }
+        self.respond(
+            request,
+            TaskContext::Owner(owner.clone()),
+            Some(&owner),
+            || context_factory(&claims),
+        )
     }
 
     /// `DELETE` on the endpoint: "Clients that no longer need a particular
     /// session **SHOULD** send an HTTP DELETE ... to explicitly terminate it."
-    fn end_session(&self, request: &Request) -> HttpResponse {
+    fn end_session(&self, request: &Request<'_>) -> HttpResponse {
+        self.end_session_for(request, None)
+    }
+
+    /// [`end_session`](Self::end_session), for a named identity.
+    fn end_session_for(&self, request: &Request<'_>, owner: Option<&str>) -> HttpResponse {
         match header_value(request, SESSION_HEADER) {
-            Some(id) if self.sessions.terminate(id) => empty_response(204),
+            Some(id) if self.sessions.terminate(owner, id) => empty_response(204),
             Some(_) => error_response(404, -32600, "Not Found: no such session"),
             None => error_response(
                 400,
@@ -1116,13 +1193,14 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// Answer one message, in the session it belongs to.
     fn respond(
         &self,
-        request: &mut Request,
+        request: &mut Request<'_>,
         task_context: TaskContext,
+        owner: Option<&str>,
         make_context: impl FnOnce() -> C,
     ) -> HttpResponse {
         let Ok((id, session)) = self
             .sessions
-            .checkout(header_value(request, SESSION_HEADER))
+            .checkout(owner, header_value(request, SESSION_HEADER))
         else {
             // "The server MAY terminate the session at any time, after which it
             // MUST respond to requests containing that session ID with HTTP 404
@@ -1140,10 +1218,38 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
         // A session is only advertised once it holds something a later request
         // could want, so a client that only ever pings is never handed an id.
-        match self.sessions.check_in(id, session) {
-            Some(id) => with_header(response, SESSION_HEADER, id),
+        match self.sessions.check_in(owner, id, session) {
+            Some(id) => response.with_header(SESSION_HEADER, id),
             None => response,
         }
+    }
+
+    /// Answer this request with *every* panic on the way contained.
+    ///
+    /// [`guarded`](Self::guarded) covers the context factory and dispatch. A
+    /// panic in the precheck, in reading the body, or in the session
+    /// bookkeeping is outside it, and a request that unwinds past this point
+    /// gets no response at all - the one answer shape §3.11 exists to
+    /// eliminate. So the whole answer is wrapped, and this is the layer that
+    /// turns a panic into a JSON-RPC error a client can read.
+    fn contained(
+        &self,
+        request: &mut Request<'_>,
+        answer: impl FnOnce(&mut Request<'_>) -> HttpResponse,
+    ) -> HttpResponse {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| answer(request))).unwrap_or_else(
+            |payload| {
+                error_response(
+                    500,
+                    -32603,
+                    format!(
+                        "Internal error: request handler panicked: {}",
+                        crate::server::panic_message(payload.as_ref())
+                    ),
+                )
+                .closing()
+            },
+        )
     }
 
     /// [`process_request`](Self::process_request) with the request's panics
@@ -1802,6 +1908,66 @@ mod http_server_tests {
         )
     }
 
+    /// Send raw bytes, then read whatever comes back until the deadline.
+    ///
+    /// Deliberately not `http_request`: the point of these is to send something
+    /// no client library would, and to keep the connection open afterwards.
+    fn raw_exchange(addr: &str, request: &[u8], patience: Duration) -> (TcpStream, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream.set_read_timeout(Some(patience)).unwrap();
+        stream.write_all(request).expect("write");
+        stream.flush().unwrap();
+
+        let mut answer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    answer.extend_from_slice(&chunk[..read]);
+                    if answer.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        (stream, String::from_utf8_lossy(&answer).into_owned())
+    }
+
+    fn status_of(answer: &str) -> u16 {
+        answer
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// [`spawn_server`] with the connection ceiling and deadlines under test.
+    fn spawn_server_bounded(max_connections: usize, read_timeout: Duration) -> String {
+        let addr = format!("127.0.0.1:{}", next_port());
+
+        let server_addr = addr.clone();
+        thread::spawn(move || {
+            let counter = Arc::new(AtomicI64::new(0));
+            let _ = HttpServer::new(ServerConfig::default())
+                .max_connections(max_connections)
+                .read_timeout(read_timeout)
+                .with_tools(|s: &mut Server<TestContext>| {
+                    s.add_tool(EchoTool)?;
+                    Ok(())
+                })
+                .serve(&server_addr, move || TestContext {
+                    counter: counter.clone(),
+                });
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        addr
+    }
+
     /// [`spawn_server`] with the configuration under test.
     fn spawn_server_with(policy: OriginPolicy, config: ServerConfig) -> String {
         let addr = format!("127.0.0.1:{}", next_port());
@@ -2180,13 +2346,12 @@ mod http_server_tests {
     }
 
     #[test]
-    fn test_a_saturated_server_says_so_rather_than_queueing_without_limit() {
-        // The pool is bounded in both directions, so there is a state where a
-        // request arrives with nowhere to run. The two alternatives are worse:
-        // an unbounded queue is a peer-controlled amount of memory and a
-        // growing pile of requests nobody is getting to, and blocking the
-        // accept loop makes the listener as slow as its slowest request, which
-        // is the failure this whole design exists to prevent.
+    fn test_a_saturated_server_says_so_rather_than_accepting_without_limit() {
+        // Live connections are what a peer can make this process hold, so they
+        // have a ceiling like everything else. The alternative is accepting
+        // without limit, which is a peer deciding how many OS threads this
+        // process has - and past the platform's answer to that question,
+        // `thread::spawn` fails and the listener is the thing that dies.
         let gate = Arc::new(Gate::default());
         let addr = format!("127.0.0.1:{}", next_port());
 
@@ -2195,8 +2360,8 @@ mod http_server_tests {
         thread::spawn(move || {
             let counter = Arc::new(AtomicI64::new(0));
             let _ = HttpServer::new(ServerConfig::default())
-                // One thread, and room for one more request behind it.
-                .pool_size(1)
+                // Room for exactly one connection at a time.
+                .max_connections(1)
                 .with_tools(move |s: &mut Server<TestContext>| {
                     s.add_tool(GateTool {
                         gate: Arc::clone(&their_gate),
@@ -2209,7 +2374,7 @@ mod http_server_tests {
         });
         thread::sleep(Duration::from_millis(100));
 
-        // Occupy the only worker, and wait until it really is occupied.
+        // Occupy the only slot, and wait until it really is occupied.
         let blocked_addr = addr.clone();
         let blocked = thread::spawn(move || {
             http_post(
@@ -2225,39 +2390,28 @@ mod http_server_tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(gate.arrivals(), 1, "the worker never picked up the request");
+        assert_eq!(gate.arrivals(), 1, "the slot never picked up the request");
 
-        // Four more, against one worker and one queue slot.
-        let pings: Vec<_> = (0..4)
+        // Four more against a server with nowhere to put them.
+        let answers: Vec<(u16, String, String)> = (0..4)
             .map(|_| {
                 let addr = addr.clone();
                 thread::spawn(move || http_post(&addr, "/mcp", PING).unwrap())
             })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|p| p.join().unwrap())
             .collect();
-        thread::sleep(Duration::from_millis(300));
-        gate.open();
 
-        let answers: Vec<(u16, String, String)> =
-            pings.into_iter().map(|p| p.join().unwrap()).collect();
         let statuses: Vec<u16> = answers.iter().map(|(status, ..)| *status).collect();
         let shed: Vec<&(u16, String, String)> = answers
             .iter()
             .filter(|(status, ..)| *status == 503)
             .collect();
-        let served = statuses.iter().filter(|status| **status == 200).count();
-
-        assert!(
-            shed.len() >= 2,
-            "a saturated server must refuse rather than absorb: {statuses:?}"
-        );
         assert_eq!(
-            shed.len() + served,
+            shed.len(),
             4,
-            "every request got one of the two answers: {statuses:?}"
-        );
-        assert!(
-            served >= 1,
-            "the queued request was still served once a worker freed up: {statuses:?}"
+            "a full server refuses rather than absorbing: {statuses:?}"
         );
 
         // The refusal is a JSON-RPC body like every other rejection here, not a
@@ -2270,16 +2424,157 @@ mod http_server_tests {
             parsed["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("busy"),
+                .contains("too many connections"),
             "{body}"
         );
 
-        // And the server is unharmed by having refused.
-        let (status, _, body) = http_post(&addr, "/mcp", PING).unwrap();
-        assert_eq!(status, 200, "{body}");
-
+        // And the server is unharmed by having refused: the slot comes back.
+        gate.open();
         let (_, _, body) = blocked.join().unwrap();
         assert!(body.contains("released"), "{body}");
+
+        let mut served = None;
+        for _ in 0..200 {
+            let (status, _, body) = http_post(&addr, "/mcp", PING).unwrap();
+            if status == 200 {
+                served = Some(body);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(served.is_some(), "the ceiling let go once the slot did");
+    }
+
+    #[test]
+    fn test_a_burst_on_an_idle_server_is_not_refused() {
+        // The bound this replaced was one queued request per thread, which made
+        // an *idle* four-thread server refuse 16 of 32 simultaneous pings -
+        // clients that had done nothing wrong, told to retry, with no `id` in
+        // the refusal to correlate it against. Nothing is queued now: a
+        // connection either gets a thread or is told there is no room, and 32
+        // is not close to the room there is.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let pings: Vec<_> = (0..32)
+            .map(|_| {
+                let addr = addr.clone();
+                thread::spawn(move || http_post(&addr, "/mcp", PING).unwrap().0)
+            })
+            .collect();
+
+        let statuses: Vec<u16> = pings.into_iter().map(|p| p.join().unwrap()).collect();
+        let refused = statuses.iter().filter(|status| **status != 200).count();
+        assert_eq!(refused, 0, "an idle server refused a burst: {statuses:?}");
+    }
+
+    #[test]
+    fn test_an_absurd_content_length_is_refused_and_the_process_survives() {
+        // 118 bytes, no body, no token, no handshake. Under the HTTP layer this
+        // replaced, refusing an over-large body without reading it left the
+        // reader holding a `Content-Length`-sized promise which its destructor
+        // then kept - `vec![0; 200000000000000000]`, `handle_alloc_error`,
+        // `SIGABRT`. The client even got its 413 first, and then the server
+        // died. Nothing is sized from a declared length now.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let attack = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 200000000000000000\r\n\r\n"
+        );
+        let started = Instant::now();
+        let (_socket, answer) = raw_exchange(&addr, attack.as_bytes(), Duration::from_secs(5));
+
+        assert_eq!(status_of(&answer), 413, "{answer}");
+        assert!(
+            answer.to_lowercase().contains("connection: close"),
+            "an oversized body ends the connection: {answer}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the answer took {:?}",
+            started.elapsed()
+        );
+
+        // The one that matters: there is still a server here.
+        let (status, _, body) = http_post(&addr, "/mcp", PING).unwrap();
+        assert_eq!(status, 200, "{body}");
+    }
+
+    #[test]
+    fn test_a_declared_body_that_never_arrives_costs_nothing_and_holds_nothing() {
+        // The same shape one order of magnitude down: `Content-Length` over the
+        // cap with no body behind it. Draining that promise was a blocking read
+        // with no deadline, so ~120 bytes bought a wedged thread - and once
+        // every thread was gone, the accept loop drained the next one itself
+        // and the listener never iterated again.
+        let addr = spawn_server_bounded(4, Duration::from_secs(1));
+
+        let attack =
+            format!("POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 100000000\r\n\r\n");
+
+        // One more than every slot, all held open at once. Each is answered -
+        // `413` because the body is refused, or `503` because a slot has not
+        // finished closing yet - and neither costs anything to wait out.
+        let started = Instant::now();
+        let held: Vec<TcpStream> = (0..6)
+            .map(|_| {
+                let (socket, answer) =
+                    raw_exchange(&addr, attack.as_bytes(), Duration::from_secs(5));
+                assert!(
+                    matches!(status_of(&answer), 413 | 503),
+                    "a wedge attempt went unanswered: {answer:?}"
+                );
+                socket
+            })
+            .collect();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "six refusals took {:?}, so something waited on a peer",
+            started.elapsed()
+        );
+
+        // Every slot came back, with the attacker's sockets still open.
+        let mut served = false;
+        for _ in 0..100 {
+            if let Ok((200, _, _)) = http_post(&addr, "/mcp", PING) {
+                served = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(served, "the listener never answered again");
+        drop(held);
+    }
+
+    #[test]
+    fn test_a_body_under_the_cap_that_never_arrives_expires_rather_than_waiting() {
+        // A declared length this server *would* accept is read, so this one is
+        // bounded by a deadline instead of by refusing outright. Either way the
+        // slot comes back without the peer's cooperation.
+        let addr = spawn_server_bounded(2, Duration::from_millis(400));
+
+        let attack = format!("POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 500\r\n\r\n");
+        let started = Instant::now();
+        let held: Vec<TcpStream> = (0..2)
+            .map(|_| raw_exchange(&addr, attack.as_bytes(), Duration::from_secs(5)).0)
+            .collect();
+
+        // Both slots were taken by a peer that then said nothing, and both came
+        // back on their own.
+        let mut served = false;
+        for _ in 0..100 {
+            if let Ok((200, _, _)) = http_post(&addr, "/mcp", PING) {
+                served = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(served, "the deadline never freed a slot");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?}",
+            started.elapsed()
+        );
+        drop(held);
     }
 
     #[test]
@@ -2358,6 +2653,79 @@ mod http_server_tests {
 
         assert_eq!(status, 413, "{response}");
         assert!(response.contains("1024"), "{response}");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn test_serve_tls_actually_serves_mcp_over_tls() {
+        // The TLS path is ours now - rustls directly, on the connection's own
+        // thread, under the connection's own deadlines - so "a bad certificate
+        // is refused" is no longer enough of a guard on its own. This drives a
+        // real handshake and a real `ping` through it.
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+
+        let certificate = include_bytes!("../../tests/fixtures/localhost.crt.pem").to_vec();
+        let private_key = include_bytes!("../../tests/fixtures/localhost.key.pem").to_vec();
+        let authority = include_bytes!("../../tests/fixtures/ca.crt.pem").to_vec();
+
+        let addr = format!("127.0.0.1:{}", next_port());
+        let server_addr = addr.clone();
+        let server_certificate = certificate.clone();
+        thread::spawn(move || {
+            let counter = Arc::new(AtomicI64::new(0));
+            let _ = HttpServer::new(ServerConfig::default())
+                .with_tools(|s: &mut Server<TestContext>| {
+                    s.add_tool(EchoTool)?;
+                    Ok(())
+                })
+                .serve_tls(&server_addr, server_certificate, private_key, move || {
+                    TestContext {
+                        counter: counter.clone(),
+                    }
+                });
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in CertificateDer::pem_slice_iter(&authority) {
+            roots.add(certificate.unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let connection = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let socket = TcpStream::connect(&addr).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut tls = rustls::StreamOwned::new(connection, socket);
+
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            addr,
+            PING.len(),
+            PING
+        );
+        tls.write_all(request.as_bytes()).unwrap();
+        tls.flush().unwrap();
+
+        let mut answer = String::new();
+        let _ = tls.read_to_string(&mut answer);
+
+        assert_eq!(status_of(&answer), 200, "{answer}");
+        let body = answer.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["id"], 1, "{answer}");
     }
 
     #[cfg(feature = "tls")]
@@ -3293,6 +3661,142 @@ mod http_server_tests {
         }
 
         #[test]
+        fn test_an_unauthenticated_peer_cannot_abort_or_wedge_the_process() {
+            // Both critical findings were reachable with no token, no
+            // handshake, and no body: the `401` goes out and then the request
+            // is dropped, and it was the *drop* that allocated on a peer's
+            // number and blocked on a peer's silence. Authentication was never
+            // the barrier, because none of it happened on the request path.
+            let addr = format!("127.0.0.1:{}", next_port());
+
+            let server_addr = addr.clone();
+            thread::spawn(move || {
+                let _ = HttpServer::new(ServerConfig::default())
+                    .max_connections(4)
+                    .read_timeout(Duration::from_secs(1))
+                    .with_tools(|s: &mut Server<AuthContext>| {
+                        s.add_tool(WhoamiTool)?;
+                        Ok(())
+                    })
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
+                    });
+            });
+            thread::sleep(Duration::from_millis(100));
+
+            // The allocator abort, unauthenticated.
+            let absurd = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 200000000000000000\r\n\r\n"
+            );
+            let (_socket, answer) = raw_exchange(&addr, absurd.as_bytes(), Duration::from_secs(5));
+            assert_eq!(status_of(&answer), 401, "{answer}");
+
+            // The permanent wedge, unauthenticated, once per slot and one over.
+            let wedge =
+                format!("POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 100000000\r\n\r\n");
+            let started = Instant::now();
+            let held: Vec<TcpStream> = (0..6)
+                .map(|_| {
+                    let (socket, answer) =
+                        raw_exchange(&addr, wedge.as_bytes(), Duration::from_secs(5));
+                    assert!(
+                        matches!(status_of(&answer), 401 | 503),
+                        "a wedge attempt went unanswered: {answer:?}"
+                    );
+                    socket
+                })
+                .collect();
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "six refusals took {:?}, so something waited on a peer",
+                started.elapsed()
+            );
+
+            // And the server is still here, for someone who does have a token.
+            let token = make_token("alice", "tenant-a");
+            let mut served = false;
+            for _ in 0..100 {
+                if let Ok((200, _, _)) = http_post_with_auth(&addr, "/mcp", PING, Some(&token)) {
+                    served = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(served, "the listener never answered again");
+            drop(held);
+        }
+
+        #[test]
+        fn test_a_session_id_does_not_travel_between_identities() {
+            // security_best_practices §Session Hijacking: "MCP servers SHOULD
+            // bind session IDs to user-specific information ... even if an
+            // attacker guesses a session ID, they cannot impersonate another
+            // user as the user ID is derived from the user token and not
+            // provided by the client."
+            let addr = format!("127.0.0.1:{}", next_port());
+
+            let server_addr = addr.clone();
+            thread::spawn(move || {
+                let _ = HttpServer::new(ServerConfig::default())
+                    .with_tools(|s: &mut Server<AuthContext>| {
+                        s.add_tool(WhoamiTool)?;
+                        Ok(())
+                    })
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
+                    });
+            });
+            thread::sleep(Duration::from_millis(100));
+
+            let alice = make_token("alice", "tenant-a");
+            let mallory = make_token("mallory", "tenant-b");
+
+            // Alice establishes something worth remembering, and is given an id
+            // for it.
+            let handshake = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{"name":"a","version":"1"}}}"#;
+            let (_, session) = http_post_in_session(&addr, handshake, Some(&alice), None);
+            let session = session.expect("an id after a handshake");
+
+            // Mallory has a perfectly valid token of her own, and the id.
+            let (body, _) = http_post_in_session(&addr, PING, Some(&mallory), Some(&session));
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                parsed["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("unknown or terminated session"),
+                "a guessed session id must not be usable: {body}"
+            );
+
+            // Alice's own session still works.
+            let (body, _) = http_post_in_session(&addr, PING, Some(&alice), Some(&session));
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["result"], serde_json::json!({}), "{body}");
+
+            // And Mallory cannot terminate what she cannot read.
+            let (status, _, _) = http_request(
+                &addr,
+                "DELETE",
+                "/mcp",
+                "",
+                &[
+                    ("Authorization", &format!("Bearer {mallory}")),
+                    (SESSION_HEADER, &session),
+                ],
+            )
+            .unwrap();
+            assert_eq!(status, 404, "a DELETE is scoped to its own sessions too");
+
+            let (body, _) = http_post_in_session(&addr, PING, Some(&alice), Some(&session));
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed["result"],
+                serde_json::json!({}),
+                "Alice's session survived Mallory's DELETE: {body}"
+            );
+        }
+
+        #[test]
         fn test_http_server_auth_missing_header() {
             let port = next_port();
             let addr = format!("127.0.0.1:{}", port);
@@ -3601,20 +4105,36 @@ mod http_server_tests {
                 .expect("a task id")
                 .to_string();
 
-            // Both of them speak into the *same* session, so the shared store
-            // is real and the authorization context is the only thing between
-            // Mallory and Alice's task. Nothing about session keying is being
-            // leaned on here.
+            // There are two independent barriers between Mallory and Alice's
+            // task, and this exercises both. The first is the session id, which
+            // is bound to the identity that was given it: replaying it under
+            // another token names a key that identity does not have.
             let session = session.expect("the task's session");
             let alice_says =
                 |body: &str| http_post_in_session(&addr, body, Some(&alice), Some(&session)).0;
+            // Mallory gets a session of her own, since Alice's is not hers to
+            // use - which leaves task ownership as the thing under test.
             let mallory_says =
-                |body: &str| http_post_in_session(&addr, body, Some(&mallory), Some(&session)).0;
+                |body: &str| http_post_in_session(&addr, body, Some(&mallory), None).0;
 
-            // Mallory knows the id and is perfectly well authenticated.
             let get = format!(
                 r#"{{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{{"taskId":"{task_id}"}}}}"#
             );
+            let stolen = http_post_in_session(&addr, &get, Some(&mallory), Some(&session)).0;
+            let parsed: Value = serde_json::from_str(&stolen).unwrap();
+            assert_eq!(
+                parsed["error"]["code"], -32600,
+                "a session id is not a bearer token: {stolen}"
+            );
+            assert!(
+                parsed["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown or terminated session"),
+                "{stolen}"
+            );
+
+            // And Mallory knows the id and is perfectly well authenticated.
             let body = mallory_says(&get);
             let parsed: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(parsed["error"]["code"], -32602, "{body}");
