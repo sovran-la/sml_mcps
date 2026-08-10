@@ -3164,6 +3164,36 @@ mod http_server_tests {
     }
 
     #[test]
+    fn test_a_405_says_what_the_path_does_answer() {
+        // RFC 9110 §15.5.6: "The origin server MUST generate an Allow header
+        // field in a 405 response containing a list of the target resource's
+        // currently supported methods." Clients probing for the older HTTP+SSE
+        // transport read these.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        for method in ["GET", "PUT", "PATCH", "HEAD"] {
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = format!(
+                "{method} /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.flush().unwrap();
+
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer);
+            assert_eq!(status_of(&answer), 405, "{method}: {answer}");
+            assert!(
+                answer.to_lowercase().contains("allow: post, delete"),
+                "{method}: {answer}"
+            );
+        }
+    }
+
+    #[test]
     fn test_protocol_version_header_accepted_when_supported() {
         let addr = spawn_server(OriginPolicy::Loopback);
         for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {

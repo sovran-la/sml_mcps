@@ -321,7 +321,7 @@ impl Body<'_> {
             let size = match read_line(self.io, &mut budget) {
                 Ok(Line::Text(line)) => parse_chunk_size(&line).ok_or(BodyError::Malformed)?,
                 Ok(Line::Eof) => return Err(BodyError::Incomplete),
-                Ok(Line::TooLong) => return Err(BodyError::Malformed),
+                Ok(Line::TooLong | Line::Invalid) => return Err(BodyError::Malformed),
                 Err(_) => return Err(BodyError::Incomplete),
             };
 
@@ -354,7 +354,7 @@ impl Body<'_> {
                 Ok(Line::Text(line)) if line.is_empty() => return Ok(()),
                 Ok(Line::Text(_)) => continue,
                 Ok(Line::Eof) => return Err(BodyError::Incomplete),
-                Ok(Line::TooLong) => return Err(BodyError::Malformed),
+                Ok(Line::TooLong | Line::Invalid) => return Err(BodyError::Malformed),
                 Err(_) => return Err(BodyError::Incomplete),
             }
         }
@@ -634,6 +634,7 @@ fn read_head(
             Ok(Line::Text(line)) => break line,
             Ok(Line::Eof) => return Ok(None),
             Ok(Line::TooLong) => return Err(too_long()),
+            Ok(Line::Invalid) => return Err(bad_request("a request line that is not text")),
             Err(e) if is_timeout(&e) => return Ok(None),
             Err(_) => return Ok(None),
         }
@@ -647,6 +648,9 @@ fn read_head(
             Ok(Line::Text(line)) => line,
             Ok(Line::Eof) => return Ok(None),
             Ok(Line::TooLong) => return Err(too_long()),
+            Ok(Line::Invalid) => {
+                return Err(bad_request("a header field that is not text"));
+            }
             Err(_) => return Ok(None),
         };
         if line.is_empty() {
@@ -780,9 +784,17 @@ enum Line {
     Eof,
     /// The budget ran out before the line ended.
     TooLong,
+    /// The line is not text a head may contain.
+    Invalid,
 }
 
 fn read_line(io: &mut BufReader<Box<dyn Socket>>, budget: &mut usize) -> std::io::Result<Line> {
+    // An exhausted budget is a head too long, not a connection that ended -
+    // reading zero bytes because we asked for zero says nothing about the peer.
+    if *budget == 0 {
+        return Ok(Line::TooLong);
+    }
+
     let mut raw = Vec::new();
     let read = (&mut *io)
         .take(*budget as u64)
@@ -810,7 +822,7 @@ fn read_line(io: &mut BufReader<Box<dyn Socket>>, budget: &mut usize) -> std::io
         {
             Ok(Line::Text(line))
         }
-        _ => Ok(Line::TooLong),
+        _ => Ok(Line::Invalid),
     }
 }
 
@@ -1511,6 +1523,20 @@ mod tests {
         });
         assert!(answer.contains("X-Ok: fine"), "{answer}");
         assert!(!answer.contains("X-Injected"), "{answer}");
+    }
+
+    #[test]
+    fn a_handler_that_panics_still_produces_a_response() {
+        // The backstop under the transport's own `catch_unwind`. Without it a
+        // panic anywhere in answering unwinds out of the connection loop, and
+        // the client gets a dropped connection rather than a status - which is
+        // strictly worse than the bare `500` this exists to replace.
+        let answer = drive(&post("hi"), Limits::default(), |_: &mut Request| {
+            panic!("handler exploded on purpose")
+        });
+        assert!(answer.starts_with("HTTP/1.1 500 "), "{answer}");
+        assert!(answer.contains("Connection: close"), "{answer}");
+        assert!(answer.ends_with("Internal Server Error\n"), "{answer}");
     }
 
     #[test]
