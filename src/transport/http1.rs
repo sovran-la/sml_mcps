@@ -1918,6 +1918,48 @@ mod tests {
     }
 
     #[test]
+    fn an_undrained_body_ends_the_connection_rather_than_framing_the_next_request() {
+        // `body_finished` in `serve_connection`'s reuse condition, which is the
+        // one `&&` between a rejected request and request smuggling - and which
+        // deleting failed **zero** tests before this one existed.
+        //
+        // Every other test that looks like it covers this misses in the same
+        // way. `an_unread_body_does_not_desynchronise_the_next_request` drains
+        // successfully, so `finished` is true and the guard is inert; the
+        // over-ceiling tests answer `.closing()`, so `response.close`
+        // short-circuits before the guard is consulted. The case that matters
+        // is an **unfinished body with a response that does not ask to close**,
+        // and it is what every `precheck` rejection produces: those return
+        // before `read_body`, and `drain_if_cheap` declines any body it would
+        // not have accepted anyway.
+        //
+        // So: a length over the ceiling, and a plain `404` that does not close.
+        // The bytes after the head are then attacker-chosen and unframed. With
+        // the guard, one request gets one answer and the connection ends;
+        // without it, the residue below is read as the next request line and
+        // the smuggled `POST` executes on a connection whose only request was a
+        // `404`.
+        let mut wire =
+            b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 20000000\r\n\r\n".to_vec();
+        wire.extend_from_slice(&post("smuggled"));
+
+        let answer = drive(&wire, Limits::default(), |_: &mut Request| {
+            Response::new(404).with_body("text/plain", b"no\n".to_vec())
+        });
+
+        assert_eq!(
+            answer.matches("HTTP/1.1 ").count(),
+            1,
+            "one request, one answer: {answer}"
+        );
+        assert!(answer.contains("Connection: close"), "{answer}");
+        assert!(
+            !answer.contains("smuggled"),
+            "the smuggled request was executed: {answer}"
+        );
+    }
+
+    #[test]
     fn a_chunked_body_is_decoded() {
         let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
                         5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
