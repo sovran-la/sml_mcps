@@ -17,6 +17,13 @@ Schema validation (§3.3), timeouts on server-initiated requests (§3.4), task
 `input_required` (§3.5), and cross-platform task-ID entropy (§3.7). The known
 flake in §5 is fixed, along with two others found while confirming it.
 
+An independent review of this branch then found 37 issues — 7 critical, 14
+significant, 16 minor. All are fixed; §7 lists each one with what was wrong and
+what changed. Two claims made in earlier revisions of this document were
+falsified by that review and are corrected in place: batch arrays were *not*
+answered on the wire (§6), and per-auth-context task binding is no longer
+"deliberately not implemented" (§4, §3.7).
+
 ---
 
 ## 1. Breaking changes
@@ -337,9 +344,14 @@ records being stuck behind the loop's read.
 
 **Where it does not apply.** Splitting the transport and bounding a read are
 both required. The HTTP transport can do neither, so workers there are refused
-exactly as before, and tasks move `working -> completed | failed | cancelled`.
-The same holds for any custom transport that has not implemented
-`set_read_timeout`.
+server-initiated requests exactly as before, and tasks move
+`working -> completed | failed | cancelled`. The same holds for any custom
+transport that has not implemented `set_read_timeout`.
+
+This section used to stop there, which read as though HTTP tasks were otherwise
+fine. They were not: the task store went out of scope with the request that
+created it, so the `taskId` in a `CreateTaskResult` resolved to nothing on every
+subsequent request. Fixed in §7, S6 — the store outlives the request now.
 
 **Downstream impact:** none required. A server that never elicits inside a task
 is unaffected; one that wants to now can.
@@ -398,12 +410,23 @@ on stderr if it is ever reached.
 Entropy is tested per-bit now rather than only for uniqueness — a source stuck
 in its high bytes still produces unique-looking ids.
 
-We also do **not** declare `tasks.list` conditionally on auth context, though
-the spec suggests receivers that cannot identify requestors `SHOULD NOT`
-declare it. **REVIEW:** for a stdio server there is exactly one requestor, so
-listing exposes nothing the requestor did not create. For a future HTTP
-deployment with real auth, this needs revisiting alongside per-context task
-binding, which is not implemented.
+**RESOLVED — tasks are now bound to an authorization context.** The original
+text said `tasks.list` was declared unconditionally, with "for a stdio server
+there is exactly one requestor" as the argument. That is right for stdio and
+wrong for `serve_with_auth`, where an authorization context *is* provided and
+the MUST bites:
+
+> When an authorization context is provided, receivers **MUST** bind tasks to
+> said context. […] receivers that cannot identify requestors **SHOULD NOT**
+> declare the `tasks.list` capability.
+
+It was masked by tasks not surviving a request on HTTP at all (§7, S6). Fixing
+that made it a live cross-tenant leak, so both halves landed together.
+`TaskContext` now says how requestors are identified — `SingleRequestor`
+(stdio, one Unix connection), `Owner` (a token's subject and tenant), or
+`Anonymous` (unauthenticated HTTP) — task records carry an owner, every task
+operation filters on it, and `tasks.list` is declared only where requestors can
+be told apart.
 
 ### 3.8 Elicitation schema builder can only express legal schemas
 
@@ -435,19 +458,29 @@ the attacker's page is served from a public origin, so its `Origin` never looks
 like loopback. `Allowlist` and `Any` are available; `Any` is an explicit
 opt-out.
 
-### 3.10 Audience validation is enforced by us, not by `jsonwebtoken`
+### 3.10 Audience validation is enforced by us, and is not optional
 
-**Confidence: high — a test caught this.**
+**Confidence: high. RESOLVED** — was "enforced by us, not by `jsonwebtoken`",
+which was true and insufficient.
 
-`jsonwebtoken` only compares `aud` when the claim is *present*. A token with no
-`aud` at all passes its check. That is exactly the token the spec says to
-refuse:
+`jsonwebtoken`'s semantics are the wrong way round for this. With an audience
+configured it *ignores* a token that carries no `aud` at all — exactly the token
+the spec says to refuse:
 
 > MCP servers MUST only accept tokens specifically intended for themselves and
 > MUST reject tokens that do not include them in the audience claim.
 
-`JwtValidator::for_resource` therefore re-checks after decoding rather than
-trusting the library's edge-case semantics.
+And with none configured, `Validation::new` leaves `validate_aud: true, aud:
+None`, which *rejects* every token that does carry an `aud` — i.e. every RFC
+8707 conformant one. Backwards in both directions.
+
+So the library's audience machinery is switched off entirely and the check lives
+in `JwtValidator::validate`, driven by `for_resource` or `with_audience`. The
+original text was correct about `for_resource` and missed the larger hole:
+`serve_with_auth(addr, JwtValidator::hs256(SECRET), ..)` — the form this
+document and the crate's own doc example both recommended — enforced no
+audience at all. `serve_with_auth` now refuses to start with a validator that
+binds none. See §7, C7.
 
 ### 3.11 HTTP error bodies are JSON-RPC
 
@@ -487,9 +520,9 @@ error.
 | `completion/complete` | Optional; we declare no `completions` capability, which is compliant. Nothing downstream has completable arguments. |
 | `resources/subscribe` | Optional; we declare no `subscribe`. No downstream resource changes after registration. |
 | `notifications/*/list_changed` | Optional; we declare no `listChanged`. Tool/resource/prompt sets are fixed at startup. |
-| Per-auth-context task binding | Meaningful only for a hosted HTTP deployment. See §3.7. |
+| ~~Per-auth-context task binding~~ | **Now implemented.** See §3.7 and §7, S8. |
 | Acting on `notifications/cancelled` | Accepted and ignored. The server is single-threaded per request, so there is nothing to interrupt; task cancellation goes through `tasks/cancel`, which is implemented. |
-| SSE resumability (`Last-Event-ID`) | Our HTTP transport buffers a whole response and returns it as one body. There is no long-lived stream to resume. |
+| SSE resumability (`Last-Event-ID`) | Our HTTP transport buffers a whole response and returns it as one body. There is no long-lived stream to resume. That also disposes of the neighbouring SHOULD — "the server SHOULD immediately send an SSE event consisting of an event ID and an empty `data` field in order to prime the client to reconnect" — since priming a client to reconnect to a stream that is already complete when it is sent would achieve nothing. Worth revisiting together if the transport ever streams incrementally. |
 | DCR / CIMD / OIDC discovery | Client-and-authorization-server concerns. The server-side obligation is Protected Resource Metadata, which *is* implemented. |
 | Anything from 2026-07-28 | Out of scope by instruction. |
 
@@ -540,7 +573,7 @@ now.
 
 ## 6. Verification
 
-- 472 tests, all passing, `--all-features` (465 unit + 5 integration + 2 doc)
+- 533 tests, all passing, `--all-features` (526 unit + 5 integration + 2 doc)
 - `cargo clippy --all-features --all-targets`: clean
 - `cargo fmt --check`: clean
 - suite run 12+ consecutive times to confirm the flakes above are gone
@@ -549,7 +582,12 @@ Conformance checks that exist specifically as regression guards:
 
 - prompt-not-found can never collide with resource-not-found again
 - param structs never gain `deny_unknown_fields` (forward compatibility)
-- JSON-RPC batch arrays are rejected with `-32600`, not an opaque parse error
+- JSON-RPC batch arrays are rejected with `-32600` **on the wire**, driven
+  through a real server over a socket rather than by calling the parser — the
+  earlier version of this claim tested only the parser, and the server hung up
+  on the client without writing anything (§7, C1)
+- every other malformed input is answered rather than fatal: bad JSON, a null
+  id, a float id, non-UTF-8 bytes, an unknown top-level key
 - task IDs are unique, 128-bit, and non-sequential
 - `tasks/result` genuinely blocks until the task finishes
 - a task worker's elicitation completes, including while `tasks/result` is
@@ -559,4 +597,72 @@ Conformance checks that exist specifically as regression guards:
   the next request's
 - a read that times out mid-message keeps the bytes it already had
 - `auto_start` never unlinks a socket a daemon is listening on
-- an audience-less token is rejected
+- an audience-less token is rejected, and a validator that enforces no audience
+  cannot be used to serve
+- a panicking tool fails its task or its call, and never the server
+- `tasks/cancel` and `tasks/get` are answered while `tasks/result` blocks
+- a task's elicitations, logs and progress carry `related-task` metadata, and
+  its status notifications do not
+- HTTP answers 202 with no body to a notification, 400 to a malformed body, and
+  keeps per-connection state across requests
+- one requestor's tasks are invisible to another
+
+---
+
+## 7. Review findings (all fixed)
+
+An independent review of this branch against both revisions found 37 issues.
+Each is listed with the commit-level summary of what was wrong; the fix always
+came with a test that fails without it.
+
+### Critical
+
+| # | What was wrong |
+|---|---|
+| C1 | Any message the server could not parse ended the session with nothing written back — a one-line remote kill on stdio. Reachable by a batch array, `"id": null`, a float id, non-UTF-8, bad JSON, or one unknown top-level key (the envelope structs carried `deny_unknown_fields` under an untagged enum). Now: `RequestId::Null`, shape-based classification in `JsonRpcMessage::from_value`, and a read loop that answers and carries on. |
+| C2 | A panicking task worker unwound past `store.finish`, so the task stayed `working` until its TTL and `tasks/result` — handled on the loop thread — blocked forever, taking every other request with it. Now: `catch_unwind` on both call paths, plus a bounded `await_result` that re-sweeps. |
+| C3 | Every request sent while `tasks/result` was outstanding was deferred to a loop that could not run until it returned. Permanent deadlock with `request_timeout: None`, on exactly the flow the spec prescribes for `input_required`. Now: `ping`, `tasks/get`, `tasks/list` and `tasks/cancel` are dispatched inline from the pump. |
+| C4 | Task-related requests and notifications carried no `io.modelcontextprotocol/related-task` metadata, so a client in `tasks/result` could not tell what an out-of-band elicitation belonged to. |
+| C5 | HTTP answered a notification or client response with `200 {}` instead of `202 Accepted` and no body — and `{}` is not a JSON-RPC message. |
+| C6 | `tasks/result` overwrote the result's `_meta` instead of merging, deleting whatever the tool had put there. |
+| C7 | Audience validation was opt-in, and the documented example opted out — accepting tokens minted for anyone. See §3.10. |
+
+### Significant
+
+| # | What was wrong |
+|---|---|
+| S1 | Type-mismatched params were reported as `-32700` instead of `-32602`. |
+| S2 | HTTP reported a client's syntax error as `500 -32603 Internal error`. |
+| S3 | An invalid cursor silently returned page one, which is an infinite loop for a client that follows cursors. `-32602` now, and `tasks/list` also rejects a cursor past the end. |
+| S4 | `outputSchema` was enforced on the synchronous path only, so the same tool succeeded as a task and failed as a call. |
+| S5 | `logging/setLevel` was acknowledged and dropped on HTTP, along with client capabilities and the negotiated version, because the server was rebuilt per request. |
+| S6 | Tasks over HTTP handed back a `taskId` no later request could resolve, while the capability was advertised as working. |
+| S7 | `tools/call` arguments were never checked against `inputSchema`. |
+| S8 | Tasks were not bound to an authorization context. See §3.7. |
+| S9 | `LineReader::partial` grew without a cap: a peer that never sends a newline could OOM the process, once per connection. |
+| S10 | `execution.taskSupport` was advertised without the `tasks` capability, which contradicts tool-level negotiation rule 1. |
+| S11 | A panic anywhere in a request killed the HTTP accept loop, and three `messages.lock().unwrap()`s panicked on the poison that panic produced. |
+| S12 | `POST /mcp?sessionId=abc` 404'd, because the endpoint was compared against the raw request target. |
+| S13 | Broader form of C3: nothing at all was answered while `tasks/result` blocked. |
+| S14 | A task cancelled mid-elicitation leaked its broker waiter and sent no `notifications/cancelled`. |
+
+### Minor
+
+| # | What was wrong |
+|---|---|
+| M1 | `Bearer` was matched case-sensitively (RFC 7235 §2.1: it is case-insensitive). |
+| M2 | An uncompilable `outputSchema` was skipped silently, so a typo bought permanent invisible non-enforcement. Reported once, at registration. |
+| M3 | The output schema was recompiled — regexes and all — on every call. Compiled once now, with the input schema. |
+| M4 | `send_progress` accepted only a string token, and nothing plumbed the client's `_meta.progressToken` through, which made progress unusable. |
+| M5 | `is_valid_tool_name`, `insufficient_scope_challenge`, `Claims::missing_scopes` and `MODEL_IMMEDIATE_RESPONSE` were built, tested, and wired to nothing. All four are now used. |
+| M6 | The README still listed task `input_required` as not included. |
+| M7 | `page_size: 0` produced an empty page plus a cursor to the same offset — an infinite loop. Clamped to 1. |
+| M8 | `set_status_message` could overwrite a cancelled task's diagnostic. |
+| M9 | HTTP logged full request and response bodies unconditionally; tool arguments routinely carry credentials and PII. Gated on `debug`. |
+| M10 | No initialization ordering was enforced. Available as `ServerConfig::require_initialization`, off by default since the relevant rules are client-side SHOULDs. |
+| M11 | The `tools` capability was omitted for an empty tool map even when `tasks.requests.tools.call` was declared. |
+| M12 | The SSE priming SHOULD was skipped without saying so. Now stated in §4. |
+| M13 | `McpError::Timeout` was indistinguishable from a generic internal error. It carries `data.reason = "timeout"`. |
+| M14 | `nbf` was not validated, so a not-yet-valid token was accepted. |
+| M15 | The negotiated protocol version was computed and discarded. Kept now, and a test backs the claim that everything newer is additive and optional. |
+| M16 | `tasks/result` error responses carried no related-task metadata. It goes in `error.data`. |

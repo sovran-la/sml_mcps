@@ -206,7 +206,7 @@ See `examples/http_server.rs` for a complete example.
 With the `hosted` feature (enables both `http` and `auth`), add JWT validation:
 
 ```rust
-use sml_mcps::{HttpServer, ServerConfig, auth::JwtValidator};
+use sml_mcps::{HttpServer, ServerConfig, auth::{JwtValidator, ResourceUri}};
 
 struct AuthContext {
     user_id: String,
@@ -220,14 +220,19 @@ fn main() -> Result<()> {
         instructions: None,
     };
 
+    // The canonical URI clients ask for tokens for, and the only audience
+    // this server accepts one from.
+    let resource = ResourceUri::parse("https://mcp.example.com/mcp")?;
+
     HttpServer::new(config)
         .with_tools(|server| {
             server.add_tool(WhoamiTool)?;
             Ok(())
         })
+        .require_scopes(["mcp:use"])   // optional: 403 + insufficient_scope
         .serve_with_auth(
             "127.0.0.1:3001",
-            JwtValidator::hs256(b"your-secret-key"),
+            JwtValidator::hs256(b"your-secret-key").for_resource(&resource),
             |claims| AuthContext {
                 user_id: claims.user_id().to_string(),
                 tenant_id: claims.tenant_id().to_string(),
@@ -236,14 +241,18 @@ fn main() -> Result<()> {
 }
 ```
 
+`for_resource` is not optional. MCP servers **MUST** reject tokens that do not
+name them in the `aud` claim (RFC 8707), so `serve_with_auth` refuses to start
+with a validator that enforces no audience.
+
 The validator supports both HS256 (symmetric) and RS256 (asymmetric) algorithms:
 
 ```rust
 // HS256 (symmetric)
-let validator = JwtValidator::hs256(b"your-secret-key");
+let validator = JwtValidator::hs256(b"your-secret-key").for_resource(&resource);
 
-// RS256 (asymmetric)  
-let validator = JwtValidator::rs256(&public_key_pem)?;
+// RS256 (asymmetric)
+let validator = JwtValidator::rs256_pem(&public_key_pem)?.for_resource(&resource);
 ```
 
 See `examples/http_auth.rs` for a complete authenticated server.
@@ -256,7 +265,9 @@ During tool execution, `ToolEnv` provides:
 // Send log notification
 env.log(LogLevel::Info, "Processing...")?;
 
-// Send progress update
+// Send progress update against the token the client asked for
+env.report_progress(0.5, Some(1.0))?;
+// ...or quote a token explicitly (string or number)
 env.send_progress("token", 0.5, Some(1.0))?;
 
 // Access resources
@@ -317,7 +328,8 @@ for the decision log and the breaking changes from 0.5.x.
 - **Async anything** - by design
 - **`completion/complete`**, resource subscriptions, and `listChanged`
   notifications - all optional, and none are declared as capabilities
-- **Task `input_required`** - see the migration notes for why
+- **SSE resumability** (`Last-Event-ID`) - a response is one buffered body, so
+  there is no long-lived stream to resume
 
 ## License
 
