@@ -153,14 +153,38 @@ const MAX_SESSIONS: usize = 256;
 /// How long a session survives without being used.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// The path of a request URL, without any query string or fragment.
+/// The path of a request target, without its authority, query string or
+/// fragment.
 ///
-/// `tiny_http` hands back the raw request target, so `/mcp?sessionId=abc` is
-/// not `/mcp` by string comparison - and the spec asks for "a single HTTP
-/// endpoint *path*". The well-known metadata route has the same problem, and it
-/// is a URL intermediaries append cache busters to.
-fn path_of(url: &str) -> &str {
-    url.split(['?', '#']).next().unwrap_or("")
+/// A request target is what the peer put on the request line, verbatim, and the
+/// spec asks for "a single HTTP endpoint *path*" - so `/mcp?sessionId=abc` is
+/// not `/mcp` by string comparison, and neither is `http://host/mcp`. The
+/// well-known metadata route has the same problem, and it is a URL
+/// intermediaries append cache busters to.
+///
+/// Both forms are the client's right to send. RFC 9112 §3.2.2: "a server MUST
+/// accept the absolute-form in requests, even though HTTP/1.1 clients will only
+/// send them in requests to proxies" - it is how a client survives being pointed
+/// at one.
+fn path_of(target: &str) -> &str {
+    // Origin-form starts with `/`, and only an absolute-form target can carry
+    // an authority - so the scheme is looked for *only* when the target is not
+    // origin-form. Otherwise `/mcp?next=http://x/` would have its own path
+    // thrown away in favour of a query parameter's.
+    let path = if target.starts_with('/') {
+        target
+    } else {
+        match target.split_once("://") {
+            Some((_, authority_and_path)) => match authority_and_path.find('/') {
+                Some(at) => &authority_and_path[at..],
+                // `http://host` with no path at all means `/`.
+                None => "/",
+            },
+            None => target,
+        }
+    };
+
+    path.split(['?', '#']).next().unwrap_or("")
 }
 
 /// Look up a request header, case-insensitively as HTTP requires.
@@ -2170,14 +2194,58 @@ mod http_server_tests {
 
     #[test]
     fn test_the_endpoint_is_a_path_not_a_request_target() {
-        // "The server MUST provide a single HTTP endpoint *path*". `tiny_http`
-        // hands back the raw target, so `/mcp?sessionId=abc` used to 404.
+        // "The server MUST provide a single HTTP endpoint *path*". The request
+        // line carries a target, not a path, so `/mcp?sessionId=abc` used to
+        // 404 - and so did the absolute-form, which RFC 9112 §3.2.2 makes a
+        // MUST to accept: "a server MUST accept the absolute-form in requests".
         let addr = spawn_server(OriginPolicy::Loopback);
 
-        for target in ["/mcp?sessionId=abc", "/mcp?", "/mcp#frag"] {
+        for target in [
+            "/mcp?sessionId=abc",
+            "/mcp?",
+            "/mcp#frag",
+            "http://example.test/mcp",
+            "http://example.test/mcp?sessionId=abc",
+            "https://example.test:8443/mcp",
+        ] {
             let (status, _, body) = http_post(&addr, target, PING).unwrap();
             assert_eq!(status, 200, "{target} should reach the endpoint: {body}");
         }
+
+        // And the authority is stripped from the *target*, not found anywhere
+        // it happens to appear: a query parameter that looks like one must not
+        // replace the path in front of it.
+        for target in [
+            "/nope?next=http://example.test/mcp",
+            "http://example.test/nope",
+            "http://example.test",
+        ] {
+            let (status, _, body) = http_post(&addr, target, PING).unwrap();
+            assert_eq!(
+                status, 404,
+                "{target} should not reach the endpoint: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_resolves_to_the_path_it_names() {
+        // `path_of` directly, because the wire test above can only see 200 or
+        // 404 and these are the distinctions that produce them.
+        assert_eq!(path_of("/mcp"), "/mcp");
+        assert_eq!(path_of("/mcp?a=b"), "/mcp");
+        assert_eq!(path_of("/mcp#frag"), "/mcp");
+        assert_eq!(path_of("http://host/mcp"), "/mcp");
+        assert_eq!(path_of("http://host:8443/mcp?a=b"), "/mcp");
+        assert_eq!(path_of("https://user@host/mcp"), "/mcp");
+        // An absolute-form target with no path at all is the root.
+        assert_eq!(path_of("http://host"), "/");
+        assert_eq!(path_of("http://host?a=b"), "/");
+        // A scheme inside a *query* belongs to the query.
+        assert_eq!(path_of("/mcp?next=http://host/other"), "/mcp");
+        // Neither form. Not our endpoint, and not something to guess at.
+        assert_eq!(path_of("*"), "*");
+        assert_eq!(path_of(""), "");
     }
 
     #[test]

@@ -941,6 +941,16 @@ fn head_from(parsed: httparse::Request<'_, '_>) -> std::result::Result<Head, Res
     }
 
     let framing = framing_of(&headers)?;
+    // Chunked transfer coding arrived with HTTP/1.1 (RFC 9112 §7.1), and a
+    // 1.0-speaking hop in front reads the same bytes as an opaque body that
+    // ends when the connection does. Two answers to where the request ends is
+    // the whole of request smuggling, and this one is free to refuse.
+    if matches!(framing, Framing::Chunked) && version == Version::Http10 {
+        return Err(bad_request(
+            "`Transfer-Encoding: chunked` on an HTTP/1.0 request",
+        ));
+    }
+
     let connection = header_of(&headers, "connection").unwrap_or("");
     let wants_close = match version {
         Version::Http11 => has_token(connection, "close"),
@@ -2486,6 +2496,29 @@ mod tests {
         let request = b"POST /mcp HTTP/2.0\r\nHost: x\r\n\r\n";
         let answer = drive(request, Limits::default(), echo_body(1024));
         assert!(answer.starts_with("HTTP/1.1 505 "), "{answer}");
+    }
+
+    #[test]
+    fn http_10_cannot_send_a_chunked_body() {
+        // Chunked arrived with HTTP/1.1. A 1.0-speaking hop in front reads
+        // these same bytes as an opaque body ending at the connection close,
+        // and this server would read them as a framed body with a request
+        // behind it - which is the disagreement smuggling is made of.
+        let request = b"POST /mcp HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                        5\r\nhello\r\n0\r\n\r\n";
+        let answer = drive(request, Limits::default(), echo_body(1024));
+        // Answered `HTTP/1.1` like every other head rejection: those go out
+        // before a version is a thing this loop is holding on to, and a 1.0
+        // client reads a 1.1 status line fine.
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+        assert!(answer.contains("HTTP/1.0 request"), "{answer}");
+
+        // The same body over 1.1 is still read, so this refuses a version and
+        // not the coding.
+        let request = b"POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                        5\r\nhello\r\n0\r\n\r\n";
+        let answer = drive(request, Limits::default(), echo_body(1024));
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
     }
 
     #[test]
