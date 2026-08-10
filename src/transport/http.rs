@@ -89,9 +89,10 @@ impl Transport for HttpTransport {
 // HttpServer - high-level server wrapper
 //
 
-use crate::server::{Server, ServerConfig};
+use crate::server::{Server, ServerConfig, TaskContext};
+use crate::tasks::TaskStore;
 use crate::transport::OriginPolicy;
-use crate::types::ASSUMED_PROTOCOL_VERSION;
+use crate::types::{ASSUMED_PROTOCOL_VERSION, ClientCapabilities};
 use std::io::Cursor;
 use tiny_http::{Header, Method, Request as TinyRequest, Response, Server as TinyServer};
 
@@ -121,6 +122,56 @@ fn header_value<'a>(request: &'a TinyRequest, name: &'static str) -> Option<&'a 
 /// it is a URL intermediaries append cache busters to.
 fn path_of(url: &str) -> &str {
     url.split(['?', '#']).next().unwrap_or("")
+}
+
+/// State that belongs to the connection rather than to one request.
+///
+/// A `Server` is built per request here, so anything the client established
+/// earlier - the log level it asked for, what it said it could do, the revision
+/// it negotiated, the tasks it started - is gone by the time the next request
+/// arrives unless it is kept somewhere that outlives the request. It was gone:
+/// `logging/setLevel` was acknowledged and ignored, `client_capabilities` was
+/// silently empty for every non-`initialize` request, the protocol version was
+/// re-negotiated each time, and a created task was unreachable forever after.
+#[derive(Default)]
+struct Session {
+    /// As last set by `logging/setLevel`.
+    log_level: Option<crate::server::LogLevel>,
+    /// As declared at `initialize`.
+    client_capabilities: ClientCapabilities,
+    /// As agreed at `initialize`.
+    negotiated_version: Option<String>,
+    /// The store tasks live in, once a request has enabled tasks.
+    tasks: Option<Arc<TaskStore>>,
+}
+
+impl Session {
+    /// Give a freshly built server everything the connection already knows.
+    fn restore<C: Send + Sync + 'static>(&mut self, server: &mut Server<C>) {
+        if let Some(level) = self.log_level {
+            server.set_log_level(level);
+        }
+        server.set_client_capabilities(self.client_capabilities.clone());
+        if let Some(version) = &self.negotiated_version {
+            server.set_negotiated_version(version.clone());
+        }
+
+        // The first request that enables tasks donates its store; every later
+        // one runs against that same store instead of its own.
+        match self.tasks.clone() {
+            Some(store) => server.share_task_store(store),
+            None => self.tasks = server.task_store().cloned(),
+        }
+    }
+
+    /// Take back whatever the request changed.
+    fn absorb<C: Send + Sync + 'static>(&mut self, server: &Server<C>) {
+        self.log_level = Some(server.log_level());
+        self.client_capabilities = server.client_capabilities().clone();
+        if let Some(version) = server.negotiated_version() {
+            self.negotiated_version = Some(version.to_string());
+        }
+    }
 }
 
 /// What a processed request produced.
@@ -199,6 +250,8 @@ pub struct HttpServer<C> {
     /// Scopes every authenticated request must carry.
     #[cfg(feature = "auth")]
     required_scopes: Vec<String>,
+    /// Everything that outlives a single request.
+    session: Arc<Mutex<Session>>,
 }
 
 impl<C: Send + Sync + 'static> HttpServer<C> {
@@ -216,6 +269,7 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             protected_resource: None,
             #[cfg(feature = "auth")]
             required_scopes: Vec::new(),
+            session: Arc::new(Mutex::new(Session::default())),
         }
     }
 
@@ -519,7 +573,10 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
             self.trace(|| format!("  Request: {}", body));
 
-            let response = self.finish(self.guarded(body, &context_factory));
+            // No authorization context, so requestors cannot be told apart:
+            // tasks stay reachable by id but are not listable.
+            let response =
+                self.finish(self.guarded(body, TaskContext::Anonymous, &context_factory));
             if let Err(e) = request.respond(response) {
                 eprintln!("  Failed to send response: {}", e);
             }
@@ -615,8 +672,11 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
             self.trace(|| format!("  Request: {}", body));
 
-            // Process request with auth context
-            let response = self.finish(self.guarded(body, || context_factory(&claims)));
+            // Process request with auth context. Tasks bind to the identity
+            // the token carries, which is what makes them isolatable.
+            let owner = format!("{}\u{1}{}", claims.user_id(), claims.tenant_id());
+            let response = self
+                .finish(self.guarded(body, TaskContext::Owner(owner), || context_factory(&claims)));
             if let Err(e) = request.respond(response) {
                 eprintln!("  Failed to send response: {}", e);
             }
@@ -632,10 +692,15 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     /// unwinding tool, setup closure, or context factory used to take the
     /// accept loop with it: the client saw a dropped connection and the server
     /// stopped serving *everyone*.
-    fn guarded(&self, body: String, make_context: impl FnOnce() -> C) -> Result<Processed> {
+    fn guarded(
+        &self,
+        body: String,
+        task_context: TaskContext,
+        make_context: impl FnOnce() -> C,
+    ) -> Result<Processed> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut ctx = make_context();
-            self.process_request(body, &mut ctx)
+            self.process_request(body, &mut ctx, task_context)
         }))
         .unwrap_or_else(|payload| {
             Err(McpError::Internal(format!(
@@ -646,7 +711,12 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
     }
 
     /// Process a single request and return the body to send, if any.
-    fn process_request(&self, body: String, ctx: &mut C) -> Result<Processed> {
+    fn process_request(
+        &self,
+        body: String,
+        ctx: &mut C,
+        task_context: TaskContext,
+    ) -> Result<Processed> {
         // Create fresh server
         let mut server: Server<C> = Server::new(self.config.clone());
 
@@ -655,9 +725,30 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
             setup(&mut server)?;
         }
 
+        server.set_task_context(task_context);
+
+        // Hand it the connection's state before it sees the request, and take
+        // back whatever the request changed afterwards.
+        {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| McpError::Internal("Session lock poisoned".into()))?;
+            session.restore(&mut server);
+        }
+
         // Create transport and process
         let transport = Arc::new(Mutex::new(HttpTransport::new(body)));
-        server.process_one(transport.clone(), ctx)?;
+        let outcome = server.process_one(transport.clone(), ctx);
+
+        {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| McpError::Internal("Session lock poisoned".into()))?;
+            session.absorb(&server);
+        }
+        outcome?;
 
         // Extract response
         let mut transport_guard = transport
@@ -831,6 +922,53 @@ mod http_server_tests {
         }
     }
 
+    // Task-callable tool, to prove a task survives the request that made it
+    struct SlowTaskTool;
+    impl Tool<TestContext> for SlowTaskTool {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn description(&self) -> &str {
+            "Runs as a task"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn task_support(&self) -> crate::types::TaskSupport {
+            crate::types::TaskSupport::Optional
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            _env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            Ok(CallToolResult::text("finished"))
+        }
+    }
+
+    // Tool that reports the log level it can see, to prove setLevel sticks
+    struct LogLevelTool;
+    impl Tool<TestContext> for LogLevelTool {
+        fn name(&self) -> &str {
+            "level"
+        }
+        fn description(&self) -> &str {
+            "Reports the client's log threshold"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn execute(
+            &self,
+            _args: Value,
+            _ctx: &mut TestContext,
+            env: &ToolEnv,
+        ) -> Result<CallToolResult> {
+            Ok(CallToolResult::text(env.log_level().as_str()))
+        }
+    }
+
     // Counter tool that uses context
     struct CounterTool;
     impl Tool<TestContext> for CounterTool {
@@ -948,6 +1086,11 @@ mod http_server_tests {
                 .with_tools(|s: &mut Server<TestContext>| {
                     s.add_tool(EchoTool)?;
                     s.add_tool(PanicTool)?;
+                    s.add_tool(LogLevelTool)?;
+                    s.add_tool(SlowTaskTool)?;
+                    s.enable_tasks(Default::default(), || TestContext {
+                        counter: Arc::new(AtomicI64::new(0)),
+                    });
                     Ok(())
                 })
                 .serve(&server_addr, move || TestContext {
@@ -1091,6 +1234,105 @@ mod http_server_tests {
 
         let (status, _, _) = http_post(&addr, "/mcp", PING).unwrap();
         assert_eq!(status, 500, "the accept loop died with the setup closure");
+    }
+
+    //
+    // Per-connection state
+    //
+
+    #[test]
+    fn test_set_level_survives_the_request_that_set_it() {
+        // logging §Message Flow shows `setLevel(error)` followed by "Only sends
+        // error level and above" for subsequent activity. A fresh `Server` per
+        // request meant the setting was acknowledged and then dropped.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"level"}}"#;
+        let (_, _, before) = http_post(&addr, "/mcp", call).unwrap();
+        let parsed: Value = serde_json::from_str(&before).unwrap();
+        assert_eq!(parsed["result"]["content"][0]["text"], "info");
+
+        let (status, _, _) = http_post(
+            &addr,
+            "/mcp",
+            r#"{"jsonrpc":"2.0","id":2,"method":"logging/setLevel","params":{"level":"error"}}"#,
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+
+        let (_, _, after) = http_post(&addr, "/mcp", call).unwrap();
+        let parsed: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed["result"]["content"][0]["text"], "error");
+    }
+
+    #[test]
+    fn test_client_capabilities_survive_the_initialize_request() {
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}},"clientInfo":{"name":"t","version":"1"}}}"#;
+        let (status, _, body) = http_post(&addr, "/mcp", init).unwrap();
+        assert_eq!(status, 200);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["result"]["protocolVersion"], "2025-11-25");
+
+        // A second `initialize` on the same connection must see what the first
+        // negotiated rather than starting from nothing.
+        let (_, _, body) = http_post(&addr, "/mcp", init).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["result"]["protocolVersion"], "2025-11-25");
+    }
+
+    #[test]
+    fn test_a_task_is_still_there_on_the_next_request() {
+        // The store used to go out of scope with the request that created it,
+        // so `tools/call` handed back a `taskId` and every later `tasks/get`,
+        // `tasks/result` and `tasks/cancel` answered -32602 "Task not found".
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let call =
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow","task":{}}}"#;
+        let (status, _, body) = http_post(&addr, "/mcp", call).unwrap();
+        assert_eq!(status, 200);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        let task_id = parsed["result"]["task"]["taskId"]
+            .as_str()
+            .expect("a task id")
+            .to_string();
+
+        let result = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tasks/result","params":{{"taskId":"{task_id}"}}}}"#
+        );
+        let (status, _, body) = http_post(&addr, "/mcp", &result).unwrap();
+        assert_eq!(status, 200);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["result"]["content"][0]["text"], "finished", "{body}");
+    }
+
+    #[test]
+    fn test_an_unauthenticated_http_server_does_not_declare_tasks_list() {
+        // "Receivers that cannot identify requestors SHOULD NOT declare the
+        // `tasks.list` capability" - several clients share this endpoint and
+        // nothing tells them apart.
+        let addr = spawn_server(OriginPolicy::Loopback);
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+        let (_, _, body) = http_post(&addr, "/mcp", init).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        let tasks = &parsed["result"]["capabilities"]["tasks"];
+        assert!(!tasks.is_null(), "{body}");
+        assert!(tasks["list"].is_null(), "{body}");
+        assert!(!tasks["cancel"].is_null(), "{body}");
+
+        // And the method itself refuses rather than listing everyone's work.
+        let (_, _, body) = http_post(
+            &addr,
+            "/mcp",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tasks/list"}"#,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], -32601, "{body}");
     }
 
     #[test]
@@ -1933,6 +2175,136 @@ mod http_server_tests {
             stream.read_to_string(&mut response).unwrap();
 
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
+        #[test]
+        fn test_tasks_are_bound_to_the_authorization_context() {
+            // "When an authorization context is provided, receivers MUST bind
+            // tasks to said context" and MUST reject `tasks/get`,
+            // `tasks/result` and `tasks/cancel` for tasks belonging to another
+            // one. Masked before only because a task never survived its
+            // request at all.
+            struct TaskTool;
+            impl Tool<AuthContext> for TaskTool {
+                fn name(&self) -> &str {
+                    "work"
+                }
+                fn description(&self) -> &str {
+                    "Runs as a task"
+                }
+                fn schema(&self) -> Value {
+                    serde_json::json!({ "type": "object", "properties": {} })
+                }
+                fn task_support(&self) -> crate::types::TaskSupport {
+                    crate::types::TaskSupport::Optional
+                }
+                fn execute(
+                    &self,
+                    _args: Value,
+                    ctx: &mut AuthContext,
+                    _env: &ToolEnv,
+                ) -> Result<CallToolResult> {
+                    Ok(CallToolResult::text(format!("done for {}", ctx.user_id)))
+                }
+            }
+
+            let addr = format!("127.0.0.1:{}", next_port());
+            let server_addr = addr.clone();
+            thread::spawn(move || {
+                let _ = HttpServer::new(ServerConfig::default())
+                    .with_tools(|s: &mut Server<AuthContext>| {
+                        s.add_tool(TaskTool)?;
+                        s.enable_tasks(Default::default(), || AuthContext {
+                            user_id: "worker".into(),
+                        });
+                        Ok(())
+                    })
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
+                    });
+            });
+            thread::sleep(Duration::from_millis(100));
+
+            let alice = make_token_with("alice", "tenant-a", Some(RESOURCE), None);
+            let mallory = make_token_with("mallory", "tenant-b", Some(RESOURCE), None);
+
+            let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"work","task":{}}}"#;
+            let (_, _, body) = http_post_with_auth(&addr, "/mcp", call, Some(&alice)).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            let task_id = parsed["result"]["task"]["taskId"]
+                .as_str()
+                .expect("a task id")
+                .to_string();
+
+            // Mallory knows the id and is perfectly well authenticated.
+            let get = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{{"taskId":"{task_id}"}}}}"#
+            );
+            let (_, _, body) = http_post_with_auth(&addr, "/mcp", &get, Some(&mallory)).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["error"]["code"], -32602, "{body}");
+
+            let cancel = format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"tasks/cancel","params":{{"taskId":"{task_id}"}}}}"#
+            );
+            let (_, _, body) = http_post_with_auth(&addr, "/mcp", &cancel, Some(&mallory)).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["error"]["code"], -32602, "{body}");
+
+            // "For tasks/list requests, receivers MUST ensure the returned task
+            // list includes only tasks associated with the requestor's
+            // authorization context."
+            let list = r#"{"jsonrpc":"2.0","id":4,"method":"tasks/list"}"#;
+            let (_, _, body) = http_post_with_auth(&addr, "/mcp", list, Some(&mallory)).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed["result"]["tasks"].as_array().unwrap().len(),
+                0,
+                "{body}"
+            );
+
+            // Alice still has hers.
+            let (_, _, body) = http_post_with_auth(&addr, "/mcp", &get, Some(&alice)).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["result"]["taskId"], task_id.as_str(), "{body}");
+
+            let (_, _, body) = http_post_with_auth(&addr, "/mcp", list, Some(&alice)).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed["result"]["tasks"].as_array().unwrap().len(),
+                1,
+                "{body}"
+            );
+        }
+
+        #[test]
+        fn test_an_authenticated_server_does_declare_tasks_list() {
+            // It can identify requestors, so listing is safe - and filtered.
+            let addr = format!("127.0.0.1:{}", next_port());
+            let server_addr = addr.clone();
+            thread::spawn(move || {
+                let _ = HttpServer::new(ServerConfig::default())
+                    .with_tools(|s: &mut Server<AuthContext>| {
+                        s.add_tool(WhoamiTool)?;
+                        s.enable_tasks(Default::default(), || AuthContext {
+                            user_id: "worker".into(),
+                        });
+                        Ok(())
+                    })
+                    .serve_with_auth(&server_addr, bound_validator(), |claims| AuthContext {
+                        user_id: claims.user_id().to_string(),
+                    });
+            });
+            thread::sleep(Duration::from_millis(100));
+
+            let token = make_token("alice", "tenant-a");
+            let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+            let (_, _, body) = http_post_with_auth(&addr, "/mcp", init, Some(&token)).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                !parsed["result"]["capabilities"]["tasks"]["list"].is_null(),
+                "{body}"
+            );
         }
 
         #[test]

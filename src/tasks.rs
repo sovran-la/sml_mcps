@@ -201,6 +201,12 @@ pub enum TaskOutcome {
     Error(JsonRpcError),
 }
 
+/// Who is asking about a task.
+///
+/// `None` where the transport provides no authorization context - a stdio
+/// server has exactly one requestor, so there is nothing to tell apart.
+pub type Requestor<'a> = Option<&'a str>;
+
 /// One task's full state.
 #[derive(Debug)]
 struct TaskRecord {
@@ -210,6 +216,23 @@ struct TaskRecord {
     created: SystemTime,
     /// Cooperative cancellation flag, observed by the running tool.
     cancelled: Arc<AtomicBool>,
+    /// The authorization context this task belongs to.
+    ///
+    /// "When an authorization context is provided, receivers **MUST** bind
+    /// tasks to said context", and **MUST** then refuse `tasks/get`,
+    /// `tasks/result` and `tasks/cancel` from anyone else.
+    owner: Option<String>,
+}
+
+impl TaskRecord {
+    /// May `requestor` see this task at all?
+    ///
+    /// Exact match, including both being `None`: on a server that identifies
+    /// requestors every task has an owner, and on one that does not, no task
+    /// does, so the two never mix in practice.
+    fn belongs_to(&self, requestor: Requestor<'_>) -> bool {
+        self.owner.as_deref() == requestor
+    }
 }
 
 impl TaskRecord {
@@ -279,7 +302,11 @@ impl TaskStore {
     ///
     /// The record exists before this returns, which is what lets the caller
     /// answer `CreateTaskResult` knowing a later `tasks/get` will find it.
-    pub fn create(&self, requested_ttl: Option<u64>) -> Result<(Task, Arc<AtomicBool>)> {
+    pub fn create(
+        &self,
+        requested_ttl: Option<u64>,
+        owner: Option<String>,
+    ) -> Result<(Task, Arc<AtomicBool>)> {
         let now = SystemTime::now();
         let mut tasks = self.lock()?;
         Self::sweep(&mut tasks, now);
@@ -320,6 +347,7 @@ impl TaskStore {
                 outcome: None,
                 created: now,
                 cancelled: cancelled.clone(),
+                owner,
             },
         );
 
@@ -327,20 +355,32 @@ impl TaskStore {
     }
 
     /// Fetch a task's current state.
-    pub fn get(&self, task_id: &str) -> Result<Task> {
+    ///
+    /// A task belonging to someone else is reported as missing rather than
+    /// forbidden: whether a given task id exists is not `requestor`'s business.
+    pub fn get(&self, task_id: &str, requestor: Requestor<'_>) -> Result<Task> {
         let mut tasks = self.lock()?;
         Self::sweep(&mut tasks, SystemTime::now());
         tasks
             .get(task_id)
+            .filter(|record| record.belongs_to(requestor))
             .map(|record| record.task.clone())
             .ok_or_else(|| not_found(task_id))
     }
 
-    /// Every task, newest first.
-    pub fn list(&self) -> Result<Vec<Task>> {
+    /// Every task this requestor owns, newest first.
+    ///
+    /// "For `tasks/list` requests, receivers **MUST** ensure the returned task
+    /// list includes only tasks associated with the requestor's authorization
+    /// context."
+    pub fn list(&self, requestor: Requestor<'_>) -> Result<Vec<Task>> {
         let mut tasks = self.lock()?;
         Self::sweep(&mut tasks, SystemTime::now());
-        let mut all: Vec<Task> = tasks.values().map(|record| record.task.clone()).collect();
+        let mut all: Vec<Task> = tasks
+            .values()
+            .filter(|record| record.belongs_to(requestor))
+            .map(|record| record.task.clone())
+            .collect();
         // Stable order so cursor pagination stays coherent between pages.
         all.sort_by(|a, b| {
             b.created_at
@@ -409,9 +449,16 @@ impl TaskStore {
     }
 
     /// Attach a human-readable note without changing status.
+    ///
+    /// Ignored once the task is terminal: a worker that has not noticed it was
+    /// cancelled would otherwise overwrite "The task was cancelled by request."
+    /// with a progress note, losing the only record of why the task ended.
     pub fn set_status_message(&self, task_id: &str, message: impl Into<String>) -> Result<()> {
         let mut tasks = self.lock()?;
-        if let Some(record) = tasks.get_mut(task_id) {
+        if let Some(record) = tasks
+            .get_mut(task_id)
+            .filter(|record| !record.task.status.is_terminal())
+        {
             record.task.status_message = Some(message.into());
             record.task.last_updated_at = iso8601(SystemTime::now());
         }
@@ -424,11 +471,14 @@ impl TaskStore {
     ///
     /// Returns Invalid params for an unknown task or one already terminal,
     /// both of which the spec names explicitly.
-    pub fn cancel(&self, task_id: &str) -> Result<Task> {
+    pub fn cancel(&self, task_id: &str, requestor: Requestor<'_>) -> Result<Task> {
         let mut tasks = self.lock()?;
         Self::sweep(&mut tasks, SystemTime::now());
 
-        let record = tasks.get_mut(task_id).ok_or_else(|| not_found(task_id))?;
+        let record = tasks
+            .get_mut(task_id)
+            .filter(|record| record.belongs_to(requestor))
+            .ok_or_else(|| not_found(task_id))?;
         if record.task.status.is_terminal() {
             return Err(McpError::InvalidParams(format!(
                 "Cannot cancel task: already in terminal status '{}'",
@@ -458,11 +508,18 @@ impl TaskStore {
     /// The non-blocking half of [`await_result`](Self::await_result), for a
     /// caller that has something else to do between checks - such as reading
     /// the transport, so a task waiting on `input_required` can be answered.
-    pub fn try_result(&self, task_id: &str) -> Result<Option<TaskOutcome>> {
+    pub fn try_result(
+        &self,
+        task_id: &str,
+        requestor: Requestor<'_>,
+    ) -> Result<Option<TaskOutcome>> {
         let mut tasks = self.lock()?;
         Self::sweep(&mut tasks, SystemTime::now());
 
-        let record = tasks.get(task_id).ok_or_else(|| not_found(task_id))?;
+        let record = tasks
+            .get(task_id)
+            .filter(|record| record.belongs_to(requestor))
+            .ok_or_else(|| not_found(task_id))?;
         if !record.task.status.is_terminal() {
             return Ok(None);
         }
@@ -488,7 +545,7 @@ impl TaskStore {
     /// The wait is bounded by the task's TTL. Nothing signals an expiry - it is
     /// noticed by sweeping - so waiting on the condvar alone would sleep past
     /// the deadline of a task that stopped making progress and never wake.
-    pub fn await_result(&self, task_id: &str) -> Result<TaskOutcome> {
+    pub fn await_result(&self, task_id: &str, requestor: Requestor<'_>) -> Result<TaskOutcome> {
         /// How often to look up from the condvar and re-sweep.
         const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -497,7 +554,10 @@ impl TaskStore {
         loop {
             Self::sweep(&mut tasks, SystemTime::now());
 
-            let record = tasks.get(task_id).ok_or_else(|| not_found(task_id))?;
+            let record = tasks
+                .get(task_id)
+                .filter(|record| record.belongs_to(requestor))
+                .ok_or_else(|| not_found(task_id))?;
             if record.task.status.is_terminal() {
                 return record.outcome.clone().ok_or_else(|| {
                     McpError::Internal(format!("task {task_id} is terminal but has no result"))
@@ -725,7 +785,7 @@ mod tests {
     fn create_starts_in_working_with_required_fields() {
         // "Tasks MUST begin in the working status when created."
         let store = store();
-        let (task, cancelled) = store.create(None).unwrap();
+        let (task, cancelled) = store.create(None, None).unwrap();
 
         assert_eq!(task.status, TaskStatus::Working);
         assert!(!cancelled.load(Ordering::SeqCst));
@@ -740,9 +800,9 @@ mod tests {
     fn create_is_immediately_visible_to_get() {
         // "The task must be durably created before sending the response."
         let store = store();
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
         assert_eq!(
-            store.get(&task.task_id).unwrap().status,
+            store.get(&task.task_id, None).unwrap().status,
             TaskStatus::Working
         );
     }
@@ -754,10 +814,16 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(store.create(Some(30_000)).unwrap().0.ttl, Some(30_000));
+        assert_eq!(
+            store.create(Some(30_000), None).unwrap().0.ttl,
+            Some(30_000)
+        );
         // Receivers MAY override the requested ttl; clamping degrades rather
         // than rejecting.
-        assert_eq!(store.create(Some(999_999_999)).unwrap().0.ttl, Some(60_000));
+        assert_eq!(
+            store.create(Some(999_999_999), None).unwrap().0.ttl,
+            Some(60_000)
+        );
     }
 
     #[test]
@@ -767,9 +833,9 @@ mod tests {
             ..Default::default()
         });
 
-        let (first, _) = store.create(None).unwrap();
-        store.create(None).unwrap();
-        assert!(store.create(None).is_err());
+        let (first, _) = store.create(None, None).unwrap();
+        store.create(None, None).unwrap();
+        assert!(store.create(None, None).is_err());
 
         // Finishing one frees a slot.
         store
@@ -779,7 +845,7 @@ mod tests {
                 TaskOutcome::Value(serde_json::json!({})),
             )
             .unwrap();
-        assert!(store.create(None).is_ok());
+        assert!(store.create(None, None).is_ok());
     }
 
     #[test]
@@ -870,7 +936,7 @@ mod tests {
     #[test]
     fn finish_records_the_outcome() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
 
         store
             .finish(
@@ -881,10 +947,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get(&task.task_id).unwrap().status,
+            store.get(&task.task_id, None).unwrap().status,
             TaskStatus::Completed
         );
-        let TaskOutcome::Value(value) = store.await_result(&task.task_id).unwrap() else {
+        let TaskOutcome::Value(value) = store.await_result(&task.task_id, None).unwrap() else {
             panic!("expected a value");
         };
         assert_eq!(value["done"], true);
@@ -893,7 +959,7 @@ mod tests {
     #[test]
     fn finish_records_error_outcomes_and_a_status_message() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
 
         store
             .finish(
@@ -903,7 +969,7 @@ mod tests {
             )
             .unwrap();
 
-        let fetched = store.get(&task.task_id).unwrap();
+        let fetched = store.get(&task.task_id, None).unwrap();
         assert_eq!(fetched.status, TaskStatus::Failed);
         // "The tasks/get response SHOULD include a statusMessage field with
         // diagnostic information about the failure."
@@ -918,9 +984,9 @@ mod tests {
     #[test]
     fn finish_cannot_move_a_terminal_task() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
 
-        store.cancel(&task.task_id).unwrap();
+        store.cancel(&task.task_id, None).unwrap();
         // "Once a task is cancelled, it MUST remain in cancelled status even
         // if execution continues to completion or fails."
         store
@@ -932,7 +998,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get(&task.task_id).unwrap().status,
+            store.get(&task.task_id, None).unwrap().status,
             TaskStatus::Cancelled
         );
     }
@@ -955,10 +1021,10 @@ mod tests {
     #[test]
     fn last_updated_at_is_always_present() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
         store.set_status_message(&task.task_id, "halfway").unwrap();
 
-        let fetched = store.get(&task.task_id).unwrap();
+        let fetched = store.get(&task.task_id, None).unwrap();
         assert!(fetched.last_updated_at.ends_with('Z'));
         assert_eq!(fetched.status_message.as_deref(), Some("halfway"));
         // A status message alone must not move the status.
@@ -972,9 +1038,9 @@ mod tests {
     #[test]
     fn cancel_moves_to_cancelled_and_signals_the_worker() {
         let store = store();
-        let (task, cancelled) = store.create(None).unwrap();
+        let (task, cancelled) = store.create(None, None).unwrap();
 
-        let result = store.cancel(&task.task_id).unwrap();
+        let result = store.cancel(&task.task_id, None).unwrap();
         // "receivers ... MUST transition the task to cancelled status before
         // sending the response."
         assert_eq!(result.status, TaskStatus::Cancelled);
@@ -984,7 +1050,7 @@ mod tests {
     #[test]
     fn cancelling_a_terminal_task_is_invalid_params() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
         store
             .finish(
                 &task.task_id,
@@ -995,24 +1061,24 @@ mod tests {
 
         // "Receivers MUST reject cancellation requests for tasks already in a
         // terminal status with error code -32602."
-        let err = store.cancel(&task.task_id).unwrap_err();
+        let err = store.cancel(&task.task_id, None).unwrap_err();
         assert_eq!(err.to_jsonrpc_error().code, -32602);
         assert!(err.to_string().contains("terminal"), "{err}");
     }
 
     #[test]
     fn cancelling_an_unknown_task_is_invalid_params() {
-        let err = store().cancel("nope").unwrap_err();
+        let err = store().cancel("nope", None).unwrap_err();
         assert_eq!(err.to_jsonrpc_error().code, -32602);
     }
 
     #[test]
     fn a_cancelled_task_yields_its_error_from_result() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
-        store.cancel(&task.task_id).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
+        store.cancel(&task.task_id, None).unwrap();
 
-        let TaskOutcome::Error(error) = store.await_result(&task.task_id).unwrap() else {
+        let TaskOutcome::Error(error) = store.await_result(&task.task_id, None).unwrap() else {
             panic!("expected an error outcome");
         };
         assert!(error.message.contains("cancelled"));
@@ -1026,9 +1092,9 @@ mod tests {
     fn unknown_tasks_are_invalid_params_everywhere() {
         let store = store();
         for err in [
-            store.get("nope").unwrap_err(),
-            store.await_result("nope").unwrap_err(),
-            store.cancel("nope").unwrap_err(),
+            store.get("nope", None).unwrap_err(),
+            store.await_result("nope", None).unwrap_err(),
+            store.cancel("nope", None).unwrap_err(),
         ] {
             assert_eq!(err.to_jsonrpc_error().code, -32602);
             assert!(err.to_string().contains("not found"), "{err}");
@@ -1045,19 +1111,19 @@ mod tests {
             default_ttl_ms: 0, // expires immediately
             ..Default::default()
         });
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
 
         // A zero TTL means already elapsed, so the next operation purges it.
-        let err = store.get(&task.task_id).unwrap_err();
+        let err = store.get(&task.task_id, None).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
     #[test]
     fn a_live_ttl_keeps_the_task() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
-        assert!(store.get(&task.task_id).is_ok());
-        assert_eq!(store.list().unwrap().len(), 1);
+        let (task, _) = store.create(None, None).unwrap();
+        assert!(store.get(&task.task_id, None).is_ok());
+        assert_eq!(store.list(None).unwrap().len(), 1);
     }
 
     #[test]
@@ -1070,12 +1136,12 @@ mod tests {
             default_ttl_ms: 150,
             ..Default::default()
         }));
-        let (task, _cancelled) = store.create(None).unwrap();
+        let (task, _cancelled) = store.create(None, None).unwrap();
 
         let (done, waited) = std::sync::mpsc::channel();
         let waiting = store.clone();
         std::thread::spawn(move || {
-            let _ = done.send(waiting.await_result(&task.task_id));
+            let _ = done.send(waiting.await_result(&task.task_id, None));
         });
 
         let outcome = waited
@@ -1094,9 +1160,9 @@ mod tests {
             max_concurrent: 1,
             ..Default::default()
         });
-        store.create(None).unwrap();
+        store.create(None, None).unwrap();
         // The first task expired, so a slot is available again.
-        assert!(store.create(None).is_ok());
+        assert!(store.create(None, None).is_ok());
     }
 
     //
@@ -1107,10 +1173,10 @@ mod tests {
     fn list_returns_every_live_task_in_stable_order() {
         let store = store();
         let ids: Vec<String> = (0..3)
-            .map(|_| store.create(None).unwrap().0.task_id)
+            .map(|_| store.create(None, None).unwrap().0.task_id)
             .collect();
 
-        let listed = store.list().unwrap();
+        let listed = store.list(None).unwrap();
         assert_eq!(listed.len(), 3);
         for id in &ids {
             assert!(listed.iter().any(|t| &t.task_id == id));
@@ -1119,7 +1185,7 @@ mod tests {
         // Order must be deterministic so paginated pages stay coherent.
         assert_eq!(
             store
-                .list()
+                .list(None)
                 .unwrap()
                 .iter()
                 .map(|t| &t.task_id)
@@ -1131,8 +1197,8 @@ mod tests {
     #[test]
     fn running_counts_only_non_terminal_tasks() {
         let store = store();
-        let (a, _) = store.create(None).unwrap();
-        store.create(None).unwrap();
+        let (a, _) = store.create(None, None).unwrap();
+        store.create(None, None).unwrap();
         assert_eq!(store.running().unwrap(), 2);
 
         store
@@ -1152,7 +1218,7 @@ mod tests {
     #[test]
     fn await_result_returns_immediately_when_already_terminal() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
         store
             .finish(
                 &task.task_id,
@@ -1161,7 +1227,7 @@ mod tests {
             )
             .unwrap();
 
-        let TaskOutcome::Value(value) = store.await_result(&task.task_id).unwrap() else {
+        let TaskOutcome::Value(value) = store.await_result(&task.task_id, None).unwrap() else {
             panic!("expected a value");
         };
         assert_eq!(value["n"], 1);
@@ -1171,7 +1237,7 @@ mod tests {
     fn await_result_blocks_until_the_task_finishes() {
         // The MUST that makes tasks/result useful: it waits.
         let store = Arc::new(store());
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
 
         let finisher = {
             let store = store.clone();
@@ -1189,7 +1255,7 @@ mod tests {
         };
 
         let started = SystemTime::now();
-        let outcome = store.await_result(&task.task_id).unwrap();
+        let outcome = store.await_result(&task.task_id, None).unwrap();
         let waited = started.elapsed().unwrap();
 
         let TaskOutcome::Value(value) = outcome else {
@@ -1204,18 +1270,18 @@ mod tests {
     #[test]
     fn await_result_wakes_on_cancellation() {
         let store = Arc::new(store());
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
 
         let canceller = {
             let store = store.clone();
             let task_id = task.task_id.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
-                store.cancel(&task_id).unwrap();
+                store.cancel(&task_id, None).unwrap();
             })
         };
 
-        let outcome = store.await_result(&task.task_id).unwrap();
+        let outcome = store.await_result(&task.task_id, None).unwrap();
         assert!(matches!(outcome, TaskOutcome::Error(_)));
         canceller.join().unwrap();
     }
@@ -1234,7 +1300,7 @@ mod tests {
     #[test]
     fn create_task_result_serializes_to_the_spec_shape() {
         let store = store();
-        let (task, _) = store.create(None).unwrap();
+        let (task, _) = store.create(None, None).unwrap();
         let result = CreateTaskResult { task, meta: None };
 
         let wire: Value = serde_json::to_value(&result).unwrap();

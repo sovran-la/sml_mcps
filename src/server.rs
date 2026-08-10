@@ -1116,6 +1116,10 @@ pub struct Server<C> {
     broker: Arc<RequestBroker>,
     /// Present only once [`Server::enable_tasks`] has been called.
     tasks: Option<TaskRuntime<C>>,
+    /// Who tasks belong to, and whether they can be listed.
+    task_context: TaskContext,
+    /// The revision agreed at `initialize`, once one has been.
+    negotiated_version: Option<String>,
     /// Workers held until the response announcing their task has been written.
     ///
     /// A worker writes through an independent handle on its own thread, so
@@ -1160,6 +1164,45 @@ impl TaskGate {
             *open = true;
         }
         self.opened.notify_all();
+    }
+}
+
+/// How this server tells requestors apart, for the purpose of owning tasks.
+///
+/// tasks §Task Isolation and Access Control: "When an authorization context is
+/// provided, receivers **MUST** bind tasks to said context", and receivers
+/// "that cannot identify requestors **SHOULD NOT** declare the `tasks.list`
+/// capability."
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TaskContext {
+    /// One requestor owns the whole server: stdio, or one Unix connection.
+    ///
+    /// There is nobody to isolate tasks from, and listing them leaks nothing.
+    #[default]
+    SingleRequestor,
+    /// Requests carry an authorization identity. Tasks bind to it, and
+    /// `tasks/get`, `tasks/result`, `tasks/cancel` and `tasks/list` only ever
+    /// see their owner's.
+    Owner(String),
+    /// Several requestors share this server and cannot be told apart - an
+    /// unauthenticated HTTP endpoint. Tasks stay reachable by id, which carries
+    /// 128 bits of entropy, but `tasks.list` is not declared, because
+    /// enumerating them would hand one requestor another's work.
+    Anonymous,
+}
+
+impl TaskContext {
+    /// The owner key tasks created in this context carry.
+    fn owner(&self) -> Option<&str> {
+        match self {
+            TaskContext::Owner(owner) => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// May this server declare `tasks.list`?
+    fn can_list(&self) -> bool {
+        !matches!(self, TaskContext::Anonymous)
     }
 }
 
@@ -1251,6 +1294,8 @@ impl<C: Send + Sync + 'static> Server<C> {
             client_capabilities: ClientCapabilities::default(),
             broker: Arc::new(RequestBroker::new()),
             tasks: None,
+            task_context: TaskContext::default(),
+            negotiated_version: None,
             task_starts: Mutex::new(Vec::new()),
         }
     }
@@ -1289,6 +1334,63 @@ impl<C: Send + Sync + 'static> Server<C> {
     /// Useful for inspecting state in tests or an admin surface.
     pub fn task_store(&self) -> Option<&Arc<TaskStore>> {
         self.tasks.as_ref().map(|runtime| &runtime.store)
+    }
+
+    /// Run tasks against a store somebody else owns.
+    ///
+    /// A transport that builds a fresh `Server` per request - HTTP - otherwise
+    /// hands out a `taskId` that no later request can resolve, because the
+    /// store went out of scope with the request that created it. No-op unless
+    /// [`enable_tasks`](Self::enable_tasks) has been called.
+    pub fn share_task_store(&mut self, store: Arc<TaskStore>) {
+        if let Some(runtime) = self.tasks.as_mut() {
+            runtime.store = store;
+        }
+    }
+
+    /// Say how requestors are identified, and therefore which tasks each may
+    /// see. Defaults to [`TaskContext::SingleRequestor`].
+    pub fn set_task_context(&mut self, context: TaskContext) {
+        self.task_context = context;
+    }
+
+    /// Who the current requestor is, for task ownership.
+    fn requestor(&self) -> Option<&str> {
+        self.task_context.owner()
+    }
+
+    /// The minimum severity currently being delivered to the client.
+    pub fn log_level(&self) -> LogLevel {
+        self.log_level
+    }
+
+    /// Restore a log level the client set on an earlier request.
+    ///
+    /// `logging/setLevel` is per-session state, and a transport that rebuilds
+    /// the server per request has to carry it across or the setting is
+    /// acknowledged and then dropped on the floor.
+    pub fn set_log_level(&mut self, level: LogLevel) {
+        self.log_level = level;
+    }
+
+    /// What the client declared at `initialize`.
+    pub fn client_capabilities(&self) -> &ClientCapabilities {
+        &self.client_capabilities
+    }
+
+    /// Restore capabilities negotiated on an earlier request.
+    pub fn set_client_capabilities(&mut self, capabilities: ClientCapabilities) {
+        self.client_capabilities = capabilities;
+    }
+
+    /// The protocol revision agreed at `initialize`, if one has happened.
+    pub fn negotiated_version(&self) -> Option<&str> {
+        self.negotiated_version.as_deref()
+    }
+
+    /// Restore the revision agreed on an earlier request.
+    pub fn set_negotiated_version(&mut self, version: impl Into<String>) {
+        self.negotiated_version = Some(version.into());
     }
 
     /// This server's identity as advertised to clients.
@@ -1616,7 +1718,9 @@ impl<C: Send + Sync + 'static> Server<C> {
     fn handle_task_get(&self, request: &JsonRpcRequest) -> Result<Value> {
         let store = self.task_store_or_unsupported()?;
         let params: TaskIdParams = parse_params(request)?;
-        Ok(serde_json::to_value(store.get(&params.task_id)?)?)
+        Ok(serde_json::to_value(
+            store.get(&params.task_id, self.requestor())?,
+        )?)
     }
 
     /// `tasks/result` - block until terminal, then return exactly what the
@@ -1691,11 +1795,11 @@ impl<C: Send + Sync + 'static> Server<C> {
         const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
         let (Some(transport), true) = (self.transport.as_ref(), self.can_pump) else {
-            return store.await_result(task_id);
+            return store.await_result(task_id, self.requestor());
         };
 
         loop {
-            if let Some(outcome) = store.try_result(task_id)? {
+            if let Some(outcome) = store.try_result(task_id, self.requestor())? {
                 return Ok(outcome);
             }
 
@@ -1716,7 +1820,9 @@ impl<C: Send + Sync + 'static> Server<C> {
                 Err(McpError::Timeout(_)) => continue,
                 // The client hung up. Fall back to waiting on the task alone -
                 // it is still running, and its result may still be wanted.
-                Err(McpError::TransportClosed) => return store.await_result(task_id),
+                Err(McpError::TransportClosed) => {
+                    return store.await_result(task_id, self.requestor());
+                }
                 // Unreadable input is the client's problem, not a reason to
                 // abandon the task. Answer it and keep pumping.
                 Err(e) if is_malformed(&e) => {
@@ -1768,9 +1874,14 @@ impl<C: Send + Sync + 'static> Server<C> {
 
     fn handle_task_list(&self, request: &JsonRpcRequest) -> Result<Value> {
         let store = self.task_store_or_unsupported()?;
+        if !self.task_context.can_list() {
+            return Err(McpError::MethodNotFound(
+                "tasks/list is not available on a server that cannot identify requestors".into(),
+            ));
+        }
         let params: ListTasksParams = parse_optional_params(request)?;
 
-        let all = store.list()?;
+        let all = store.list(self.requestor())?;
         let state = PageState::from_cursor(params.cursor.as_deref(), self.config.page_size)?;
 
         // "Invalid or nonexistent cursor in `tasks/list`: -32602 (Invalid
@@ -1794,7 +1905,9 @@ impl<C: Send + Sync + 'static> Server<C> {
     fn handle_task_cancel(&self, request: &JsonRpcRequest) -> Result<Value> {
         let store = self.task_store_or_unsupported()?;
         let params: TaskIdParams = parse_params(request)?;
-        Ok(serde_json::to_value(store.cancel(&params.task_id)?)?)
+        Ok(serde_json::to_value(
+            store.cancel(&params.task_id, self.requestor())?,
+        )?)
     }
 
     /// Start a task-augmented tool call and answer with a `CreateTaskResult`.
@@ -1813,7 +1926,10 @@ impl<C: Send + Sync + 'static> Server<C> {
             .as_ref()
             .ok_or_else(|| McpError::Internal("tasks are not enabled".into()))?;
 
-        let (task, cancelled) = runtime.store.create(task_params.ttl)?;
+        // "When an authorization context is provided, receivers MUST bind
+        // tasks to said context."
+        let owner = self.task_context.owner().map(str::to_string);
+        let (task, cancelled) = runtime.store.create(task_params.ttl, owner.clone())?;
 
         let store = runtime.store.clone();
         let context_factory = runtime.context_factory.clone();
@@ -1967,7 +2083,7 @@ impl<C: Send + Sync + 'static> Server<C> {
 
                 // Optional per the spec, but it lets a client stop polling
                 // early when it is listening.
-                if let Ok(task) = store.get(&task_id) {
+                if let Ok(task) = store.get(&task_id, owner.as_deref()) {
                     if let Some(transport) = &transport {
                         if let Ok(params) = serde_json::to_value(&task) {
                             let notification = JsonRpcMessage::notification(
@@ -2053,10 +2169,17 @@ impl<C: Send + Sync + 'static> Server<C> {
                     .unwrap_or_else(|| PROTOCOL_VERSION.to_string())
             });
 
+        // Kept so a caller can ask what was agreed, and so a transport that
+        // rebuilds the server per request can restore it.
+        self.negotiated_version = Some(negotiated.clone());
+
         let result = InitializeResult {
             protocol_version: negotiated,
             capabilities: ServerCapabilities {
-                tools: if self.tools.is_empty() {
+                // Declared whenever `tools/call` is reachable. Omitting it
+                // while `tasks.requests.tools.call` was declared told the
+                // client two different things about the same method.
+                tools: if self.tools.is_empty() && self.tasks.is_none() {
                     None
                 } else {
                     Some(ToolsCapability::default())
@@ -2078,7 +2201,11 @@ impl<C: Send + Sync + 'static> Server<C> {
                 // Only declared when a runtime is actually installed, since
                 // declaring it commits us to honoring task-augmented requests.
                 tasks: self.tasks.as_ref().map(|_| TasksCapability {
-                    list: Some(serde_json::json!({})),
+                    // "Receivers that cannot identify requestors SHOULD NOT
+                    // declare the `tasks.list` capability" - listing is the one
+                    // task operation that does not need a task id, so it is the
+                    // one that leaks across requestors.
+                    list: self.task_context.can_list().then(|| serde_json::json!({})),
                     cancel: Some(serde_json::json!({})),
                     requests: Some(serde_json::json!({ "tools": { "call": {} } })),
                 }),
@@ -6402,7 +6529,7 @@ mod tests {
     #[test]
     fn test_set_status_honors_the_state_machine() {
         let store = TaskStore::new(TaskConfig::default());
-        let (task, _cancelled) = store.create(None).unwrap();
+        let (task, _cancelled) = store.create(None, None).unwrap();
 
         // working -> input_required -> working
         assert!(
@@ -6411,7 +6538,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            store.get(&task.task_id).unwrap().status,
+            store.get(&task.task_id, None).unwrap().status,
             TaskStatus::InputRequired
         );
         assert!(
@@ -6441,7 +6568,7 @@ mod tests {
     #[test]
     fn test_a_finished_task_cannot_be_moved_back_to_input_required() {
         let store = TaskStore::new(TaskConfig::default());
-        let (task, _cancelled) = store.create(None).unwrap();
+        let (task, _cancelled) = store.create(None, None).unwrap();
         store
             .finish(
                 &task.task_id,
@@ -6456,7 +6583,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            store.get(&task.task_id).unwrap().status,
+            store.get(&task.task_id, None).unwrap().status,
             TaskStatus::Completed
         );
     }
@@ -6464,9 +6591,9 @@ mod tests {
     #[test]
     fn test_try_result_does_not_block() {
         let store = TaskStore::new(TaskConfig::default());
-        let (task, _cancelled) = store.create(None).unwrap();
+        let (task, _cancelled) = store.create(None, None).unwrap();
 
-        assert!(store.try_result(&task.task_id).unwrap().is_none());
+        assert!(store.try_result(&task.task_id, None).unwrap().is_none());
 
         store
             .finish(
@@ -6476,13 +6603,14 @@ mod tests {
             )
             .unwrap();
 
-        let TaskOutcome::Value(value) = store.try_result(&task.task_id).unwrap().unwrap() else {
+        let TaskOutcome::Value(value) = store.try_result(&task.task_id, None).unwrap().unwrap()
+        else {
             panic!("expected a value");
         };
         assert_eq!(value["done"], true);
 
         // An unknown task is an error, matching await_result.
-        assert!(store.try_result("nope").is_err());
+        assert!(store.try_result("nope", None).is_err());
     }
 
     #[test]
