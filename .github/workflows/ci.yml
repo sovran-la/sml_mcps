@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: ["", "--features hosted"]
+        features: ["", "--features hosted", "--features cli"]
     steps:
       - uses: actions/checkout@v4
       
@@ -50,6 +50,10 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --features hosted -- -D warnings
 
+      # `cli` is not implied by `hosted`, so it needs a pass of its own
+      - name: Run clippy (cli)
+        run: cargo clippy --all-targets --features cli -- -D warnings
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -79,7 +83,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       
       - name: Generate coverage
-        run: cargo llvm-cov --features hosted --lcov --output-path lcov.info
+        run: cargo llvm-cov --features hosted,cli --lcov --output-path lcov.info
       
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4

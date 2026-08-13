@@ -40,6 +40,13 @@ getrandom = "0.3"
 # replaces. Only pulled in by the `http` feature.
 httparse = { version = "1.10", optional = true }
 
+# Codex keeps its MCP servers in `~/.codex/config.toml`, which is hand-written
+# and hand-commented. `toml_edit` rather than `toml` because re-serializing a
+# parsed `toml::Value` loses every comment and every choice of layout in the
+# file, and silently reformatting someone's config is not a thing an installer
+# gets to do. Only pulled in by the `cli` feature.
+toml_edit = { version = "0.25", optional = true }
+
 # Unix daemon syscalls (fork, setsid, dup2, kill) for UnixServer::serve_daemon.
 # Unix-only, always available there - no feature flag (matches #[cfg(unix)] gating).
 [target.'cfg(unix)'.dependencies]
@@ -58,8 +65,13 @@ hosted = ["http", "auth"]
 # HTTPS via rustls. Pure Rust - no system OpenSSL - and off by default,
 # because most deployments terminate TLS at a proxy and should not pay for it.
 tls = ["http", "dep:rustls", "dep:rustls-pemfile"]
+# `install`/`uninstall`/`serve`/`health` subcommands, and the registry of MCP
+# clients they edit. The only dependency is `toml_edit`, for the one client that
+# keeps its server list in TOML.
+cli = ["dep:toml_edit"]
 
 [dev-dependencies]
+tempfile = "3"
 
 [[example]]
 name = "simple"
@@ -79,3 +91,8 @@ name = "unix_server"
 # The same three modes as unix_server, through Server::serve_daemon
 [[example]]
 name = "serve_daemon"
+
+# install/uninstall/serve/health, plus a custom subcommand
+[[example]]
+name = "cli"
+required-features = ["cli"]

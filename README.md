@@ -28,6 +28,7 @@ http = ["dep:httparse"]        # Streamable HTTP transport (with SSE)
 auth = ["dep:jsonwebtoken"]    # JWT validation for hosted
 hosted = ["http", "auth"]      # Both HTTP and auth
 tls = ["http", "dep:rustls", "dep:rustls-pemfile"]  # HTTPS, via rustls
+cli = ["dep:toml_edit"]        # install/uninstall/serve/health subcommands
 ```
 
 ## Usage (Stdio)
@@ -370,6 +371,98 @@ if t.has_notifications() {
     let json_body = t.take_response().unwrap_or_default();
 }
 ```
+
+## CLI Harness (`cli` feature)
+
+Every MCP server ends up writing the same four subcommands. `install` and
+`uninstall` are the same mechanical work everywhere - find the MCP clients on
+this machine, edit their config files - so the crate does them for you.
+
+```rust
+use sml_mcps::cli::{Cli, ServerEntry, SubCommand};
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    Cli::new(ServerEntry::new("my-mcp", &["serve"]))
+        .description("An MCP server for doing cool stuff")
+        .on_install(|_args| {
+            // your own setup, before any client config is written
+            Ok(())
+        })
+        .on_uninstall(|_args| {
+            // and your own cleanup, once the entries are gone
+            Ok(())
+        })
+        .on_serve(|_args| {
+            // build the server, start the transport
+            Ok(())
+        })
+        .on_health(|_args| { println!("ok"); Ok(()) })
+        .command(
+            SubCommand::new("doctor", "Run diagnostic checks")
+                .flag("--verbose", "Show detailed output for each check"),
+            |args| { println!("checking… {args:?}"); Ok(()) },
+        )
+        .run()
+}
+```
+
+```text
+$ my-mcp --help
+my-mcp — An MCP server for doing cool stuff
+
+USAGE: my-mcp <COMMAND>
+
+COMMANDS:
+    install      Install this server into MCP client configs
+    uninstall    Remove this server from MCP client configs
+    serve        Start the MCP server
+    health       Run health checks
+    doctor       Run diagnostic checks
+```
+
+Six clients are known, on macOS and Linux:
+
+| Client | Config | Key |
+|---|---|---|
+| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` | `mcpServers` |
+| Claude Code | `~/.claude.json` | `mcpServers` |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | `mcpServers` |
+| VS Code | `~/Library/Application Support/Code/User/mcp.json` | `servers` |
+| Codex | `~/.codex/config.toml` | `mcp_servers` (TOML) |
+
+Claude Desktop and VS Code live under `~/.config/` on Linux. `install --client
+<name>` targets one; a client that could not be configured gets a pasteable
+snippet instead.
+
+Every write parses the config whole, changes one entry, and puts everything else
+back - including comments, in Codex's hand-written TOML. The previous contents
+are kept as `.bak`, the write itself goes through a rename, and both directions
+are idempotent.
+
+The client entries are only half of an install. The other half - a data
+directory, a config file, an API key to ask for - is `on_install`, which runs
+before the first config is touched and stops the install if it returns an error;
+nothing is written, so a failed setup leaves no client pointing at a server that
+is not ready. `on_uninstall` is the other end of it, and runs after the entries
+have been removed. A command line that is refused - an unknown flag, an unknown
+`--client` - reaches neither.
+
+The registry is public API in its own right, for servers that own their command
+line already:
+
+```rust
+use sml_mcps::cli::{ServerEntry, all_clients};
+
+let entry = ServerEntry::new("my-mcp", &["serve"]);
+
+for client in all_clients() {
+    println!("{}: {}", client.name(), client.check_existing(&entry));
+}
+```
+
+See `examples/cli.rs` - `cargo run --example cli --features cli -- --help`.
 
 ## Protocol Version
 

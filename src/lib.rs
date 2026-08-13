@@ -10,6 +10,8 @@
 //! - `auth` - JWT validation for hosted deployments
 //! - `hosted` - Enables both `http` and `auth`
 //! - `tls` - HTTPS for the HTTP transport, via rustls
+//! - `cli` - `install`/`uninstall`/`serve`/`health` subcommands, and the
+//!   registry of MCP clients they configure
 
 /// What a composed identity is joined with, and so what neither half of one may
 /// contain.
@@ -36,6 +38,11 @@ pub mod types;
 
 #[cfg(feature = "auth")]
 pub mod auth;
+
+/// The subcommands every MCP server ends up writing, and the MCP client
+/// registry behind `install`.
+#[cfg(feature = "cli")]
+pub mod cli;
 
 #[cfg(unix)]
 pub mod bridge;
