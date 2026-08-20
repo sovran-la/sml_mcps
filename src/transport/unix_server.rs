@@ -20,6 +20,7 @@
 //! Unix-only: gated behind `#[cfg(unix)]`, no feature flag.
 
 use crate::server::{Server, ServerConfig};
+use crate::socket::{ensure_private_parent_dir, owned_by_current_user};
 use crate::transport::UnixTransport;
 use crate::types::{McpError, Result};
 use std::io::{self, Write};
@@ -391,6 +392,11 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
             max_connections,
         } = self;
 
+        // The directory the socket goes in, private to this user, before
+        // anything is bound in it. A daemon driven through `UnixServer`
+        // directly gets the same treatment `Server::serve_daemon` arranges.
+        ensure_private_parent_dir(&socket_path)?;
+
         // Clear a stale socket (or refuse if a live server owns it).
         prepare_socket_path(&socket_path)?;
 
@@ -664,24 +670,39 @@ fn cleanup(socket_path: &Path, pid_path: Option<&Path>) {
     }
 }
 
-/// Clear the socket path before binding. If a live server is already
-/// listening, refuse (don't clobber it); if it's a stale socket file, remove it.
+/// Clear the socket path before binding.
+///
+/// Three answers: a path belonging to another account is refused outright, a
+/// live server's socket is refused rather than clobbered, and a stale socket
+/// file is removed.
 fn prepare_socket_path(path: &Path) -> Result<()> {
-    if path.exists() {
-        match UnixStream::connect(path) {
-            Ok(_) => {
-                return Err(McpError::Internal(format!(
-                    "socket {} is already in use by a live server",
-                    path.display()
-                )));
-            }
-            Err(_) => {
-                // Nothing listening - stale socket, safe to remove.
-                std::fs::remove_file(path)?;
-            }
+    // `symlink_metadata` rather than `exists`, which follows links and so says
+    // "nothing here" about a dangling symlink that `bind` will refuse.
+    if std::fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+
+    // Someone else's file where our socket goes. Removing it is not ours to do
+    // - and in a sticky directory it would fail anyway, with an error about
+    // permissions rather than about what is actually wrong.
+    if owned_by_current_user(path) == Some(false) {
+        return Err(McpError::Internal(format!(
+            "socket {} belongs to another user - refusing to serve on it",
+            path.display()
+        )));
+    }
+
+    match UnixStream::connect(path) {
+        Ok(_) => Err(McpError::Internal(format!(
+            "socket {} is already in use by a live server",
+            path.display()
+        ))),
+        Err(_) => {
+            // Nothing listening - stale socket, safe to remove.
+            std::fs::remove_file(path)?;
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// Write the current process PID to `path`.
@@ -1274,6 +1295,66 @@ mod tests {
         assert!(sock.exists());
 
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_prepare_socket_path_refuses_a_path_it_does_not_own() {
+        // The other half of the shim's refusal: neither side races the other to
+        // bind a path that belongs to a third account. `/` stands in for one -
+        // it is root's on every machine this runs on.
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+
+        let error = prepare_socket_path(Path::new("/"))
+            .expect_err("a path this user does not own must not be served on");
+
+        assert!(
+            error.to_string().contains("belongs to another user"),
+            "the reason has to name the actual problem, not whatever \
+             `remove_file` said about permissions: {error}"
+        );
+    }
+
+    #[test]
+    fn test_prepare_socket_path_has_nothing_to_do_with_a_free_path() {
+        let sock = temp_socket();
+        assert!(!sock.exists());
+
+        prepare_socket_path(&sock).unwrap();
+
+        assert!(!sock.exists(), "and nothing is created in passing");
+    }
+
+    #[test]
+    fn test_serving_creates_the_socket_directory_privately() {
+        // A socket is only as private as the directory holding it, and a
+        // `UnixServer` driven directly used to leave that entirely to the
+        // caller - including the case where the directory did not exist and the
+        // bind simply failed.
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "sml_mcps_unix_private_{}_{}",
+            std::process::id(),
+            CONN_COUNTER.load(Ordering::SeqCst)
+        ));
+        let sock = base.join("nested/server.sock");
+        let store = Arc::new(StdMutex::new(HashMap::new()));
+        let _server = spawn_server(&sock, Some(Duration::from_secs(10)), store);
+
+        let mut client = connect_retry(&sock);
+        initialize(&mut client, 1);
+
+        let mode = std::fs::metadata(sock.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+
+        drop(client);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---- integration tests ----------------------------------------------

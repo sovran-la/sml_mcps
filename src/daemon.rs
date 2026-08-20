@@ -14,6 +14,7 @@
 
 use crate::bridge::Bridge;
 use crate::server::Server;
+use crate::socket::ensure_private_parent_dir;
 use crate::transport::{StdioTransport, Transport, UnixServer};
 use crate::types::{McpError, Result};
 use std::path::Path;
@@ -75,7 +76,10 @@ impl<C: Send + Sync + 'static> Server<C> {
     ///     server.add_tool(IncrementTool)?;
     ///
     ///     server.serve_daemon(
-    ///         "/tmp/myapp/server.sock",
+    ///         // `~/.local/state/myapp/server.sock`, or the system's runtime
+    ///         // directory where there is one. Not `/tmp`: a socket there is
+    ///         // a path any account on the machine can bind first.
+    ///         user_socket_path("myapp", "server.sock"),
     ///         Duration::from_secs(300),
     ///         move |conn_id| AppContext {
     ///             conn_id: conn_id.to_string(),
@@ -135,7 +139,10 @@ impl<C: Send + Sync + 'static> Server<C> {
         I::Item: AsRef<str>,
         F: Fn(&str) -> C + Send + Sync + 'static,
     {
-        ensure_parent_dir(socket_path)?;
+        // Before the fork, so a directory that cannot be created is reported
+        // to whoever ran the command rather than to `/dev/null`. Private to
+        // this user, because a socket is as private as the directory it is in.
+        ensure_private_parent_dir(socket_path)?;
 
         match mode_from_args(args) {
             Mode::Shim => shim(socket_path, StdioTransport::new()),
@@ -191,30 +198,6 @@ where
         }
     }
     Mode::Shim
-}
-
-/// Create the directories `socket_path` will be bound inside.
-///
-/// A socket in `~/.myapp/run/` is the normal case and the directory is often
-/// this daemon's to make. Done before the fork, so a failure is reported to the
-/// shell rather than to `/dev/null`.
-fn ensure_parent_dir(socket_path: &Path) -> Result<()> {
-    // A bare filename has a parent of `""`, which is the current directory and
-    // is not ours to create. `create_dir_all` happens to no-op on that too, so
-    // this guard is saying what we mean rather than standing between anyone and
-    // a bug - which is still better than resting on a special case buried in
-    // the standard library.
-    let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Ok(());
-    };
-
-    std::fs::create_dir_all(parent).map_err(|e| {
-        McpError::Internal(format!(
-            "failed to create socket directory {}: {}",
-            parent.display(),
-            e
-        ))
-    })
 }
 
 /// Proxy `client` to the daemon on `socket_path`, starting one if none is up.
@@ -560,62 +543,10 @@ mod tests {
     }
 
     // ---- socket directory ------------------------------------------------
-
-    #[test]
-    fn test_missing_socket_directories_are_created() {
-        let base = temp_path("dir");
-        let socket = base.join("nested/deeper/server.sock");
-        assert!(!base.exists());
-
-        ensure_parent_dir(&socket).unwrap();
-
-        assert!(socket.parent().unwrap().is_dir());
-        assert!(!socket.exists(), "the socket itself is the listener's job");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn test_an_existing_socket_directory_is_left_alone() {
-        let base = temp_path("dir");
-        let socket = base.join("server.sock");
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join("keep-me"), b"x").unwrap();
-
-        // Idempotent: twice over an existing directory is still fine, and the
-        // directory's contents survive.
-        ensure_parent_dir(&socket).unwrap();
-        ensure_parent_dir(&socket).unwrap();
-
-        assert!(base.join("keep-me").exists());
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn test_a_socket_path_with_no_directory_is_not_an_error() {
-        // `parent()` of a bare filename is `""` - the current directory, which
-        // exists and is not ours to create.
-        ensure_parent_dir(Path::new("server.sock")).unwrap();
-        ensure_parent_dir(Path::new("/server.sock")).unwrap();
-    }
-
-    #[test]
-    fn test_an_unusable_socket_directory_is_reported() {
-        // A file sitting where the directory belongs. Failing here is the point:
-        // the alternative is a daemon that forks, detaches, and only then
-        // discovers it cannot bind - with its stderr already at /dev/null.
-        let blocker = temp_path("file");
-        std::fs::write(&blocker, b"not a directory").unwrap();
-
-        let err = ensure_parent_dir(&blocker.join("server.sock")).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("failed to create socket directory"),
-            "{err}"
-        );
-
-        let _ = std::fs::remove_file(&blocker);
-    }
-
+    //
+    // The helper itself, and the `0700` it creates directories with, are tested
+    // in `crate::socket`. What belongs here is that `serve_daemon` calls it -
+    // which the test below drives end to end.
     #[test]
     fn test_serve_daemon_creates_the_socket_directory_before_serving() {
         // The whole path, not just the helper: a socket two directories down
@@ -628,11 +559,60 @@ mod tests {
 
         assert!(socket.exists(), "the daemon should have bound its socket");
 
+        // And made the directory its own: a socket is only as private as what
+        // holds it, so a daemon that created a world-writable directory has
+        // published a path anyone can bind first.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(socket.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+
         let mut client = UnixTransport::connect(&socket).unwrap();
         initialize(&mut client, 1);
         assert_eq!(call_tool(&mut client, 2, "increment"), "1");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_a_socket_directory_that_cannot_be_made_is_reported_before_the_dispatch() {
+        // Which is what makes it reportable at all. `--daemon` double-forks
+        // first, and by the time the grandchild finds it cannot create the
+        // directory the original process has already printed a PID and exited
+        // zero - so the shell is told the daemon started. Doing it here, ahead
+        // of the mode dispatch, is what turns that into an error the caller's
+        // `main` returns.
+        //
+        // Driven through shim mode, the one dispatch that never reaches
+        // `UnixServer` and so cannot be covered by its copy of this step.
+        let blocker = temp_path("file");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let socket = blocker.join("server.sock");
+
+        let outcome = server_with_tools().serve_daemon_from(
+            ["prog"],
+            &socket,
+            Duration::from_secs(1),
+            move |conn_id| Ctx {
+                conn_id: conn_id.to_string(),
+                counter: Arc::new(AtomicI64::new(0)),
+            },
+        );
+
+        let Err(error) = outcome else {
+            panic!("a socket directory that cannot exist must not be dispatched on");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create socket directory"),
+            "{error}"
+        );
+
+        let _ = std::fs::remove_file(&blocker);
     }
 
     // ---- serving ---------------------------------------------------------

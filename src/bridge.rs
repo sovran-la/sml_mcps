@@ -8,7 +8,7 @@
 //! ```ignore
 //! fn main() -> sml_mcps::Result<()> {
 //!     let upstream = Bridge::auto_start(
-//!         "/tmp/myapp/server.sock",
+//!         sml_mcps::user_socket_path("myapp", "server.sock"),
 //!         "myapp-server",
 //!         &["--daemon"],
 //!     )?;
@@ -26,6 +26,7 @@
 //! Unix-only: gated behind `#[cfg(unix)]`.
 
 use crate::server::{error_id, is_malformed};
+use crate::socket::owned_by_current_user;
 use crate::transport::{Transport, UnixTransport, pid_path_for};
 use crate::types::{JsonRpcMessage, McpError, Result};
 use std::os::unix::net::UnixStream;
@@ -69,6 +70,14 @@ impl Bridge {
     /// A socket is never unlinked without first confirming nothing answers on
     /// it, so a daemon that comes up in the middle of this keeps its socket -
     /// and gets connected to - rather than being orphaned from its own path.
+    ///
+    /// A socket belonging to another account is never connected to, and never
+    /// removed either. Both are refusals rather than repairs: a path this user
+    /// does not own is one another account may be listening on, and every
+    /// message of the session - every argument, every result - would go through
+    /// them. Use [`user_socket_path`](crate::user_socket_path) and the question
+    /// does not come up; this is the answer for the paths that came from
+    /// somewhere else.
     ///
     /// `daemon_bin` must double-fork (e.g. via
     /// [`UnixServer::serve_daemon`](crate::UnixServer::serve_daemon)) so the
@@ -239,6 +248,21 @@ fn auto_start_inner(
     startup_grace: Duration,
     ready_timeout: Duration,
 ) -> Result<UnixTransport> {
+    // Before anything is connected to. A socket this user does not own is one
+    // another account may be listening on, and a shim that connects anyway has
+    // handed them the whole session. The daemon side refuses to bind such a
+    // path for the same reason, which is what makes "it is already there and it
+    // is not ours" a refusal rather than a race to bind first.
+    //
+    // Only conclusive when the path exists: `None` means "nothing there", which
+    // is the ordinary first start.
+    if owned_by_current_user(socket_path) == Some(false) {
+        return Err(McpError::Internal(format!(
+            "socket {} belongs to another user - refusing to connect",
+            socket_path.display()
+        )));
+    }
+
     // Fast path: a daemon is already accepting connections.
     if let Ok(t) = UnixTransport::connect(socket_path) {
         return Ok(t);
@@ -345,14 +369,27 @@ enum Probe {
 /// listener does. Repeating the probe separates the two, because a backlog
 /// drains and an abandoned socket does not.
 fn probe_socket(path: &Path, attempts: u32, gap: Duration) -> Probe {
-    let mut verdict = Probe::Unknown;
+    // Not ours to connect to, and not ours to unlink either - which is what
+    // `Unknown` means here.
+    if owned_by_current_user(path) == Some(false) {
+        return Probe::Unknown;
+    }
 
+    let mut verdict = Probe::Unknown;
     for attempt in 0..attempts {
         if attempt > 0 {
             thread::sleep(gap);
         }
         match UnixStream::connect(path) {
-            Ok(stream) => return Probe::Live(UnixTransport::from_stream(stream)),
+            // `try_from_stream` rather than `from_stream`: a process out of
+            // descriptors has told us nothing about whether this socket is
+            // live, and must not be answered with a panic.
+            Ok(stream) => {
+                return match UnixTransport::try_from_stream(stream) {
+                    Ok(transport) => Probe::Live(transport),
+                    Err(_) => Probe::Unknown,
+                };
+            }
             Err(e) if is_unreachable(&e) => verdict = Probe::Dead,
             // Something else is wrong. Say so and stop guessing - one
             // inconclusive answer outranks any number of confident ones.
@@ -400,9 +437,15 @@ fn clear_socket(socket_path: &Path, pid_path: Option<&Path>) -> Option<UnixTrans
 }
 
 /// Poll-connect to the socket until success or the timeout elapses.
+///
+/// A path that turns out to belong to another account ends the wait: whatever
+/// is behind it, it is not the daemon this shim started.
 fn wait_for_socket(path: &Path, timeout: Duration) -> Option<UnixTransport> {
     let deadline = Instant::now() + timeout;
     loop {
+        if owned_by_current_user(path) == Some(false) {
+            return None;
+        }
         if let Ok(t) = UnixTransport::connect(path) {
             return Some(t);
         }
@@ -860,6 +903,92 @@ mod tests {
 
         // And the daemon is still reachable by a plain connect.
         assert!(UnixTransport::connect(&sock).is_ok());
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_auto_start_refuses_a_socket_belonging_to_someone_else() {
+        // `/` is root's on every machine this runs on, which makes it a stand-in
+        // for the real thing: a socket another account created at the path this
+        // shim was told to use. Connecting to one hands them the session -
+        // every argument and every result - so it is refused before anything
+        // else is tried, and it is not unlinked either.
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+
+        let theirs = Path::new("/");
+        let outcome = auto_start_inner(
+            theirs,
+            "false",
+            &[],
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+        );
+
+        let Err(error) = outcome else {
+            panic!("a path this user does not own must not be connected to");
+        };
+        assert!(
+            error.to_string().contains("belongs to another user"),
+            "{error}"
+        );
+        assert!(theirs.exists(), "and it is not ours to remove");
+    }
+
+    #[test]
+    fn test_a_socket_we_do_not_own_is_neither_live_nor_dead() {
+        // `Dead` is a licence to unlink and `Live` is a licence to talk; a path
+        // belonging to another account is neither.
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+
+        assert!(matches!(
+            probe_socket(Path::new("/"), 1, Duration::from_millis(1)),
+            Probe::Unknown
+        ));
+        assert!(clear_socket(Path::new("/"), None).is_none());
+        assert!(Path::new("/").exists());
+    }
+
+    #[test]
+    fn test_waiting_for_a_socket_gives_up_on_one_that_is_not_ours() {
+        // The wait after spawning a daemon: whatever is behind a path this user
+        // does not own, it is not the daemon this shim just started, and the
+        // wait must not end by connecting to it.
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+
+        let waited = Instant::now();
+        assert!(wait_for_socket(Path::new("/"), Duration::from_secs(5)).is_none());
+        assert!(
+            waited.elapsed() < Duration::from_secs(1),
+            "and it gives up at once rather than polling something it will \
+             never accept"
+        );
+    }
+
+    #[test]
+    fn test_a_socket_this_user_owns_is_used_as_before() {
+        // The ownership check is a guard, not a new obstacle: an ordinary
+        // daemon on an ordinary path is still connected to.
+        let sock = temp_path("sock");
+        let _server = start_ping_daemon(&sock);
+
+        assert!(
+            auto_start_inner(
+                &sock,
+                "false",
+                &[],
+                Duration::from_millis(50),
+                Duration::from_millis(200)
+            )
+            .is_ok()
+        );
+        assert_eq!(owned_by_current_user(&sock), Some(true));
+
         let _ = std::fs::remove_file(&sock);
     }
 

@@ -95,7 +95,7 @@ For servers with expensive state (ML models, indexes, agent registries), you don
 **One binary, three modes** — `Server::serve_daemon` reads `argv` and dispatches:
 
 ```rust
-use sml_mcps::{Server, ServerConfig, Result};
+use sml_mcps::{Server, ServerConfig, Result, user_socket_path};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::time::Duration;
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
     let counter = Arc::new(AtomicI64::new(0));
 
     server.serve_daemon(
-        "/tmp/my-daemon/server.sock",
+        user_socket_path("my-daemon", "server.sock"),
         Duration::from_secs(300),      // exit after 5min idle
         move |conn_id| AppContext {
             conn_id: conn_id.to_string(),
@@ -129,12 +129,21 @@ missing, and every connection gets a fresh `Server` carrying the tools,
 resources, prompts and task runtime you registered. See
 `examples/serve_daemon.rs`.
 
+**Where the socket goes matters.** `user_socket_path("my-daemon",
+"server.sock")` resolves to `$XDG_RUNTIME_DIR/my-daemon/server.sock` where the
+system provides one and `~/.local/state/my-daemon/server.sock` where it does
+not, and the directory is created `0700`. A socket in `/tmp` is a path any
+account on the machine can create *first* - bind it, wait for the shim to
+connect, and read or answer every message of the session. Both sides refuse a
+path they do not own: the daemon will not bind one, and `Bridge::auto_start`
+will not connect to one.
+
 The two halves are public too, if you want the pieces rather than the pattern:
 
 **Daemon** (one long-lived process):
 
 ```rust
-use sml_mcps::{UnixServer, ServerConfig, Server, Tool, ToolEnv, CallToolResult, Result};
+use sml_mcps::{UnixServer, ServerConfig, Server, Tool, ToolEnv, CallToolResult, Result, user_socket_path};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -163,7 +172,7 @@ fn main() -> Result<()> {
             s.add_tool(PingTool)?;
             Ok(())
         })
-        .serve_daemon("/tmp/my-daemon.sock", |conn_id| {
+        .serve_daemon(user_socket_path("my-daemon", "server.sock"), |conn_id| {
             AppContext { conn_id: conn_id.to_string() }
         })
 }
@@ -172,11 +181,11 @@ fn main() -> Result<()> {
 **Shim** (one per client, near-zero overhead):
 
 ```rust
-use sml_mcps::{Bridge, Result};
+use sml_mcps::{Bridge, Result, user_socket_path};
 
 fn main() -> Result<()> {
     let upstream = Bridge::auto_start(
-        "/tmp/my-daemon.sock",
+        user_socket_path("my-daemon", "server.sock"),
         "my-daemon",
         &["--daemon"],
     )?;
@@ -184,7 +193,7 @@ fn main() -> Result<()> {
 }
 ```
 
-`auto_start` connects to a running daemon, or starts one if needed (handling stale sockets and PID files). The shim is a transparent proxy — MCP over stdio on one side, Unix socket on the other.
+`auto_start` connects to a running daemon, or starts one if needed (handling stale sockets and PID files, and refusing a socket this user does not own). The shim is a transparent proxy — MCP over stdio on one side, Unix socket on the other.
 
 See `examples/unix_server.rs` for a complete single-binary daemon + shim wired up
 by hand, and `examples/serve_daemon.rs` for the same thing in one call.

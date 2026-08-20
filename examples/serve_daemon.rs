@@ -26,7 +26,7 @@
 #[cfg(unix)]
 fn main() -> sml_mcps::Result<()> {
     use serde_json::Value;
-    use sml_mcps::{CallToolResult, Result, Server, ServerConfig, Tool, ToolEnv};
+    use sml_mcps::{CallToolResult, Result, Server, ServerConfig, Tool, ToolEnv, user_socket_path};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::time::Duration;
@@ -73,16 +73,20 @@ fn main() -> sml_mcps::Result<()> {
         }
     }
 
-    // Socket path: `--socket PATH` if given, else one in the temp dir. The
-    // daemon is relaunched with `--socket <path>`, so parsing it here is what
-    // makes a caller-chosen path survive into the daemon.
+    // Socket path: `--socket PATH` if given, else this user's own runtime
+    // directory. The daemon is relaunched with `--socket <path>`, so parsing it
+    // here is what makes a caller-chosen path survive into the daemon.
+    //
+    // `user_socket_path` rather than the temp directory: a socket in a shared
+    // directory is a path any account on the machine can bind first, and
+    // whoever binds it first is who the shim ends up talking to.
     let args: Vec<String> = std::env::args().collect();
     let socket_path = args
         .iter()
         .position(|a| a == "--socket")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("sml_mcps_serve_daemon_example.sock"));
+        .unwrap_or_else(|| user_socket_path("sml_mcps-serve-daemon-example", "server.sock"));
 
     let config = ServerConfig {
         name: "serve-daemon-example".to_string(),

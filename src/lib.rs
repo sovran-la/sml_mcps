@@ -52,6 +52,10 @@ pub mod bridge;
 #[cfg(unix)]
 mod daemon;
 
+/// Where a daemon's socket goes, and who is allowed to be behind it.
+#[cfg(unix)]
+mod socket;
+
 // Re-export commonly used types
 pub use pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
 pub use server::{
@@ -66,6 +70,9 @@ pub use transport::{HttpServer, HttpTransport};
 
 #[cfg(unix)]
 pub use bridge::Bridge;
+
+#[cfg(unix)]
+pub use socket::user_socket_path;
 
 #[cfg(unix)]
 pub use transport::{UnixServer, UnixTransport};

@@ -27,7 +27,7 @@ fn main() -> sml_mcps::Result<()> {
     use serde_json::Value;
     use sml_mcps::{
         Bridge, CallToolResult, Result, Server, ServerConfig, StdioTransport, Tool, ToolEnv,
-        UnixServer,
+        UnixServer, user_socket_path,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -90,14 +90,16 @@ fn main() -> sml_mcps::Result<()> {
         Ok(())
     }
 
-    // Socket path: use --socket PATH if provided, else temp dir.
+    // Socket path: use --socket PATH if provided, else this user's own runtime
+    // directory. Not the temp directory: a socket there is a path any account
+    // on the machine can bind first, and the shim would talk to whoever did.
     let args: Vec<String> = std::env::args().collect();
     let socket_path = args
         .iter()
         .position(|a| a == "--socket")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("sml_mcps_example.sock"));
+        .unwrap_or_else(|| user_socket_path("sml_mcps-unix-example", "server.sock"));
 
     let mode = args.get(1).map(|s| s.as_str());
     match mode {
