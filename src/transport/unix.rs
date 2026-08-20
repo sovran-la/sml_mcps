@@ -68,17 +68,22 @@ impl UnixTransport {
 
     /// Wrap an already-accepted stream (daemon/server side).
     ///
-    /// Panics only on file-descriptor exhaustion (`try_clone` failure), which
-    /// is a process-wide catastrophic condition rather than a per-connection
-    /// error. The infallible signature keeps the accept loop ergonomic.
+    /// Panics on file-descriptor exhaustion (`try_clone` failure). Use
+    /// [`try_from_stream`](Self::try_from_stream) anywhere the caller can carry
+    /// on without this connection - an accept loop that must keep listening, a
+    /// proxy that can report the failure - and keep this one for the top of a
+    /// program, where there is nothing to carry on to.
     pub fn from_stream(stream: UnixStream) -> Self {
         Self::try_from_stream(stream)
             .expect("UnixTransport::from_stream: failed to clone UnixStream (fd exhaustion?)")
     }
 
-    /// Fallible inner constructor shared by [`connect`](Self::connect) and
-    /// [`from_stream`](Self::from_stream).
-    fn try_from_stream(stream: UnixStream) -> Result<Self> {
+    /// [`from_stream`](Self::from_stream) with the failure handed back.
+    ///
+    /// The clone is a second descriptor for the same socket, so this fails
+    /// exactly when the process has run out of them - which is a condition a
+    /// server is expected to survive, not one it should die of.
+    pub fn try_from_stream(stream: UnixStream) -> Result<Self> {
         let writer = stream.try_clone()?;
         Ok(Self {
             reader: LineReader::new(TimedStream { stream }),
@@ -122,10 +127,15 @@ impl Transport for UnixTransport {
     fn try_clone_writer(&self) -> Option<Box<dyn Transport>> {
         // Clone the underlying fd so the bridge's other direction has an
         // independent write handle to the same socket connection.
-        self.writer
-            .try_clone()
-            .ok()
-            .map(|s| Box::new(UnixTransport::from_stream(s)) as Box<dyn Transport>)
+        //
+        // Both clones are fallible and both are answered with `None`: the
+        // second used to go through `from_stream`, which panics, so a process
+        // that ran out of descriptors between the two - the exact condition
+        // this method exists to report - took the caller down instead.
+        let stream = self.writer.try_clone().ok()?;
+        let transport = UnixTransport::try_from_stream(stream).ok()?;
+
+        Some(Box::new(transport))
     }
 
     /// Supported: the deadline rides on the socket's own `SO_RCVTIMEO`.
@@ -375,5 +385,74 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let result = UnixTransport::connect(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_from_stream_hands_the_failure_back() {
+        // The fallible constructor is what `try_clone_writer` goes through, so
+        // that a process out of descriptors gets a `None` rather than the panic
+        // `from_stream` is entitled to. Here the clone succeeds; what matters
+        // is that the result is one the caller can look at.
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = UnixTransport::try_from_stream(a).expect("a pair can be cloned");
+        let mut server = UnixTransport::try_from_stream(b).unwrap();
+
+        let msg = JsonRpcMessage::request(1i64, "ping", None);
+        client.write(&msg).unwrap();
+        assert_eq!(server.read().unwrap(), msg);
+    }
+
+    #[test]
+    fn test_try_clone_writer_writes_to_the_same_socket() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let client = UnixTransport::from_stream(a);
+        let mut server = UnixTransport::from_stream(b);
+
+        let mut cloned = client.try_clone_writer().expect("a unix socket can split");
+        let msg = JsonRpcMessage::request(4i64, "ping", None);
+        cloned.write(&msg).unwrap();
+
+        assert_eq!(server.read().unwrap(), msg);
+    }
+
+    #[test]
+    fn test_the_original_still_writes_after_its_writer_is_cloned() {
+        // Independent handles, not a handover: the bridge writes through the
+        // clone on one thread while the original is still in use on another.
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = UnixTransport::from_stream(a);
+        let mut server = UnixTransport::from_stream(b);
+
+        let mut cloned = client.try_clone_writer().unwrap();
+        let first = JsonRpcMessage::request(1i64, "ping", None);
+        let second = JsonRpcMessage::request(2i64, "ping", None);
+
+        cloned.write(&first).unwrap();
+        client.write(&second).unwrap();
+
+        assert_eq!(server.read().unwrap(), first);
+        assert_eq!(
+            server.read().unwrap(),
+            second,
+            "two handles on one socket must not lose or interleave a message"
+        );
+    }
+
+    #[test]
+    fn test_a_cloned_writer_can_be_cloned_again() {
+        // The bridge holds the clone as a `Box<dyn Transport>` and asks it for
+        // another; a clone that could not be split would end the chain.
+        let (a, b) = UnixStream::pair().unwrap();
+        let client = UnixTransport::from_stream(a);
+        let mut server = UnixTransport::from_stream(b);
+
+        let cloned = client.try_clone_writer().unwrap();
+        let mut again = cloned
+            .try_clone_writer()
+            .expect("a clone is still a socket");
+
+        let msg = JsonRpcMessage::request(7i64, "ping", None);
+        again.write(&msg).unwrap();
+        assert_eq!(server.read().unwrap(), msg);
     }
 }

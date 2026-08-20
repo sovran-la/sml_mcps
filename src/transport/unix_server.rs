@@ -4,7 +4,8 @@
 //! Binds a [`UnixListener`], accepts connections, and spawns one
 //! `std::thread` per connection - connection counts are single digits (a
 //! handful of client sessions sharing one daemon), so thread-per-connection
-//! is the right amount of machinery.
+//! is the right amount of machinery. There is still a ceiling on how many of
+//! them a peer can ask for: see [`UnixServer::max_connections`].
 //!
 //! Three ways to run:
 //! - [`UnixServer::serve`] - foreground, blocks (debugging/development).
@@ -31,6 +32,23 @@ use std::time::Duration;
 
 /// Setup function type for configuring tools on each connection.
 type SetupFn<C> = Box<dyn Fn(&mut Server<C>) -> Result<()> + Send + Sync>;
+
+/// Live connections allowed at once, by default.
+///
+/// Each one costs a thread and two descriptors, so this is the ceiling on what
+/// a client that reconnects in a loop can make this process hold. Well above
+/// the handful of sessions a daemon really sees, and well below the descriptor
+/// limit a shell hands out - the point is that the number is ours and not the
+/// peer's. Lower than the HTTP server's because a local daemon serves the
+/// people logged into one machine, not the internet.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+
+/// How long to wait after an `accept` that failed, or a thread the OS would
+/// not give us, before trying again.
+///
+/// Long enough that a descriptor shortage cannot become a hot loop, short
+/// enough that a daemon recovers the moment there is room again.
+const ACCEPT_RETRY: Duration = Duration::from_millis(10);
 
 // ---- signal handling -----------------------------------------------------
 
@@ -109,8 +127,29 @@ fn install_signal_handlers(
                 // Unblock accept() via self-connect (same trick as idle_watcher).
                 let _ = UnixStream::connect(&socket_clone);
             }
-        })
-        .map_err(|e| McpError::Internal(format!("failed to spawn signal watcher: {}", e)))?;
+        });
+
+    let watcher = match watcher {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            // Nobody will ever read this pipe now, and the handler is holding
+            // a descriptor pointing into it: without this, both ends leak for
+            // the life of the process and every later signal writes into a
+            // pipe with no reader. Undo the installation in reverse.
+            restore_signal_handlers(prev_term, prev_int, sig_write);
+            // SAFETY: the watcher never started, so nothing else owns the read
+            // end - it is closed here rather than by the thread that would
+            // have been blocked on it.
+            unsafe {
+                libc::close(sig_read);
+            }
+
+            return Err(McpError::Internal(format!(
+                "failed to spawn signal watcher: {}",
+                e
+            )));
+        }
+    };
 
     Ok(SignalGuard {
         write_fd: sig_write,
@@ -118,6 +157,32 @@ fn install_signal_handlers(
         prev_int,
         watcher: Some(watcher),
     })
+}
+
+/// Put the previous signal handlers back, unpublish the pipe, and close the
+/// write end of it.
+///
+/// Shared by [`SignalGuard::drop`] and the spawn-failure path above, because an
+/// installation that never got its watcher has to give back exactly what a
+/// finished one does - and the version that ran when the watcher failed to
+/// start gave back nothing at all.
+///
+/// The order is deliberate: the handlers go back first, so that clearing the
+/// descriptor underneath the handler cannot race a signal arriving.
+fn restore_signal_handlers(
+    prev_term: libc::sighandler_t,
+    prev_int: libc::sighandler_t,
+    write_fd: i32,
+) {
+    unsafe {
+        libc::signal(libc::SIGTERM, prev_term);
+        libc::signal(libc::SIGINT, prev_int);
+    }
+
+    SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
+    unsafe {
+        libc::close(write_fd);
+    }
 }
 
 /// RAII guard that restores signal handlers and cleans up the pipe on drop.
@@ -130,18 +195,9 @@ struct SignalGuard {
 
 impl Drop for SignalGuard {
     fn drop(&mut self) {
-        // Restore previous signal handlers.
-        unsafe {
-            libc::signal(libc::SIGTERM, self.prev_term);
-            libc::signal(libc::SIGINT, self.prev_int);
-        }
-
-        // Close the write end — if the watcher is still blocked on read(),
-        // it'll get EOF and exit cleanly.
-        SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
-        unsafe {
-            libc::close(self.write_fd);
-        }
+        // Closing the write end is also how the watcher is told to stop: if it
+        // is still blocked on `read`, it gets EOF and exits cleanly.
+        restore_signal_handlers(self.prev_term, self.prev_int, self.write_fd);
 
         if let Some(w) = self.watcher.take() {
             let _ = w.join();
@@ -163,6 +219,44 @@ struct ConnState {
     generation: u64,
     /// Set when the server should stop accepting and exit.
     shutdown: bool,
+}
+
+/// What became of a connection that has just been accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// It has a slot, and `active` counts it.
+    Admitted,
+    /// The daemon already holds [`UnixServer::max_connections`] of them.
+    Full,
+    /// The daemon is on its way out and is not serving anything more.
+    ShuttingDown,
+}
+
+impl ConnState {
+    /// Take a slot for a newly accepted connection, or say why not.
+    ///
+    /// The ceiling is what stands between this daemon and a client that
+    /// reconnects in a loop: every live connection is a thread and two
+    /// descriptors, and a process that runs out of either is not the process
+    /// that opened them. Without it the loop walked itself to `EMFILE`, where
+    /// `accept` fails and the daemon used to exit.
+    fn admit(&mut self, max: usize) -> Admission {
+        if self.shutdown {
+            return Admission::ShuttingDown;
+        }
+        if self.active >= max {
+            return Admission::Full;
+        }
+
+        self.active += 1;
+        // Only for a connection that is being served. The generation is what
+        // tells the idle watcher a client arrived, and a refused one did not:
+        // counting it would let a reconnect loop hold an unused daemon open
+        // forever.
+        self.generation += 1;
+
+        Admission::Admitted
+    }
 }
 
 /// Decrements the active-connection count when a connection thread exits,
@@ -191,7 +285,7 @@ impl Drop for ActiveGuard {
 ///         s.add_tool(EchoTool)?;
 ///         Ok(())
 ///     })
-///     .serve_daemon("/tmp/myapp/server.sock", |conn_id| {
+///     .serve_daemon(user_socket_path("myapp", "server.sock"), |conn_id| {
 ///         AppContext::new(conn_id)
 ///     })?;
 /// ```
@@ -199,6 +293,7 @@ pub struct UnixServer<C> {
     config: ServerConfig,
     setup: Option<SetupFn<C>>,
     idle_timeout: Option<Duration>,
+    max_connections: usize,
 }
 
 impl<C: Send + Sync + 'static> UnixServer<C> {
@@ -208,6 +303,7 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
             config,
             setup: None,
             idle_timeout: None,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -229,6 +325,21 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
     /// multi-GB state.
     pub fn idle_timeout(mut self, duration: Duration) -> Self {
         self.idle_timeout = Some(duration);
+        self
+    }
+
+    /// How many connections may be live at once.
+    ///
+    /// Default: [`DEFAULT_MAX_CONNECTIONS`]. A connection over the ceiling is
+    /// closed as soon as it is accepted, which a client sees as an immediate
+    /// end-of-file and can retry; the daemon says nothing on the socket,
+    /// because the accept loop is the one thread that must never wait on a
+    /// peer's reading pace.
+    ///
+    /// Zero is raised to one - a daemon that serves nobody is not a
+    /// configuration anyone means.
+    pub fn max_connections(mut self, connections: usize) -> Self {
+        self.max_connections = connections.max(1);
         self
     }
 
@@ -277,6 +388,7 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
             config,
             setup,
             idle_timeout,
+            max_connections,
         } = self;
 
         // Clear a stale socket (or refuse if a live server owns it).
@@ -320,7 +432,14 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
             thread::spawn(move || idle_watcher(shared, timeout, socket_path))
         });
 
-        let result = accept_loop(&listener, &shared, &config, &setup, &factory);
+        let result = accept_loop(
+            &listener,
+            &shared,
+            max_connections,
+            &config,
+            &setup,
+            &factory,
+        );
 
         // Make sure the watcher stops even if we exited for a non-idle reason.
         {
@@ -339,11 +458,12 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
     }
 }
 
-/// Main accept loop. Returns `Ok(())` on a clean shutdown break, `Err` on an
-/// accept-level failure.
+/// Main accept loop. Returns `Ok(())` on a clean shutdown break, `Err` only
+/// where the daemon's own bookkeeping has gone wrong.
 fn accept_loop<C, F>(
     listener: &UnixListener,
     shared: &Arc<(Mutex<ConnState>, Condvar)>,
+    max_connections: usize,
     config: &ServerConfig,
     setup: &Option<Arc<SetupFn<C>>>,
     factory: &Arc<F>,
@@ -355,22 +475,32 @@ where
     loop {
         let (stream, _addr) = match listener.accept() {
             Ok(pair) => pair,
-            Err(e) => return Err(McpError::Internal(format!("accept failed: {}", e))),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // Out of descriptors, or a client that hung up between connecting
+            // and being accepted. Neither is a reason to stop listening, and
+            // neither is a reason to spin: a hot loop on `EMFILE` is its own
+            // outage. This used to end the daemon on the first one, which is
+            // exactly what a reconnect loop had to do to take it down.
+            Err(_) => {
+                thread::sleep(ACCEPT_RETRY);
+                if shutdown_requested(shared) {
+                    break;
+                }
+                continue;
+            }
         };
 
-        // Register the connection. If a shutdown was requested (the idle
-        // watcher self-connected to wake us), stop here and drop this stream.
-        {
-            let (lock, cv) = &**shared;
-            let mut state = lock
-                .lock()
-                .map_err(|_| McpError::Internal("conn state lock poisoned".into()))?;
-            if state.shutdown {
-                break;
+        match admit(shared, max_connections)? {
+            Admission::Admitted => {}
+            // Refused by closing: the client sees end-of-file at once and can
+            // come back. Saying more would mean writing to a peer from the one
+            // thread that must never wait on one.
+            Admission::Full => {
+                drop(stream);
+                continue;
             }
-            state.active += 1;
-            state.generation += 1;
-            cv.notify_all();
+            // The idle watcher or a signal self-connected to wake us.
+            Admission::ShuttingDown => break,
         }
 
         let conn_id = format!("conn-{}", CONN_COUNTER.fetch_add(1, Ordering::SeqCst));
@@ -385,15 +515,47 @@ where
 
         if let Err(e) = spawn {
             eprintln!("failed to spawn connection thread: {}", e);
-            // We incremented `active` above but no ActiveGuard will run - undo it.
-            let (lock, cv) = &**shared;
-            if let Ok(mut state) = lock.lock() {
-                state.active = state.active.saturating_sub(1);
-                cv.notify_all();
-            }
+            // We took a slot above but no ActiveGuard will run - give it back.
+            release(shared);
+            // A thread the OS will not give us is the platform saying it is
+            // full, and asking again immediately is how that becomes a spin.
+            thread::sleep(ACCEPT_RETRY);
         }
     }
     Ok(())
+}
+
+/// Take a slot for an accepted connection, under the lock.
+fn admit(shared: &Arc<(Mutex<ConnState>, Condvar)>, max: usize) -> Result<Admission> {
+    let (lock, cv) = &**shared;
+    let mut state = lock
+        .lock()
+        .map_err(|_| McpError::Internal("conn state lock poisoned".into()))?;
+
+    let admission = state.admit(max);
+    if admission == Admission::Admitted {
+        cv.notify_all();
+    }
+
+    Ok(admission)
+}
+
+/// Give a slot back, for the one exit that has no [`ActiveGuard`] to do it.
+fn release(shared: &Arc<(Mutex<ConnState>, Condvar)>) {
+    let (lock, cv) = &**shared;
+    if let Ok(mut state) = lock.lock() {
+        state.active = state.active.saturating_sub(1);
+        cv.notify_all();
+    }
+}
+
+/// Whether a shutdown has been asked for.
+///
+/// A poisoned lock answers "yes": something panicked while holding the state,
+/// and a loop that cannot read it any more is a loop with no way out.
+fn shutdown_requested(shared: &Arc<(Mutex<ConnState>, Condvar)>) -> bool {
+    let (lock, _) = &**shared;
+    lock.lock().map(|state| state.shutdown).unwrap_or(true)
 }
 
 /// Per-connection worker: build a fresh server + context, then run the
@@ -422,7 +584,18 @@ fn handle_connection<C, F>(
         }
     }
 
-    let transport = UnixTransport::from_stream(stream);
+    // Fallibly, because the descriptor this needs a second of is the one the
+    // process has run out of when it fails - and a daemon that panics one
+    // connection thread at a time under that pressure is a daemon printing
+    // backtraces where it could be declining politely.
+    let transport = match UnixTransport::try_from_stream(stream) {
+        Ok(transport) => transport,
+        Err(e) => {
+            eprintln!("[{}] connection dropped: {}", conn_id, e);
+            return;
+        }
+    };
+
     if let Err(e) = server.start(transport, context) {
         eprintln!("[{}] connection closed: {}", conn_id, e);
     }
@@ -720,6 +893,60 @@ mod tests {
         })
     }
 
+    /// Spawn a server on `path` that will hold at most `max` connections.
+    fn spawn_bounded_server(
+        path: &Path,
+        max: usize,
+        store: Arc<StdMutex<HashMap<String, i64>>>,
+    ) -> thread::JoinHandle<Result<()>> {
+        let path = path.to_path_buf();
+        thread::spawn(move || {
+            UnixServer::new(test_config())
+                .max_connections(max)
+                .idle_timeout(Duration::from_secs(10))
+                .with_tools(|s: &mut Server<TestContext>| {
+                    s.add_tool(WhoamiTool)?;
+                    Ok(())
+                })
+                .serve(&path, move |conn_id| TestContext {
+                    conn_id: conn_id.to_string(),
+                    store: store.clone(),
+                })
+        })
+    }
+
+    /// Connect and handshake, retrying while the server is still full.
+    ///
+    /// A refused connection is accepted and closed, so the refusal shows up on
+    /// the first read rather than on connect.
+    fn connect_admitted(path: &Path) -> UnixTransport {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut client = connect_retry(path);
+            let request = JsonRpcMessage::request(
+                1,
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "1.0" }
+                })),
+            );
+            if client.write(&request).is_ok()
+                && matches!(client.read(), Ok(JsonRpcMessage::Response(_)))
+            {
+                return client;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "a slot never came back on {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Connect a client transport, retrying until the server is listening.
     fn connect_retry(path: &Path) -> UnixTransport {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -783,6 +1010,230 @@ mod tests {
             pid_path_for(Path::new("/x/server")),
             PathBuf::from("/x/server.pid")
         );
+    }
+
+    //
+    // The connection ceiling
+    //
+
+    #[test]
+    fn test_a_free_slot_is_taken_and_counted() {
+        let mut state = ConnState::default();
+
+        assert_eq!(state.admit(2), Admission::Admitted);
+
+        assert_eq!(state.active, 1);
+        assert_eq!(
+            state.generation, 1,
+            "a served connection is activity the idle watcher must see"
+        );
+    }
+
+    #[test]
+    fn test_a_connection_over_the_ceiling_is_refused() {
+        let mut state = ConnState::default();
+        assert_eq!(state.admit(2), Admission::Admitted);
+        assert_eq!(state.admit(2), Admission::Admitted);
+
+        assert_eq!(state.admit(2), Admission::Full, "and no more than two");
+        assert_eq!(state.active, 2, "a refusal costs no slot");
+        assert_eq!(
+            state.generation, 2,
+            "nor does it count as a client arriving: a reconnect loop must not \
+             hold an unused daemon open"
+        );
+    }
+
+    #[test]
+    fn test_a_released_slot_can_be_taken_again() {
+        let mut state = ConnState::default();
+        state.admit(1);
+        assert_eq!(state.admit(1), Admission::Full);
+
+        // What `ActiveGuard::drop` does when a connection thread ends.
+        state.active -= 1;
+
+        assert_eq!(state.admit(1), Admission::Admitted);
+    }
+
+    #[test]
+    fn test_a_shutdown_outranks_a_free_slot() {
+        // The idle watcher and the signal watcher both wake the accept loop by
+        // connecting to it. That connection must end the loop, not be served -
+        // however much room there is.
+        let mut state = ConnState {
+            shutdown: true,
+            ..Default::default()
+        };
+
+        assert_eq!(state.admit(64), Admission::ShuttingDown);
+        assert_eq!(state.active, 0);
+    }
+
+    #[test]
+    fn test_a_ceiling_of_zero_admits_nobody() {
+        // Unreachable through the builder, which raises zero to one. Here so
+        // that the arithmetic says what it means on its own.
+        assert_eq!(ConnState::default().admit(0), Admission::Full);
+    }
+
+    #[test]
+    fn test_the_builder_will_not_take_a_ceiling_of_zero() {
+        let server: UnixServer<()> = UnixServer::new(test_config()).max_connections(0);
+        assert_eq!(server.max_connections, 1);
+
+        let server: UnixServer<()> = UnixServer::new(test_config()).max_connections(9);
+        assert_eq!(server.max_connections, 9);
+    }
+
+    #[test]
+    fn test_a_server_has_a_ceiling_without_being_asked_for_one() {
+        // The whole finding: an unbounded daemon is one a reconnect loop walks
+        // to `EMFILE`, and `accept` failing there used to end the process.
+        let server: UnixServer<()> = UnixServer::new(test_config());
+        assert_eq!(server.max_connections, DEFAULT_MAX_CONNECTIONS);
+        const { assert!(DEFAULT_MAX_CONNECTIONS >= 1) };
+    }
+
+    #[test]
+    fn test_admit_notifies_the_idle_watcher_only_when_it_admits() {
+        let shared: Arc<(Mutex<ConnState>, Condvar)> =
+            Arc::new((Mutex::new(ConnState::default()), Condvar::new()));
+
+        assert_eq!(admit(&shared, 1).unwrap(), Admission::Admitted);
+        assert_eq!(admit(&shared, 1).unwrap(), Admission::Full);
+        assert_eq!(shared.0.lock().unwrap().active, 1);
+
+        release(&shared);
+        assert_eq!(shared.0.lock().unwrap().active, 0);
+        assert_eq!(
+            admit(&shared, 1).unwrap(),
+            Admission::Admitted,
+            "the slot a failed spawn gave back is usable"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_requested_reads_the_shared_flag() {
+        let shared: Arc<(Mutex<ConnState>, Condvar)> =
+            Arc::new((Mutex::new(ConnState::default()), Condvar::new()));
+        assert!(!shutdown_requested(&shared));
+
+        shared.0.lock().unwrap().shutdown = true;
+        assert!(
+            shutdown_requested(&shared),
+            "an accept loop retrying a failing listener has to notice this"
+        );
+    }
+
+    #[test]
+    fn test_an_accept_that_fails_does_not_end_the_daemon() {
+        // A non-blocking listener fails every `accept` with `WouldBlock`, which
+        // is the shape of the `EMFILE` a reconnect loop used to walk a daemon
+        // into. The loop has to keep listening through it - and still notice a
+        // shutdown, rather than being wedged in the retry.
+        let sock = temp_socket();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let shared: Arc<(Mutex<ConnState>, Condvar)> =
+            Arc::new((Mutex::new(ConnState::default()), Condvar::new()));
+        let config = test_config();
+        let store = Arc::new(StdMutex::new(HashMap::new()));
+        let factory = Arc::new(move |conn_id: &str| TestContext {
+            conn_id: conn_id.to_string(),
+            store: store.clone(),
+        });
+
+        let loop_shared = shared.clone();
+        let looping = thread::spawn(move || {
+            accept_loop(
+                &listener,
+                &loop_shared,
+                1,
+                &config,
+                &None::<Arc<SetupFn<TestContext>>>,
+                &factory,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !looping.is_finished(),
+            "an accept that failed must not end the daemon"
+        );
+
+        {
+            let (lock, cv) = &*shared;
+            lock.lock().unwrap().shutdown = true;
+            cv.notify_all();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !looping.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            looping.is_finished(),
+            "a shutdown must reach a loop that is retrying a failing listener"
+        );
+        assert!(looping.join().unwrap().is_ok());
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    //
+    // Signal handling
+    //
+
+    #[test]
+    fn test_restoring_the_handlers_closes_the_pipe_it_published() {
+        // What the spawn-failure path leans on. Without it, a daemon whose
+        // watcher thread never started leaked both ends of the pipe and left
+        // the signal handler holding a descriptor nobody would ever read.
+        let (read_fd, write_fd) = create_signal_pipe().unwrap();
+        let published = SIGNAL_WRITE_FD.swap(write_fd, Ordering::SeqCst);
+
+        // `SIG_DFL` both ways: nothing in this suite installs a handler that
+        // outlives its own server, and nothing here sends a signal.
+        restore_signal_handlers(libc::SIG_DFL, libc::SIG_DFL, write_fd);
+
+        assert_eq!(
+            SIGNAL_WRITE_FD.load(Ordering::SeqCst),
+            -1,
+            "the handler must not be left pointing at a closed pipe"
+        );
+        assert!(is_closed(write_fd), "the write end must not be left open");
+        assert!(
+            !is_closed(read_fd),
+            "the read end belongs to whoever is blocked on it, or to the \
+             spawn-failure path"
+        );
+
+        // Which is what that path then does with it.
+        unsafe { libc::close(read_fd) };
+        assert!(is_closed(read_fd));
+
+        SIGNAL_WRITE_FD.store(published, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_a_signal_pipe_has_two_usable_ends() {
+        let (read_fd, write_fd) = create_signal_pipe().unwrap();
+
+        assert!(!is_closed(read_fd));
+        assert!(!is_closed(write_fd));
+        assert_ne!(read_fd, write_fd);
+
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+    }
+
+    /// Whether `fd` is closed, asked the only way a process can ask.
+    fn is_closed(fd: i32) -> bool {
+        unsafe { libc::fcntl(fd, libc::F_GETFD) == -1 }
     }
 
     #[test]
@@ -917,6 +1368,83 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
+    #[test]
+    fn test_a_full_server_refuses_rather_than_absorbing() {
+        // A daemon that accepts everything is a daemon a reconnect loop turns
+        // into a thread-and-descriptor pile until `accept` fails - which is
+        // where the process used to exit.
+        let sock = temp_socket();
+        let store = Arc::new(StdMutex::new(HashMap::new()));
+        let _server = spawn_bounded_server(&sock, 1, store);
+
+        let mut held = connect_admitted(&sock);
+
+        let mut refused = connect_retry(&sock);
+        let request = JsonRpcMessage::request(1, "tools/list", None);
+        let _ = refused.write(&request);
+        assert!(
+            matches!(refused.read(), Err(McpError::TransportClosed)),
+            "the connection over the ceiling must be closed, not queued"
+        );
+
+        // And the one holding the slot is untouched by the refusal.
+        assert!(
+            call_tool(&mut held, 2, "whoami", serde_json::json!({})).starts_with("conn-"),
+            "refusing a peer must not disturb the one being served"
+        );
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_the_slot_comes_back_when_a_connection_ends() {
+        let sock = temp_socket();
+        let store = Arc::new(StdMutex::new(HashMap::new()));
+        let _server = spawn_bounded_server(&sock, 1, store);
+
+        let first = connect_admitted(&sock);
+        let first_id = {
+            let mut first = first;
+            let id = call_tool(&mut first, 2, "whoami", serde_json::json!({}));
+            drop(first);
+            id
+        };
+
+        // A new client gets in once the old connection's thread has ended -
+        // which is `ActiveGuard` giving the slot back.
+        let mut second = connect_admitted(&sock);
+        let second_id = call_tool(&mut second, 2, "whoami", serde_json::json!({}));
+
+        assert_ne!(first_id, second_id, "a new connection, not the old one");
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_a_refusal_is_not_a_client_arriving() {
+        // While the ceiling is met, every further connection is refused - and a
+        // refusal must not touch the generation counter, which is what cancels
+        // the idle countdown. Otherwise a reconnect loop could hold a daemon
+        // nobody is using open indefinitely.
+        let sock = temp_socket();
+        let store = Arc::new(StdMutex::new(HashMap::new()));
+        let _server = spawn_bounded_server(&sock, 1, store);
+
+        let mut held = connect_admitted(&sock);
+
+        for _ in 0..5 {
+            let mut knock = connect_retry(&sock);
+            let _ = knock.write(&JsonRpcMessage::request(1, "tools/list", None));
+            assert!(
+                matches!(knock.read(), Err(McpError::TransportClosed)),
+                "every connection past the ceiling is refused, not just the first"
+            );
+        }
+
+        assert!(call_tool(&mut held, 2, "whoami", serde_json::json!({})).starts_with("conn-"));
+
+        let _ = std::fs::remove_file(&sock);
+    }
     #[test]
     fn test_idle_timeout_exits() {
         let sock = temp_socket();

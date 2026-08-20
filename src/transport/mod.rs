@@ -29,7 +29,7 @@ pub use http::{HttpServer, HttpTransport};
 pub use unix::UnixTransport;
 
 #[cfg(unix)]
-pub use unix_server::UnixServer;
+pub use unix_server::{DEFAULT_MAX_CONNECTIONS, UnixServer};
 
 // Shared with the bridge for stale-daemon detection (same PID-file convention).
 #[cfg(unix)]
