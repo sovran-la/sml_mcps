@@ -441,6 +441,21 @@ back - including comments, in Codex's hand-written TOML. The previous contents
 are kept as `.bak`, the write itself goes through a rename, and both directions
 are idempotent.
 
+A server whose tools should not stop for an approval prompt says so on its
+entry:
+
+```rust
+use sml_mcps::cli::ServerEntry;
+
+let entry = ServerEntry::new("my-mcp", &["serve"]).with_auto_approve();
+```
+
+Off by default - whether a tool call needs approving is the user's decision. It
+is a request rather than a guarantee: Codex is the only one of the six with a
+config-time mechanism for it, and gets `default_tools_approval_mode = "auto"` on
+its entry. The rest are written exactly as they always were. An approval mode
+already in the file that this crate was not asked to write is left alone.
+
 The client entries are only half of an install. The other half - a data
 directory, a config file, an API key to ask for - is `on_install`, which runs
 before the first config is touched and stops the install if it returns an error;

@@ -183,9 +183,10 @@ fn install_configures_the_clients_that_are_there_and_says_so() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let report = stdout(&output);
     assert!(
-        report.contains("Detected 3 client(s), configured 3."),
+        report.contains("Detected 3 client(s), changed 3."),
         "{report}"
     );
+    assert!(report.contains("Cursor: configured ("), "{report}");
     assert!(report.contains("Claude Desktop: not installed"), "{report}");
     assert!(report.contains("Restart your MCP client"), "{report}");
 
@@ -273,7 +274,12 @@ fn a_second_install_changes_nothing() {
 
     assert_eq!(code(&output), 0);
     assert!(
-        stdout(&output).contains("already configured"),
+        stdout(&output).contains("Cursor: up to date ("),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("Detected 3 client(s), all up to date."),
         "{}",
         stdout(&output)
     );

@@ -33,7 +33,7 @@
 //! ```no_run
 //! use sml_mcps::cli::{ServerEntry, all_clients};
 //!
-//! let entry = ServerEntry { name: "my-mcp", args: &["serve"], env: vec![] };
+//! let entry = ServerEntry::new("my-mcp", &["serve"]);
 //!
 //! for client in all_clients() {
 //!     if client.detect() {
@@ -52,6 +52,7 @@ pub use codex_client::CodexClient;
 pub use json_client::JsonClient;
 
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -62,14 +63,14 @@ use std::path::{Path, PathBuf};
 
 /// What a server calls itself in an MCP client's configuration.
 ///
-/// The three things that differ between servers. Everything else about an
-/// entry, the binary path above all, is the same computation everywhere and is
-/// done by the methods below.
+/// The few things that differ between servers. Everything else about an entry,
+/// the binary path above all, is the same computation everywhere and is done by
+/// the methods below.
 ///
 /// ```
 /// use sml_mcps::cli::ServerEntry;
 ///
-/// let entry = ServerEntry { name: "my-mcp", args: &["serve"], env: vec![] };
+/// let entry = ServerEntry::new("my-mcp", &["serve"]);
 /// assert_eq!(entry.name, "my-mcp");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +94,19 @@ pub struct ServerEntry {
     /// a data directory, an API endpoint. Owned rather than `'static` because
     /// these are usually computed at install time.
     pub env: Vec<(String, String)>,
+
+    /// Whether clients should run this server's tools without asking first.
+    ///
+    /// Off unless a server says otherwise: whether a tool call needs approving
+    /// is the user's decision, and an installer that quietly turned the prompt
+    /// off would be making it for them. Worth turning on for a server whose
+    /// tools are read-only, or one a client would otherwise interrupt on every
+    /// call.
+    ///
+    /// Only clients with a config-time mechanism for it act on this, which
+    /// today means [`CodexClient`] alone - see [`JsonClient`] for why the JSON
+    /// clients cannot.
+    pub auto_approve: bool,
 }
 
 impl ServerEntry {
@@ -102,12 +116,36 @@ impl ServerEntry {
             name,
             args,
             env: Vec::new(),
+            auto_approve: false,
         }
     }
 
     /// Pin one environment variable in the entry.
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Ask the clients that support it to skip the approval prompt for this
+    /// server's tools.
+    ///
+    /// A request, not a guarantee: a client with nowhere to put it writes the
+    /// same entry it always did.
+    ///
+    /// Turning this on for a server that is already installed lands on the next
+    /// `install`: [`check_existing`](McpClient::check_existing) answers
+    /// [`NeedsRefresh`](InstallStatus::NeedsRefresh) for an entry that names
+    /// this binary and has not got the mode, so the client is written rather
+    /// than skipped.
+    ///
+    /// ```
+    /// use sml_mcps::cli::ServerEntry;
+    ///
+    /// let entry = ServerEntry::new("my-mcp", &["serve"]).with_auto_approve();
+    /// assert!(entry.auto_approve);
+    /// ```
+    pub fn with_auto_approve(mut self) -> Self {
+        self.auto_approve = true;
         self
     }
 
@@ -129,6 +167,25 @@ impl ServerEntry {
     /// want.
     pub fn arguments(&self) -> Vec<String> {
         self.args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// The pinned environment as the map both config formats store it as.
+    ///
+    /// [`env`](Self::env) is a list, and a list can name `A` twice; neither a
+    /// JSON object nor a TOML table can, and both writers here resolve that the
+    /// same way - the last value wins. Anything comparing a written entry back
+    /// against a [`ServerEntry`] has to resolve it identically, or an entry
+    /// with a repeated key never matches what was written from it and is
+    /// reported stale on every run, forever.
+    ///
+    /// Public for the same reason [`json_entry`](Self::json_entry) is: a client
+    /// implemented outside this crate faces the same question and should not
+    /// have to answer it differently.
+    pub fn env_map(&self) -> BTreeMap<&str, &str> {
+        self.env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
     }
 
     /// The entry as the JSON object every JSON-configured client stores.
@@ -235,8 +292,19 @@ pub enum InstallStatus {
     /// The client is installed and has no entry for this server.
     NotInstalled,
 
-    /// The client points at this binary.
+    /// The client points at this binary, and the rest of the entry is current.
     Installed,
+
+    /// The client has an entry pointing at this binary, but other config is
+    /// stale.
+    ///
+    /// The binary has not moved, so there is nothing to say about where it
+    /// went. What changed is inside the entry: an argument, a pinned
+    /// environment variable, an approval mode that was asked for and is not
+    /// there. [`install`](McpClient::install) rewrites the whole entry either
+    /// way; this exists so the `install` command knows to call it, and so the
+    /// report can say "updated" rather than naming a binary that never moved.
+    NeedsRefresh,
 
     /// The client has an entry, but it names a different binary.
     NeedsUpdate {
@@ -251,12 +319,18 @@ pub enum InstallStatus {
 impl InstallStatus {
     /// Whether this status is one `install` would act on.
     pub fn wants_install(&self) -> bool {
-        matches!(self, Self::NotInstalled | Self::NeedsUpdate { .. })
+        matches!(
+            self,
+            Self::NotInstalled | Self::NeedsRefresh | Self::NeedsUpdate { .. }
+        )
     }
 
     /// Whether there is an entry here for `uninstall` to remove.
     pub fn has_entry(&self) -> bool {
-        matches!(self, Self::Installed | Self::NeedsUpdate { .. })
+        matches!(
+            self,
+            Self::Installed | Self::NeedsRefresh | Self::NeedsUpdate { .. }
+        )
     }
 }
 
@@ -265,6 +339,7 @@ impl fmt::Display for InstallStatus {
         match self {
             Self::NotInstalled => write!(f, "not configured"),
             Self::Installed => write!(f, "configured"),
+            Self::NeedsRefresh => write!(f, "outdated"),
             Self::NeedsUpdate { current_command } => {
                 write!(f, "outdated (pointing at {current_command})")
             }
@@ -369,17 +444,49 @@ where
         std::fs::create_dir_all(parent)?;
     }
 
+    // Asked before anything is written, because the rename below replaces the
+    // config wholesale - mode included - and this is the last moment the file
+    // being replaced can be asked what its mode was.
+    let mode = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+
     if path.exists() {
         std::fs::copy(path, backup_path(path))?;
     }
 
     let staging = staging_path(path);
-    std::fs::write(&staging, contents)?;
-    commit(&staging, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&staging);
+    staged(&staging, |staging| {
+        std::fs::write(staging, contents)?;
+
+        // A file created here gets `0666 & ~umask`, usually `0644`, and the
+        // rename hands that mode to the config along with the contents. A
+        // config someone keeps at `0600` would come back readable by every
+        // account on the machine, with the same API keys pinned in its `env` -
+        // so the mode of the file being replaced is carried across rather than
+        // quietly traded for the default one.
+        if let Some(mode) = &mode {
+            std::fs::set_permissions(staging, mode.clone())?;
+        }
+
+        commit(staging, path)
     })?;
 
     Ok(())
+}
+
+/// Run the steps that follow a staging file into existence, removing it if any
+/// of them fails.
+///
+/// All of them are in here for one reason: a staging file that never landed is
+/// a `.sml_mcps.<pid>.tmp` nobody will ever look at, in a directory the user
+/// does look at, and the process that made it is the only one that knows it is
+/// rubbish.
+fn staged<W>(staging: &Path, write: W) -> io::Result<()>
+where
+    W: FnOnce(&Path) -> io::Result<()>,
+{
+    write(staging).inspect_err(|_| {
+        let _ = std::fs::remove_file(staging);
+    })
 }
 
 /// Where a client's previous config is kept.
@@ -427,12 +534,14 @@ mod tests {
 
     #[test]
     fn an_entry_can_be_written_as_a_literal() {
-        // The shape the plan documents, and so the shape that must keep
-        // compiling.
+        // Every field is public, so a literal is still a way to build one -
+        // and a new field is a source break for anyone who does, which is why
+        // the builder is what the documentation shows.
         let entry = ServerEntry {
             name: "my-mcp",
             args: &["serve"],
             env: vec![],
+            auto_approve: false,
         };
 
         assert_eq!(entry, ServerEntry::new("my-mcp", &["serve"]));
@@ -485,6 +594,67 @@ mod tests {
     }
 
     #[test]
+    fn the_environment_map_is_what_a_config_file_can_hold() {
+        let entry = entry().with_env("B", "2").with_env("A", "1");
+
+        assert_eq!(
+            entry.env_map(),
+            BTreeMap::from([("A", "1"), ("B", "2")]),
+            "every pinned variable, however they were ordered"
+        );
+    }
+
+    #[test]
+    fn a_repeated_variable_is_one_variable_with_the_last_value() {
+        // Which is what gets written: a JSON object and a TOML table both keep
+        // one `A`, and the second `with_env` is the one that decided it.
+        let entry = entry().with_env("A", "1").with_env("A", "2");
+
+        assert_eq!(entry.env.len(), 2, "the list still records both");
+        assert_eq!(entry.env_map(), BTreeMap::from([("A", "2")]));
+        assert_eq!(entry.json_entry()["env"], json!({ "A": "2" }));
+    }
+
+    #[test]
+    fn an_entry_that_pins_nothing_has_an_empty_map() {
+        assert!(entry().env_map().is_empty());
+    }
+
+    //
+    // Auto-approval
+    //
+
+    #[test]
+    fn a_fresh_entry_does_not_ask_to_skip_approval() {
+        // The default has to be the one that leaves the decision where it was.
+        assert!(!entry().auto_approve);
+        assert!(!ServerEntry::new("bare", &[]).auto_approve);
+    }
+
+    #[test]
+    fn an_entry_can_ask_to_skip_approval() {
+        assert!(entry().with_auto_approve().auto_approve);
+    }
+
+    #[test]
+    fn asking_to_skip_approval_changes_nothing_else_about_the_entry() {
+        let asked = entry().with_env("A", "1").with_auto_approve();
+
+        assert_eq!(asked.name, "my-mcp");
+        assert_eq!(asked.args, &["serve"]);
+        assert_eq!(asked.env, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn auto_approval_is_part_of_what_makes_two_entries_different() {
+        assert_ne!(entry(), entry().with_auto_approve());
+        assert_eq!(
+            entry().with_auto_approve(),
+            entry().with_auto_approve().with_auto_approve()
+        );
+    }
+
+    #[test]
     fn the_json_entry_is_what_a_client_needs_to_start_the_server() {
         let entry = entry().with_env("MY_MCP_HOME", "/var/lib/my-mcp");
         let json = entry.json_entry();
@@ -524,6 +694,17 @@ mod tests {
             written["mcpServers"]["my-mcp"],
             pasted["mcpServers"]["my-mcp"]
         );
+    }
+
+    #[test]
+    fn auto_approval_is_nowhere_in_the_json_a_client_is_handed() {
+        // There is no key for it in this shape, and inventing one would put a
+        // setting no client reads into every config and every snippet.
+        let asked = entry().with_auto_approve();
+
+        assert_eq!(asked.json_entry(), entry().json_entry());
+        assert_eq!(asked.snippet(), entry().snippet());
+        assert!(!asked.snippet().contains("approval"), "{}", asked.snippet());
     }
 
     #[test]
@@ -586,6 +767,7 @@ mod tests {
             InstallStatus::ClientNotFound.to_string(),
             "client not installed"
         );
+        assert_eq!(InstallStatus::NeedsRefresh.to_string(), "outdated");
         assert_eq!(
             InstallStatus::NeedsUpdate {
                 current_command: "/old/build".to_string()
@@ -597,12 +779,16 @@ mod tests {
 
     #[test]
     fn install_acts_on_a_missing_or_stale_entry_only() {
-        let stale = InstallStatus::NeedsUpdate {
+        let moved = InstallStatus::NeedsUpdate {
             current_command: "/old".to_string(),
         };
 
         assert!(InstallStatus::NotInstalled.wants_install());
-        assert!(stale.wants_install());
+        assert!(moved.wants_install());
+        assert!(
+            InstallStatus::NeedsRefresh.wants_install(),
+            "the same binary with stale config is still work to do"
+        );
         assert!(!InstallStatus::Installed.wants_install());
         assert!(!InstallStatus::ClientNotFound.wants_install());
     }
@@ -610,12 +796,16 @@ mod tests {
     #[test]
     fn uninstall_acts_on_an_entry_however_current_it_is() {
         // A stale entry is still ours, and still has to go.
-        let stale = InstallStatus::NeedsUpdate {
+        let moved = InstallStatus::NeedsUpdate {
             current_command: "/old".to_string(),
         };
 
         assert!(InstallStatus::Installed.has_entry());
-        assert!(stale.has_entry());
+        assert!(moved.has_entry());
+        assert!(
+            InstallStatus::NeedsRefresh.has_entry(),
+            "an entry that needs refreshing is one there is something to remove"
+        );
         assert!(!InstallStatus::NotInstalled.has_entry());
         assert!(!InstallStatus::ClientNotFound.has_entry());
     }
@@ -811,6 +1001,115 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
         assert!(!staging_path(&path).exists());
+    }
+
+    #[test]
+    fn anything_that_fails_after_the_staging_file_exists_takes_it_with_it() {
+        // The write itself can fail with the file already created - a full
+        // filesystem is the ordinary way - and the cleanup used to start one
+        // step later, at the commit.
+        let dir = TempDir::new().unwrap();
+        let staging = dir.path().join("config.json.tmp");
+
+        let result = staged(&staging, |staging| {
+            std::fs::write(staging, "half a config")?;
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        });
+
+        assert!(result.is_err());
+        assert!(
+            !staging.exists(),
+            "a staging file that never landed must not be left behind"
+        );
+    }
+
+    #[test]
+    fn a_staged_write_that_lands_keeps_its_file() {
+        let dir = TempDir::new().unwrap();
+        let staging = dir.path().join("config.json.tmp");
+
+        staged(&staging, |staging| std::fs::write(staging, "whole")).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&staging).unwrap(), "whole");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_keeps_the_mode_the_config_already_had() {
+        // The staging file is created at the umask default and renamed over the
+        // config, which is how a `0600` file full of API keys used to come back
+        // `0644` - readable by every account on the machine.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomically(&path, "{\"env\":{\"TOKEN\":\"secret\"}}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a private config must stay private: {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_does_not_tighten_a_config_either() {
+        // The old mode is carried across, not replaced with one this crate
+        // decided on: a config the user made group-readable stays that way.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_atomically(&path, "{}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "{mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_first_write_has_no_mode_to_carry_and_uses_the_default() {
+        // Nothing to copy from, so the file is whatever the umask says - and
+        // in particular the write still succeeds rather than failing on a
+        // missing file's metadata.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+
+        write_atomically(&path, "{}\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert!(mode & 0o111 == 0, "a config is not executable: {mode:o}");
+        assert!(mode & 0o600 == 0o600, "and its owner can read it: {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_is_written_before_the_mode_is_carried_over() {
+        // Both come off the same file, and the `.bak` is what makes a wrong
+        // answer recoverable - so it has to survive the rename either way.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{\"theme\":\"dark\"}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomically(&path, "{}").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&path)).unwrap(),
+            "{\"theme\":\"dark\"}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

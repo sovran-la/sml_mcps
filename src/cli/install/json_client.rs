@@ -93,6 +93,17 @@ impl JsonClient {
     }
 }
 
+/// Whether what is already in the file is exactly what `entry` would write.
+///
+/// The whole entry, not just the command it names. Both
+/// [`check_existing`](McpClient::check_existing) and
+/// [`install`](McpClient::install) ask this one question, which is what keeps
+/// them from disagreeing: a status of `Installed` means `install` would write
+/// nothing, and anything else means it would write this exact object.
+fn matches_entry(existing: &Value, entry: &ServerEntry) -> bool {
+    *existing == entry.json_entry()
+}
+
 impl McpClient for JsonClient {
     fn name(&self) -> &str {
         &self.name
@@ -131,17 +142,42 @@ impl McpClient for JsonClient {
             .and_then(Value::as_str)
             .unwrap_or_default();
 
-        if their_command == entry.command() {
+        if their_command != entry.command() {
+            return InstallStatus::NeedsUpdate {
+                current_command: their_command.to_string(),
+            };
+        }
+
+        // The binary has not moved, but the rest of the entry may still be
+        // stale - a changed argument, a pinned variable this version of the
+        // server needs. `install` rewrites all of it; the status is what
+        // decides whether the `install` command calls it at all, so answering
+        // `Installed` here is what would leave the file alone.
+        if matches_entry(existing, entry) {
             InstallStatus::Installed
         } else {
-            InstallStatus::NeedsUpdate {
-                current_command: their_command.to_string(),
-            }
+            InstallStatus::NeedsRefresh
         }
     }
 
     fn install(&self, entry: &ServerEntry) -> Result<(), InstallError> {
         let mut config = self.read_config()?;
+        // `entry.auto_approve` is deliberately not written here. None of these
+        // five clients take a per-server approval policy in the file this type
+        // edits:
+        //
+        // - Claude Code has one, as `mcp__<server>__*` in the `allowedTools`
+        //   array of `~/.claude/settings.json` - a second file, on a different
+        //   path, that this type has no reason to know about. A `JsonClient` is
+        //   a path and a key, so it cannot tell it is the Claude Code one and
+        //   not the Cursor one; supporting it means the trait growing a way to
+        //   say so.
+        // - Claude Desktop, Cursor, Windsurf and VS Code have no config-time
+        //   mechanism at all. Approval is something their UI asks for, and a
+        //   key we invented would sit in the config unread.
+        //
+        // So an entry that asked for auto-approval gets the same JSON as one
+        // that did not, and Codex is the only client that acts on it.
         let written = entry.json_entry();
 
         let object = config.as_object_mut().ok_or_else(|| {
@@ -167,7 +203,10 @@ impl McpClient for JsonClient {
 
         // Nothing to do if it is already exactly right: rewriting would churn
         // the file's timestamp and overwrite a `.bak` worth keeping.
-        if servers.get(entry.name) == Some(&written) {
+        if servers
+            .get(entry.name)
+            .is_some_and(|existing| matches_entry(existing, entry))
+        {
             return Ok(());
         }
         servers.insert(entry.name.to_string(), written);
@@ -357,10 +396,11 @@ mod tests {
     }
 
     #[test]
-    fn extra_arguments_on_a_matching_binary_are_left_be() {
-        // Only the command decides. Someone who added `--verbose-logging` by
-        // hand is pointing at the right binary, and re-running `install` should
-        // not quietly undo their flag.
+    fn an_entry_that_is_not_what_we_would_write_needs_refreshing() {
+        // The same binary with different arguments. `install` has always
+        // rewritten this entry when it ran; reporting `Installed` only meant
+        // the `install` command never called it, so the rewrite landed at some
+        // unrelated later moment instead of the one that asked for it.
         let dir = TempDir::new().unwrap();
         let client = client(&dir, "mcpServers");
         seed(
@@ -371,7 +411,65 @@ mod tests {
             }}}),
         );
 
-        assert_eq!(client.check_existing(&entry()), InstallStatus::Installed);
+        assert_eq!(client.check_existing(&entry()), InstallStatus::NeedsRefresh);
+    }
+
+    #[test]
+    fn a_stale_pinned_variable_needs_refreshing() {
+        // The upgrade case this exists for: a server that grew a variable its
+        // entry has to carry, on a client that is otherwise current.
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+        client.install(&entry()).unwrap();
+
+        assert_eq!(
+            client.check_existing(&entry().with_env("MY_MCP_HOME", "/var/lib/my-mcp")),
+            InstallStatus::NeedsRefresh
+        );
+    }
+
+    #[test]
+    fn a_refresh_is_what_the_install_actually_writes() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+        client.install(&entry()).unwrap();
+        let wanted = entry().with_env("MY_MCP_HOME", "/var/lib/my-mcp");
+
+        assert_eq!(client.check_existing(&wanted), InstallStatus::NeedsRefresh);
+        client.install(&wanted).unwrap();
+
+        assert_eq!(client.check_existing(&wanted), InstallStatus::Installed);
+        assert_eq!(
+            config_of(&client)["mcpServers"]["my-mcp"]["env"]["MY_MCP_HOME"],
+            "/var/lib/my-mcp"
+        );
+    }
+
+    #[test]
+    fn a_status_and_an_install_agree_about_every_entry() {
+        // `wants_install` decides whether `install` is called at all, so a
+        // status that said "nothing to do" about an entry `install` would
+        // rewrite is an install that silently never happens - and one that
+        // said "work to do" about an entry `install` would leave alone is a
+        // report claiming a change that was not made.
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+        client.install(&entry()).unwrap();
+
+        for wanted in [
+            entry(),
+            entry().with_auto_approve(),
+            entry().with_env("A", "1"),
+            ServerEntry::new("my-mcp", &["serve", "--stdio"]),
+            ServerEntry::new("another-mcp", &["serve"]),
+        ] {
+            let before = std::fs::read_to_string(client.config_path()).unwrap();
+            let wants_install = client.check_existing(&wanted).wants_install();
+            client.install(&wanted).unwrap();
+
+            let rewritten = std::fs::read_to_string(client.config_path()).unwrap() != before;
+            assert_eq!(wants_install, rewritten, "{wanted:?}");
+        }
     }
 
     #[test]
@@ -529,6 +627,60 @@ mod tests {
             config_of(&client)["mcpServers"]["my-mcp"]["env"]["MY_MCP_HOME"],
             "/new"
         );
+    }
+
+    //
+    // Auto-approval
+    //
+
+    #[test]
+    fn an_auto_approving_entry_is_written_exactly_like_any_other() {
+        // None of the JSON clients read a per-server approval policy out of
+        // this file, so there is nothing to write and no key to invent.
+        let dir = TempDir::new().unwrap();
+        let asked = client(&dir, "mcpServers");
+        let plain = JsonClient::new("Test Client", dir.path().join("plain.json"), "mcpServers");
+
+        asked.install(&entry().with_auto_approve()).unwrap();
+        plain.install(&entry()).unwrap();
+
+        assert_eq!(config_of(&asked), config_of(&plain));
+        let text = std::fs::read_to_string(asked.config_path()).unwrap();
+        assert!(!text.contains("approval"), "{text}");
+        assert!(!text.contains("allowedTools"), "{text}");
+        assert!(!text.contains("autoApprove"), "{text}");
+    }
+
+    #[test]
+    fn an_auto_approving_entry_is_still_a_working_entry() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+        let entry = entry().with_auto_approve();
+
+        client.install(&entry).unwrap();
+
+        assert_eq!(
+            config_of(&client)["mcpServers"]["my-mcp"]["command"],
+            our_command()
+        );
+        assert_eq!(client.check_existing(&entry), InstallStatus::Installed);
+
+        client.uninstall(&entry).unwrap();
+
+        assert_eq!(client.check_existing(&entry), InstallStatus::NotInstalled);
+    }
+
+    #[test]
+    fn asking_for_auto_approval_afterwards_does_not_rewrite_the_file() {
+        // It changes nothing here, so it is not a reason to churn the config
+        // or overwrite a `.bak` worth keeping.
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+        client.install(&entry()).unwrap();
+
+        client.install(&entry().with_auto_approve()).unwrap();
+
+        assert!(!backup_path(&client.config_path()).exists());
     }
 
     #[test]

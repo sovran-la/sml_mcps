@@ -11,6 +11,7 @@
 //! is running the suite.
 
 use super::install::{InstallStatus, McpClient, ServerEntry};
+use std::path::Path;
 
 /// What a command produced: what to print, and how it went.
 pub(super) struct Report {
@@ -167,29 +168,16 @@ pub(super) fn install(
 
         if !status.wants_install() {
             out.push_str(&format!(
-                "  {}: already configured ({})\n",
+                "  {}: up to date ({})\n",
                 client.name(),
                 client.config_path().display()
             ));
             continue;
         }
 
-        // "Update this" is a different thing from "add this", and the binary
-        // being replaced is the part worth seeing.
-        if let InstallStatus::NeedsUpdate { current_command } = &status {
-            out.push_str(&format!(
-                "  {}: configured, but pointing at {current_command}\n",
-                client.name()
-            ));
-        }
-
         match client.install(entry) {
             Ok(()) => {
-                out.push_str(&format!(
-                    "  {}: configured ({})\n",
-                    client.name(),
-                    client.config_path().display()
-                ));
+                out.push_str(&changed_line(client.name(), &status, &client.config_path()));
                 changed += 1;
             }
             Err(error) => {
@@ -212,13 +200,17 @@ pub(super) fn install(
             "None of the named MCP clients are installed.\n"
         });
         out.push_str(&fallback(entry));
-    } else {
+    } else if changed > 0 {
         out.push_str(&format!(
-            "Detected {detected} client(s), configured {changed}.\n"
+            "Detected {detected} client(s), changed {changed}.\n"
         ));
-        if changed > 0 {
-            out.push_str("Restart your MCP client to pick up the change.\n");
-        }
+        out.push_str("Restart your MCP client to pick up the change.\n");
+    } else if failed {
+        // Nothing was written, but "all up to date" would be a claim about
+        // clients this run never managed to look at properly.
+        out.push_str(&format!("Detected {detected} client(s), changed 0.\n"));
+    } else {
+        out.push_str(&format!("Detected {detected} client(s), all up to date.\n"));
     }
 
     Report {
@@ -228,6 +220,26 @@ pub(super) fn install(
         } else {
             Outcome::Done
         },
+    }
+}
+
+/// One client's line, once its entry has been written.
+///
+/// The three ways an install can change a config are worth telling apart, and
+/// `status` is the only thing that still knows which one happened: the config
+/// has already been overwritten by the time this is called. A client that had
+/// no entry was *configured*; one that had a current entry with something stale
+/// in it was *updated*; one that named another binary was updated too, and
+/// which binary it used to name is the part worth seeing.
+fn changed_line(name: &str, status: &InstallStatus, config_path: &Path) -> String {
+    let path = config_path.display();
+
+    match status {
+        InstallStatus::NeedsUpdate { current_command } => {
+            format!("  {name}: updated — was pointing at {current_command} ({path})\n")
+        }
+        InstallStatus::NeedsRefresh => format!("  {name}: updated ({path})\n"),
+        _ => format!("  {name}: configured ({path})\n"),
     }
 }
 
@@ -267,12 +279,20 @@ pub(super) fn uninstall(
 
     for client in &clients {
         let status = client.check_existing(entry);
-        if !status.has_entry() {
+        if status == InstallStatus::ClientNotFound {
             continue;
         }
 
-        match client.uninstall(entry) {
-            Ok(()) => {
+        // Asked even where the status says there is nothing to remove, because
+        // `NotInstalled` is also the answer for a config that could not be
+        // parsed - and a file we cannot read may well still name this server.
+        // `uninstall` re-reads it and reports the parse failure the way
+        // `install` does, rather than this command claiming it looked and found
+        // nothing.
+        let removal = client.uninstall(entry);
+
+        match (removal, status.has_entry()) {
+            (Ok(()), true) => {
                 out.push_str(&format!(
                     "  {}: removed ({})\n",
                     client.name(),
@@ -280,7 +300,10 @@ pub(super) fn uninstall(
                 ));
                 removed += 1;
             }
-            Err(error) => {
+            // A client that had no entry says nothing, the same as before: a
+            // list of every client that was already clean is noise.
+            (Ok(()), false) => {}
+            (Err(error), _) => {
                 out.push_str(&format!(
                     "  {}: could not be changed - {error}\n",
                     client.name()
@@ -480,7 +503,7 @@ mod tests {
         let report = install(&entry(), detected_clients(&dir), &[]);
 
         assert_eq!(report.outcome, Outcome::Done);
-        assert!(report.text.contains("Detected 6 client(s), configured 6."));
+        assert!(report.text.contains("Detected 6 client(s), changed 6."));
         for client in clients_under(dir.path()) {
             assert_eq!(
                 client.check_existing(&entry()),
@@ -524,7 +547,7 @@ mod tests {
         let report = install(&entry(), detected_clients(&dir), &["cursor".to_string()]);
 
         assert_eq!(report.outcome, Outcome::Done);
-        assert!(report.text.contains("Detected 1 client(s), configured 1."));
+        assert!(report.text.contains("Detected 1 client(s), changed 1."));
         for client in clients_under(dir.path()) {
             let expected = if client.name() == "Cursor" {
                 InstallStatus::Installed
@@ -598,12 +621,37 @@ mod tests {
         let report = install(&entry(), detected_clients(&dir), &[]);
 
         assert_eq!(report.outcome, Outcome::Done);
-        assert!(report.text.contains("Detected 6 client(s), configured 0."));
-        assert!(report.text.contains("already configured"));
+        assert!(
+            report
+                .text
+                .contains("Detected 6 client(s), all up to date."),
+            "{}",
+            report.text
+        );
+        assert!(report.text.contains("up to date ("), "{}", report.text);
         assert!(
             !report.text.contains("Restart your MCP client"),
             "nothing changed, so there is nothing to restart for"
         );
+    }
+
+    #[test]
+    fn install_says_up_to_date_for_every_client_it_checked() {
+        // The whole complaint this answers: a run that reports nothing but a
+        // count of zero gives no sign it looked at anything.
+        let dir = TempDir::new().unwrap();
+        install(&entry(), detected_clients(&dir), &[]);
+
+        let report = install(&entry(), detected_clients(&dir), &[]);
+
+        for client in clients_under(dir.path()) {
+            let line = format!(
+                "  {}: up to date ({})",
+                client.name(),
+                client.config_path().display()
+            );
+            assert!(report.text.contains(&line), "{}\n---\n{line}", report.text);
+        }
     }
 
     #[test]
@@ -615,16 +663,112 @@ mod tests {
             serde_json::json!({"mcpServers": {"my-mcp": {"command": "/old/build"}}}).to_string(),
         )
         .unwrap();
+        let path = client.config_path();
 
         let report = install(&entry(), vec![Box::new(client)], &[]);
 
         assert_eq!(report.outcome, Outcome::Done);
         assert!(
-            report.text.contains("pointing at /old/build"),
+            report.text.contains(&format!(
+                "  Test: updated — was pointing at /old/build ({})",
+                path.display()
+            )),
             "{}",
             report.text
         );
-        assert!(report.text.contains("Detected 1 client(s), configured 1."));
+        assert!(report.text.contains("Detected 1 client(s), changed 1."));
+    }
+
+    #[test]
+    fn install_says_it_updated_a_client_whose_binary_did_not_move() {
+        // The entry names this binary already, so there is nothing to say about
+        // where it went - but the pinned environment is not what this version
+        // of the server asks for, and the config really is being rewritten.
+        let dir = TempDir::new().unwrap();
+        let client = JsonClient::new("Test", dir.path().join("config.json"), "mcpServers");
+        client.install(&entry()).unwrap();
+        let path = client.config_path();
+        let wanted = entry().with_env("MY_MCP_HOME", "/var/lib/my-mcp");
+
+        let report = install(&wanted, vec![Box::new(client)], &[]);
+
+        assert_eq!(report.outcome, Outcome::Done);
+        assert!(
+            report
+                .text
+                .contains(&format!("  Test: updated ({})", path.display())),
+            "{}",
+            report.text
+        );
+        assert!(
+            !report.text.contains("pointing at"),
+            "the binary did not move, so nothing was pointing anywhere else: {}",
+            report.text
+        );
+        assert!(report.text.contains("Detected 1 client(s), changed 1."));
+        assert!(report.text.contains("Restart your MCP client"));
+    }
+
+    #[test]
+    fn a_stale_approval_mode_is_a_client_the_install_command_writes() {
+        // End to end over the whole fix: turning auto-approval on for a server
+        // that is already installed used to report "already configured" and
+        // write nothing at all.
+        let dir = TempDir::new().unwrap();
+        let asked = entry().with_auto_approve();
+        install(&entry(), detected_clients(&dir), &["codex".to_string()]);
+
+        let report = install(&asked, detected_clients(&dir), &["codex".to_string()]);
+
+        assert_eq!(report.outcome, Outcome::Done);
+        assert!(report.text.contains("Codex: updated ("), "{}", report.text);
+        assert!(report.text.contains("Detected 1 client(s), changed 1."));
+        let written = std::fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        assert!(
+            written.contains("default_tools_approval_mode = \"auto\""),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn every_kind_of_change_says_which_one_it_was() {
+        // One run with all three: a client with no entry, one whose entry is
+        // stale in place, and one whose entry names another binary.
+        let dir = TempDir::new().unwrap();
+        let fresh = JsonClient::new("Fresh", dir.path().join("fresh.json"), "mcpServers");
+        let stale = JsonClient::new("Stale", dir.path().join("stale.json"), "mcpServers");
+        let moved = JsonClient::new("Moved", dir.path().join("moved.json"), "mcpServers");
+        stale.install(&entry()).unwrap();
+        std::fs::write(
+            moved.config_path(),
+            serde_json::json!({"mcpServers": {"my-mcp": {"command": "/old/build"}}}).to_string(),
+        )
+        .unwrap();
+
+        let report = install(
+            &entry().with_env("A", "1"),
+            vec![Box::new(fresh), Box::new(stale), Box::new(moved)],
+            &[],
+        );
+
+        assert!(
+            report.text.contains("  Fresh: configured ("),
+            "{}",
+            report.text
+        );
+        assert!(
+            report.text.contains("  Stale: updated ("),
+            "{}",
+            report.text
+        );
+        assert!(
+            report
+                .text
+                .contains("  Moved: updated — was pointing at /old/build ("),
+            "{}",
+            report.text
+        );
+        assert!(report.text.contains("Detected 3 client(s), changed 3."));
     }
 
     #[test]
@@ -670,6 +814,16 @@ mod tests {
             "a failed write must not report success"
         );
         assert!(report.text.contains("Broken: could not be configured"));
+        assert!(
+            report.text.contains("Detected 1 client(s), changed 0."),
+            "{}",
+            report.text
+        );
+        assert!(
+            !report.text.contains("all up to date"),
+            "a client that could not be written is not one that is up to date: {}",
+            report.text
+        );
     }
 
     #[test]
@@ -721,6 +875,34 @@ mod tests {
                 client.config_path().display()
             );
             assert!(report.text.contains(&line), "{}\n---\n{line}", report.text);
+        }
+    }
+
+    #[test]
+    fn uninstall_removes_an_entry_that_only_needed_refreshing() {
+        // An entry that names this binary and is stale in some other way is
+        // still ours. `has_entry` is what decides whether `uninstall` looks at
+        // a client at all, so a status it did not account for is an entry left
+        // behind by a command that reported success.
+        let dir = TempDir::new().unwrap();
+        install(&entry(), detected_clients(&dir), &[]);
+        let wanted = entry().with_env("MY_MCP_HOME", "/var/lib/my-mcp");
+
+        let report = uninstall(&wanted, detected_clients(&dir), &[]);
+
+        assert_eq!(report.outcome, Outcome::Done);
+        assert!(
+            report.text.contains("Removed from 6 client(s)."),
+            "{}",
+            report.text
+        );
+        for client in clients_under(dir.path()) {
+            assert_eq!(
+                client.check_existing(&wanted),
+                InstallStatus::NotInstalled,
+                "{}",
+                client.name()
+            );
         }
     }
 
@@ -842,5 +1024,86 @@ mod tests {
             !report.text.contains("Nothing to remove"),
             "a failure is not nothing to do"
         );
+    }
+
+    #[test]
+    fn uninstall_reports_a_config_it_could_not_read() {
+        // A config that will not parse is the one thing `check_existing` cannot
+        // see past: it answers `NotInstalled`, which used to make this command
+        // skip the client and report there was nothing to remove - about a file
+        // that may well still name this server.
+        let dir = TempDir::new().unwrap();
+        install(&entry(), detected_clients(&dir), &[]);
+        let cursor = clients_under(dir.path())
+            .into_iter()
+            .find(|client| client.name() == "Cursor")
+            .expect("Cursor must be a known client");
+        std::fs::write(cursor.config_path(), "{ not json").unwrap();
+
+        let report = uninstall(&entry(), detected_clients(&dir), &[]);
+
+        assert_eq!(report.outcome, Outcome::Failed);
+        assert!(
+            report.text.contains("Cursor: could not be changed"),
+            "{}",
+            report.text
+        );
+        assert!(
+            report.text.contains("left untouched"),
+            "and says the file was not rewritten: {}",
+            report.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(cursor.config_path()).unwrap(),
+            "{ not json",
+            "a config we cannot parse is one we have no business rewriting"
+        );
+    }
+
+    #[test]
+    fn uninstall_reports_a_client_whose_status_hid_the_failure() {
+        // `BrokenClient` is that shape exactly: it reports `NotInstalled` and
+        // then fails the removal, which is what an unreadable config does.
+        let report = uninstall(&entry(), vec![Box::new(BrokenClient)], &[]);
+
+        assert_eq!(report.outcome, Outcome::Failed);
+        assert!(report.text.contains("Broken: could not be changed"));
+        assert!(
+            !report.text.contains("Nothing to remove"),
+            "a client that could not be read is not a client with nothing in it"
+        );
+    }
+
+    #[test]
+    fn uninstall_still_says_nothing_about_a_client_that_was_already_clean() {
+        // Every detected client is asked now, so the quiet has to come from the
+        // status rather than from never having called `uninstall`.
+        let dir = TempDir::new().unwrap();
+        let clients = detected_clients(&dir);
+
+        let report = uninstall(&entry(), clients, &[]);
+
+        assert_eq!(report.outcome, Outcome::Done);
+        assert!(report.text.contains("Nothing to remove"));
+        assert!(!report.text.contains("removed ("), "{}", report.text);
+        for client in clients_under(dir.path()) {
+            assert!(
+                !client.config_path().exists(),
+                "{} must not have a config invented for it",
+                client.name()
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_does_not_ask_a_client_that_is_not_installed() {
+        // Nothing is on this machine, so there is nothing to read and nothing
+        // to report - the loop stops at the status.
+        let dir = TempDir::new().unwrap();
+
+        let report = uninstall(&entry(), clients_under(dir.path()), &[]);
+
+        assert_eq!(report.outcome, Outcome::Done);
+        assert!(report.text.contains("Nothing to remove"));
     }
 }

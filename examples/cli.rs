@@ -51,11 +51,7 @@ impl Tool<AppContext> for PingTool {
 }
 
 fn main() -> ExitCode {
-    // What gets written into every client's config. The binary path is worked
-    // out for you; this is only the part that is yours.
-    let entry = ServerEntry::new("cli-example", &["serve"]).with_env("CLI_EXAMPLE_MODE", "demo");
-
-    Cli::new(entry)
+    Cli::new(entry())
         .description("An example MCP server that installs itself")
         .on_install(|_args| {
             // Runs before a single client config is written. Whatever your
@@ -119,7 +115,10 @@ fn main() -> ExitCode {
                 .flag("--verbose", "Print the config path for every client"),
             |args| {
                 let verbose = args.iter().any(|arg| arg == "--verbose");
-                let entry = ServerEntry::new("cli-example", &["serve"]);
+                // The same entry `install` writes, or this reports every
+                // client as outdated for differing from an entry nothing ever
+                // installed.
+                let entry = entry();
 
                 for client in all_clients() {
                     println!("{}: {}", client.name(), client.check_existing(&entry));
@@ -132,6 +131,16 @@ fn main() -> ExitCode {
             },
         )
         .run()
+}
+
+/// What gets written into every client's config.
+///
+/// The binary path is worked out for you; this is only the part that is yours.
+/// One function rather than a literal in `main`, because `doctor` asks the
+/// clients about the same entry and a second spelling of it would be a second
+/// answer.
+fn entry() -> ServerEntry {
+    ServerEntry::new("cli-example", &["serve"]).with_env("CLI_EXAMPLE_MODE", "demo")
 }
 
 /// Where this example keeps the configuration it writes for itself.

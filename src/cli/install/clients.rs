@@ -303,6 +303,42 @@ mod tests {
     }
 
     #[test]
+    fn every_client_handles_an_entry_asking_for_auto_approval() {
+        // Codex is the only one with anywhere to put it. Everywhere else the
+        // entry has to be exactly what it always was - asking for something a
+        // client cannot do is not a reason for that client to be configured
+        // differently, or to fail.
+        let dir = tempfile::TempDir::new().unwrap();
+        let entry = entry().with_auto_approve();
+
+        for client in clients_under(dir.path()) {
+            client.install(&entry).unwrap();
+            assert_eq!(
+                client.check_existing(&entry),
+                InstallStatus::Installed,
+                "{}",
+                client.name()
+            );
+
+            let text = std::fs::read_to_string(client.config_path()).unwrap();
+            assert_eq!(
+                text.contains("default_tools_approval_mode = \"auto\""),
+                client.name() == "Codex",
+                "{}: {text}",
+                client.name()
+            );
+
+            client.uninstall(&entry).unwrap();
+            assert_eq!(
+                client.check_existing(&entry),
+                InstallStatus::NotInstalled,
+                "{}",
+                client.name()
+            );
+        }
+    }
+
+    #[test]
     fn every_client_creates_the_directories_it_needs() {
         // Nothing is pre-created here: a client whose config directory has
         // never existed must still be configurable.
