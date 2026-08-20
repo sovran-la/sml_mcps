@@ -228,6 +228,26 @@ impl RequestBroker {
         }
     }
 
+    /// Stop waiting for `id` because the client has said it will not answer.
+    ///
+    /// Only for ids this broker issued. `notifications/cancelled` travels in
+    /// both directions, and one naming a request the *client* sent has nothing
+    /// to do with any waiter here - remembering it would only fill the
+    /// abandoned queue with ids no response can ever match, evicting the ones
+    /// that can.
+    ///
+    /// Returns whether there was anything here to cancel, which is what lets a
+    /// caller tell "a waiter was woken" from "a notification about someone
+    /// else's request".
+    pub(crate) fn cancel(&self, id: &RequestId) -> bool {
+        if !self.was_issued_here(id) {
+            return false;
+        }
+
+        self.abandon(id);
+        true
+    }
+
     /// Was `id` abandoned? Removes it if so, since a response only arrives once.
     fn forget_abandoned(&self, id: &RequestId) -> bool {
         let mut abandoned = Self::hold(&self.abandoned);
@@ -445,6 +465,74 @@ mod tests {
         broker.park(response("sml-0")); // parked normally
 
         assert!(broker.take_parked(&id).is_some());
+    }
+
+    #[test]
+    fn cancelling_an_id_we_issued_abandons_it() {
+        let broker = broker_awaiting(1);
+        let id = RequestId::String("sml-0".into());
+
+        assert!(broker.cancel(&id), "there was a request here to cancel");
+
+        broker.park(response("sml-0"));
+        assert!(
+            broker.take_parked(&id).is_none(),
+            "an answer to a cancelled request has nowhere to go"
+        );
+    }
+
+    #[test]
+    fn cancelling_hands_the_waiter_its_channel_back_closed() {
+        // Which is how a task worker blocked on the channel finds out: the
+        // sender is dropped, so its `recv` ends at once instead of running out
+        // the request timeout.
+        let broker = broker_awaiting(1);
+        let id = RequestId::String("sml-0".into());
+        let receiver = broker.register_waiter(&id);
+
+        broker.cancel(&id);
+
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn cancelling_an_id_we_never_issued_changes_nothing() {
+        // `notifications/cancelled` travels both ways, and one naming a request
+        // the client sent has no waiter here. Remembering it would fill the
+        // abandoned queue with ids no response can ever match - evicting the
+        // ones that can.
+        let broker = broker_awaiting(1);
+
+        assert!(!broker.cancel(&RequestId::Number(41)));
+        assert!(!broker.cancel(&RequestId::String("sml-99".into())));
+
+        // The one real request is untouched: its answer still lands.
+        broker.park(response("sml-0"));
+        assert!(
+            broker
+                .take_parked(&RequestId::String("sml-0".into()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cancelling_one_request_leaves_another_waiting() {
+        let broker = broker_awaiting(2);
+        let first = RequestId::String("sml-0".into());
+        let second = RequestId::String("sml-1".into());
+        let waiting = broker.register_waiter(&second);
+
+        broker.cancel(&first);
+
+        broker.deliver(response("sml-1"));
+        assert!(
+            waiting
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_ok()
+        );
     }
 
     #[test]

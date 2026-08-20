@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// - it **MUST** be an absolute URI with a scheme (`mcp.example.com` is not one)
 /// - it **MUST NOT** contain a fragment (`https://x.example.com#frag` is not one)
+/// - it **MUST NOT** contain a query string: the metadata document is published
+///   at a path derived from this one, and a request target is matched with its
+///   query stripped, so one here means discovery can never match
 /// - the canonical form lowercases scheme and host, though implementations
 ///   **SHOULD** accept uppercase for robustness
 /// - a trailing slash **SHOULD** be omitted unless it is semantically
@@ -45,6 +48,17 @@ impl ResourceUri {
         }
         if uri.contains('#') {
             return Err(format!("resource URI must not contain a fragment: {uri}"));
+        }
+        // Not a style rule. The metadata document is published at a *path* -
+        // `/.well-known/oauth-protected-resource` plus this URI's path - and a
+        // request target is matched by path, with any query stripped off. A
+        // resource URI carrying one produces a `metadata_path` no request can
+        // ever equal, so RFC 9728 discovery is off and nothing says so.
+        if uri.contains('?') {
+            return Err(format!(
+                "resource URI must not contain a query string, which would leave its \
+                 metadata document unreachable: {uri}"
+            ));
         }
 
         let Some((scheme, rest)) = uri.split_once("://") else {
@@ -276,6 +290,51 @@ mod tests {
                 .unwrap_err()
                 .contains("fragment")
         );
+    }
+
+    #[test]
+    fn rejects_a_query_string() {
+        // Not pedantry: the metadata document is published at a path built from
+        // this URI's path, and a request target is matched with its query
+        // stripped. A resource URI carrying one produces a `metadata_path` no
+        // request can equal, so discovery is off and nothing says so.
+        for bad in [
+            "https://mcp.example.com/mcp?v=2",
+            "https://mcp.example.com?",
+            "https://mcp.example.com/mcp?",
+        ] {
+            let error = ResourceUri::parse(bad).unwrap_err();
+            assert!(error.contains("query string"), "{bad}: {error}");
+            assert!(
+                error.contains(bad),
+                "the message has to name the URI that was refused: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_string_would_have_published_metadata_nobody_can_reach() {
+        // What the refusal above is protecting, spelled out: the path a client
+        // would GET carries the query, and the path the server compares against
+        // does not. This is the shape the two would have disagreed in.
+        let published = "/.well-known/oauth-protected-resource/mcp?v=2";
+        let requested = "/.well-known/oauth-protected-resource/mcp";
+
+        assert_ne!(published, requested);
+
+        // Without a query, the two are the same string - which is the whole
+        // requirement.
+        let clean = ResourceUri::parse("https://mcp.example.com/mcp").unwrap();
+        assert_eq!(clean.metadata_path(), requested);
+    }
+
+    #[test]
+    fn a_path_that_merely_contains_a_question_mark_is_still_a_query() {
+        // There is no escaping that changes this: `?` starts the query
+        // component wherever it appears, so a path cannot contain a literal
+        // one, and a URI that has one is refused rather than silently
+        // reinterpreted.
+        assert!(ResourceUri::parse("https://example.com/a?b/c").is_err());
     }
 
     #[test]

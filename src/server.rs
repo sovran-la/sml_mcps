@@ -512,7 +512,20 @@ impl<'a> ToolEnv<'a> {
                 // Might belong to a task worker blocked on a channel, which
                 // would never come back to collect a parked response.
                 JsonRpcMessage::Response(response) => self.broker.deliver(response),
-                other => self.shed_or_defer(other),
+                // The one client message this loop acts on rather than sets
+                // aside: a cancellation naming the request being waited for.
+                // Nothing downstream would see it in time - it would sit in the
+                // deferred queue until the main loop ran again, which is what
+                // this wait is holding up.
+                other => match cancelled_here(&other, id) {
+                    true => {
+                        self.broker.abandon(id);
+                        return Err(McpError::Internal(format!(
+                            "the client cancelled request {id:?}"
+                        )));
+                    }
+                    false => self.shed_or_defer(other),
+                },
             }
         }
     }
@@ -1208,6 +1221,34 @@ fn overloaded_response(refused: JsonRpcMessage) -> Option<JsonRpcMessage> {
     ))
 }
 
+/// The method a peer sends to withdraw a request it will not see through.
+const CANCELLED_NOTIFICATION: &str = "notifications/cancelled";
+
+/// The request `notification` withdraws, if that is what it is.
+///
+/// `None` covers everything else: another notification entirely, one with no
+/// `params`, and one whose `requestId` is missing or is not a JSON-RPC id.
+/// Cancellation is best-effort in both directions - lifecycle §Cancellation:
+/// "the receiver ... MAY ignore [it] if ... the notification is malformed" -
+/// so a shape we cannot read is nothing to answer.
+fn cancelled_request_id(notification: &JsonRpcNotification) -> Option<RequestId> {
+    if notification.method != CANCELLED_NOTIFICATION {
+        return None;
+    }
+
+    let request_id = notification.params.as_ref()?.get("requestId")?;
+    serde_json::from_value(request_id.clone()).ok()
+}
+
+/// Whether `message` is a cancellation for `id`.
+fn cancelled_here(message: &JsonRpcMessage, id: &RequestId) -> bool {
+    let JsonRpcMessage::Notification(notification) = message else {
+        return false;
+    };
+
+    cancelled_request_id(notification).as_ref() == Some(id)
+}
+
 /// Parse a request's params, treating an absent `params` as invalid.
 fn parse_params<T: serde::de::DeserializeOwned>(request: &JsonRpcRequest) -> Result<T> {
     let params = request
@@ -1255,7 +1296,17 @@ pub struct Server<C> {
     /// writing through it waits for the loop to wake - which, for a task worker
     /// wanting to elicit, is the very thing it is waiting to cause. A separate
     /// sink removes that circularity. Falls back to `transport` where splitting
-    /// is not possible (HTTP), which is also where nothing needs it.
+    /// is not possible, which among the transports here means HTTP - where a
+    /// request carries one message, nothing is parked in `read`, and there is
+    /// nothing to contend with.
+    ///
+    /// Worth knowing for a transport implemented elsewhere: the fallback is not
+    /// free on a bidirectional one. Server-initiated *requests* are refused
+    /// outright there (`can_pump` is false without a splittable writer), but a
+    /// task worker's `env.log()` is a plain write, and on the fallback it waits
+    /// on the read handle until the next message arrives. A transport that
+    /// means to carry tasks should implement
+    /// [`try_clone_writer`](crate::Transport::try_clone_writer).
     writer: Option<Arc<Mutex<dyn Transport>>>,
     /// Whether the transport can be pumped while `tasks/result` blocks.
     ///
@@ -2795,10 +2846,30 @@ impl<C: Send + Sync + 'static> Server<C> {
         Ok(serde_json::to_value(result)?)
     }
 
+    /// Act on a notification from the client.
+    ///
+    /// Everything unrecognized is ignored on purpose - base protocol: "the
+    /// receiver MUST NOT send a response" to a notification, so there is
+    /// nowhere to say "I do not know that one" even if it were worth saying.
     fn handle_notification(&mut self, notification: JsonRpcNotification) -> Result<()> {
         match notification.method.as_str() {
             "notifications/initialized" => Ok(()),
-            "notifications/cancelled" => Ok(()),
+            // A client withdrawing a request the *server* sent - an elicitation
+            // whose form it closed, a sampling request it will not serve - has
+            // said the answer is not coming. Dropping this left the waiter
+            // blocked for the whole `request_timeout`, two minutes by default,
+            // on an answer that had already been taken back.
+            //
+            // Any other id belongs to a request the client sent us, which is
+            // what `cancel` declines to touch: this server handles one message
+            // at a time, so a request named here has either not started or
+            // already finished.
+            CANCELLED_NOTIFICATION => {
+                if let Some(id) = cancelled_request_id(&notification) {
+                    self.broker.cancel(&id);
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -5260,6 +5331,258 @@ mod tests {
         );
         assert!(matches!(second, JsonRpcMessage::Request(ref r) if r.method == "ping"));
         assert!(server.broker.next_deferred().is_none());
+    }
+
+    //
+    // Cancelled server-initiated requests
+    //
+
+    /// The notification a client sends to withdraw `id`.
+    fn cancellation_of(id: &RequestId) -> JsonRpcNotification {
+        JsonRpcNotification {
+            jsonrpc: Default::default(),
+            method: "notifications/cancelled".to_string(),
+            params: Some(serde_json::json!({
+                "requestId": id,
+                "reason": "the user closed the form"
+            })),
+        }
+    }
+
+    #[test]
+    fn test_a_cancellation_names_the_request_it_withdraws() {
+        assert_eq!(
+            cancelled_request_id(&cancellation_of(&RequestId::String("sml-3".into()))),
+            Some(RequestId::String("sml-3".into()))
+        );
+        assert_eq!(
+            cancelled_request_id(&cancellation_of(&RequestId::Number(7))),
+            Some(RequestId::Number(7))
+        );
+    }
+
+    #[test]
+    fn test_a_cancellation_we_cannot_read_names_nothing() {
+        // Lifecycle §Cancellation lets the receiver ignore a malformed one, and
+        // there is nothing else to do with a shape that has no id in it.
+        let shapes = [
+            JsonRpcNotification {
+                jsonrpc: Default::default(),
+                method: "notifications/cancelled".to_string(),
+                params: None,
+            },
+            JsonRpcNotification {
+                jsonrpc: Default::default(),
+                method: "notifications/cancelled".to_string(),
+                params: Some(serde_json::json!({ "reason": "no id here" })),
+            },
+            JsonRpcNotification {
+                jsonrpc: Default::default(),
+                method: "notifications/cancelled".to_string(),
+                params: Some(serde_json::json!({ "requestId": { "not": "an id" } })),
+            },
+            JsonRpcNotification {
+                jsonrpc: Default::default(),
+                method: "notifications/progress".to_string(),
+                params: Some(serde_json::json!({ "requestId": "sml-0" })),
+            },
+        ];
+
+        for shape in shapes {
+            assert_eq!(cancelled_request_id(&shape), None, "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_cancellation_wakes_a_waiter_on_another_thread() {
+        // A task worker blocks on a channel rather than reading, so the only
+        // way it hears anything is the reading thread routing it. This used to
+        // be dropped, and the worker sat out the whole `request_timeout` - two
+        // minutes - for an answer the client had already withdrawn.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let id = server.broker.next_request_id();
+        let receiver = server.broker.register_waiter(&id);
+
+        server.handle_notification(cancellation_of(&id)).unwrap();
+
+        assert!(
+            matches!(
+                receiver.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the waiter must be woken, not left on the clock"
+        );
+    }
+
+    #[test]
+    fn test_an_answer_after_a_cancellation_is_discarded() {
+        // The other half of abandoning: a client that cancels and then answers
+        // anyway must not have that answer kept for the next waiter.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let id = server.broker.next_request_id();
+
+        server.handle_notification(cancellation_of(&id)).unwrap();
+        server.broker.park(JsonRpcResponse {
+            jsonrpc: Default::default(),
+            id: id.clone(),
+            result: Some(serde_json::json!({ "action": "accept" })),
+            error: None,
+        });
+
+        assert!(server.broker.take_parked(&id).is_none());
+    }
+
+    #[test]
+    fn test_a_cancellation_for_the_clients_own_request_leaves_our_waiters_alone() {
+        // `notifications/cancelled` travels both ways. One naming a request the
+        // *client* sent says nothing about anything waiting here.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let ours = server.broker.next_request_id();
+        let receiver = server.broker.register_waiter(&ours);
+
+        server
+            .handle_notification(cancellation_of(&RequestId::Number(41)))
+            .unwrap();
+
+        assert!(
+            matches!(
+                receiver.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a waiter for a different request must still be waiting"
+        );
+    }
+
+    #[test]
+    fn test_an_unparseable_cancellation_is_ignored_rather_than_fatal() {
+        // It arrives on the same loop as everything else, and a client that
+        // sends nonsense must not end the session with it.
+        let mut server: Server<TestContext> = Server::new(ServerConfig::default());
+        let id = server.broker.next_request_id();
+        let receiver = server.broker.register_waiter(&id);
+
+        let result = server.handle_notification(JsonRpcNotification {
+            jsonrpc: Default::default(),
+            method: "notifications/cancelled".to_string(),
+            params: Some(serde_json::json!({ "requestId": ["not", "an", "id"] })),
+        });
+
+        assert!(result.is_ok());
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "nothing was delivered"
+        );
+    }
+
+    #[test]
+    fn test_a_cancellation_ends_the_wait_it_names() {
+        // Here the waiter is the only reader, so it is the one that sees the
+        // cancellation - and it has to act on it rather than set it aside,
+        // because the loop that would handle it is the one this wait is
+        // holding up. `sml-0` is the first id a fresh broker issues.
+        let cancelled = JsonRpcMessage::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({
+                "requestId": "sml-0",
+                "reason": "the user closed the form"
+            })),
+        );
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "accept" })])
+            .with_injected(vec![cancelled]);
+        let (server, written, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        let started = std::time::Instant::now();
+        let result = env.elicit_form("m", serde_json::json!({}));
+
+        let Err(error) = result else {
+            panic!("a cancelled elicitation must not come back with a result");
+        };
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must end with the cancellation, not with the timeout"
+        );
+
+        // Nothing is echoed back: the client is the one that cancelled, and
+        // telling it so is noise on a request that is already closed.
+        let notifications: Vec<_> = written
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|message| match message {
+                JsonRpcMessage::Notification(n) => Some(n.method.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !notifications
+                .iter()
+                .any(|method| method == "notifications/cancelled"),
+            "{notifications:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_late_answer_to_a_cancelled_request_is_not_mistaken_for_the_next_one() {
+        // The cancelled request is abandoned as the wait ends, so an answer
+        // that turns up afterwards has nowhere to be kept.
+        let cancelled = JsonRpcMessage::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({ "requestId": "sml-0" })),
+        );
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "accept" })])
+            .with_injected(vec![cancelled]);
+        let (server, _w, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        assert!(env.elicit_form("m", serde_json::json!({})).is_err());
+
+        server.broker.park(JsonRpcResponse {
+            jsonrpc: Default::default(),
+            id: RequestId::String("sml-0".into()),
+            result: Some(serde_json::json!({ "action": "accept" })),
+            error: None,
+        });
+        assert!(
+            server
+                .broker
+                .take_parked(&RequestId::String("sml-0".into()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_a_cancellation_for_another_request_is_still_deferred() {
+        // Only the wait it names ends. Anything else is a client message the
+        // main loop is owed, exactly as before.
+        let stray = JsonRpcMessage::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({ "requestId": 41 })),
+        );
+        let transport = ScriptedTransport::new(vec![serde_json::json!({ "action": "accept" })])
+            .with_injected(vec![stray]);
+        let (server, _w, _t) = scripted_server(
+            serde_json::json!({ "elicitation": { "form": {} } }),
+            transport,
+        );
+
+        let env = server.tool_env();
+        let result = env.elicit_form("m", serde_json::json!({})).unwrap();
+
+        assert!(result.accepted(), "the elicitation runs to its answer");
+        assert!(matches!(
+            server.broker.next_deferred(),
+            Some(JsonRpcMessage::Notification(n)) if n.method == "notifications/cancelled"
+        ));
     }
 
     #[test]

@@ -875,8 +875,13 @@ impl<C: Send + Sync + 'static> HttpServer<C> {
 
         // Discovery must work before the client has a token, so this endpoint
         // is deliberately unauthenticated - it contains nothing secret.
-        if !matches!(request.method(), Method::Get) {
-            return Some(method_not_allowed("GET"));
+        //
+        // HEAD is answered as well as GET: it is the same response with the
+        // body left off, which the layer below already does for a HEAD request,
+        // and a client probing the endpoint should not be told the method is
+        // not allowed where the GET beside it is.
+        if !matches!(request.method(), Method::Get | Method::Head) {
+            return Some(method_not_allowed("GET, HEAD"));
         }
 
         let body = serde_json::to_string(metadata).ok()?;
@@ -4674,6 +4679,82 @@ mod http_server_tests {
                 &[],
             )
             .unwrap();
+            assert_eq!(status, 405);
+        }
+
+        #[test]
+        fn test_metadata_endpoint_names_both_methods_it_allows() {
+            // RFC 9110 §15.5.6 requires the `Allow` header on a 405, and a
+            // client reading it should be told about HEAD as well as GET.
+            let addr = spawn_protected_server();
+
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = format!(
+                "DELETE /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\n\
+                 Host: {}\r\nConnection: close\r\n\r\n",
+                addr
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+
+            assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+            assert!(
+                response
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("Allow: GET, HEAD")),
+                "{response}"
+            );
+        }
+
+        #[test]
+        fn test_metadata_endpoint_answers_head_like_get() {
+            // Same answer as the GET beside it, with the body left off. A
+            // client - or an intermediary - probing the endpoint should not be
+            // told the method is not allowed on a document that is there.
+            let addr = spawn_protected_server();
+
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = format!(
+                "HEAD /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\n\
+                 Host: {}\r\nConnection: close\r\n\r\n",
+                addr
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+            let (head, body) = response
+                .split_once("\r\n\r\n")
+                .expect("a response has a header section");
+            assert!(
+                head.to_lowercase()
+                    .contains("content-type: application/json"),
+                "{head}"
+            );
+            assert!(
+                head.to_lowercase().contains("content-length: "),
+                "the length the body would have had is still declared: {head}"
+            );
+            assert!(body.is_empty(), "a HEAD response carries no body: {body:?}");
+        }
+
+        #[test]
+        fn test_head_on_the_mcp_endpoint_is_still_refused() {
+            // The metadata document is a document; the MCP endpoint is not, and
+            // allowing HEAD there would be answering a request this transport
+            // has no answer for.
+            let addr = spawn_protected_server();
+            let (status, _, _) = http_request(&addr, "HEAD", "/mcp", "", &[]).unwrap();
+
             assert_eq!(status, 405);
         }
 
