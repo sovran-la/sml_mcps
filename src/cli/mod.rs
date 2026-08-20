@@ -12,20 +12,27 @@
 //! edits.
 //!
 //! ```no_run
-//! use sml_mcps::cli::{Cli, ServerEntry, SubCommand};
+//! use sml_mcps::cli::{Cli, ServerEntry, SubCommand, home_dir};
 //!
 //! fn main() -> std::process::ExitCode {
+//!     let data_dir = home_dir().unwrap_or_default().join(".my-mcp");
+//!
 //!     Cli::new(ServerEntry::new("my-mcp", &["serve"]))
 //!         .description("An MCP server for doing cool stuff")
-//!         .on_install(|_args| {
-//!             // whatever this server needs on disk before a client points
-//!             // at it; an error here stops the install
-//!             std::fs::create_dir_all("/tmp/my-mcp")?;
-//!             Ok(())
+//!         .on_install({
+//!             let data_dir = data_dir.clone();
+//!             move |_args| {
+//!                 // whatever this server needs on disk before a client points
+//!                 // at it; an error here stops the install. Under the user's
+//!                 // own directory rather than a shared one, for the same
+//!                 // reason `user_socket_path` exists.
+//!                 std::fs::create_dir_all(&data_dir)?;
+//!                 Ok(())
+//!             }
 //!         })
-//!         .on_uninstall(|_args| {
+//!         .on_uninstall(move |_args| {
 //!             // and what to do about it once the entries are gone
-//!             std::fs::remove_dir_all("/tmp/my-mcp")?;
+//!             std::fs::remove_dir_all(&data_dir)?;
 //!             Ok(())
 //!         })
 //!         .on_serve(|_args| {
