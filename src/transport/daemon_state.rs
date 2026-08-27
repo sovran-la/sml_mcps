@@ -107,9 +107,9 @@ impl Drop for ActiveGuard {
 
 /// Ask the daemon to stop, and unpark anything waiting for a client.
 ///
-/// Both watchers and the teardown in `run` go through here, so "stop the
-/// daemon" is one code path that knows about every listener rather than three
-/// that each know about the socket path.
+/// The signal watcher, the idle watcher and the accept loops on their way out
+/// all go through here, so "stop the daemon" is one code path that knows about
+/// every listener rather than three that each know about the socket path.
 ///
 /// The flag goes up before the knocking, so a connection a `wake` produces is
 /// refused by the accept loop rather than served.

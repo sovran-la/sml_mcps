@@ -304,3 +304,34 @@ release build all clean.
 - **Renaming `UnixServer`.** It grows non-Unix listeners and keeps its name,
   because the alternative is a breaking change to three shipped consumers for a
   noun.
+
+## As built
+
+Four differences from the plan above, all found while writing it:
+
+- **`src/transport/daemon_state.rs` is a fifth new module.** The connection
+  bookkeeping, the shutdown request and the idle decision belong to no single
+  listener, and most of this branch's new code landed on top of them - which
+  would have taken `unix_server.rs` from 1600 lines to 2000. Split out, it is
+  666 lines against that file's 1369, and the state machine reads on its own.
+- **`describe` moved there too**, since it is about listeners as a collection
+  rather than about serving on one.
+- **`run`'s teardown no longer calls `request_shutdown`.** `serve_listeners`
+  flags it on every path back, so the second call was dead and the comment
+  explaining it was wrong.
+- **The `Listener` doc example is the whole mTLS shape**, and
+  `examples/multi_listener.rs` is a runnable version of it, because the
+  handoff is the deliverable as much as the API is.
+
+Everything else landed as described, including the two things worth
+double-checking after the fact: `UnixTransport`'s test suite passes verbatim
+over the shared generic, and `tests/daemon_lifecycle.rs` and
+`tests/serve_daemon_e2e.rs` are untouched.
+
+Every guard this branch adds was mutation-checked - the veto itself, the state
+re-check after it, dropping the lock before asking, waking the listeners, the
+loopback substitution, `TCP_NODELAY`, and `StreamTransport` reporting that it
+cannot split. No survivors. One of them is worth writing down: the *live* test
+for the loopback substitution cannot kill its mutant, because a kernel will
+route a connection to `0.0.0.0` to loopback anyway - the unit test that pins
+the chosen address is the one doing the work there.
