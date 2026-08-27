@@ -19,7 +19,7 @@
 use crate::bridge::Bridge;
 use crate::server::Server;
 use crate::socket::ensure_private_parent_dir;
-use crate::transport::unix_server::BusyCheck;
+use crate::transport::daemon_state::BusyCheck;
 use crate::transport::{Listener, StdioTransport, Transport, UnixServer};
 use crate::types::{McpError, Result};
 use std::fmt;

@@ -16,6 +16,9 @@ mod http;
 mod http1;
 
 #[cfg(unix)]
+pub(crate) mod daemon_state;
+
+#[cfg(unix)]
 mod listener;
 
 #[cfg(unix)]
@@ -25,7 +28,7 @@ mod signals;
 mod unix;
 
 #[cfg(unix)]
-pub(crate) mod unix_server;
+mod unix_server;
 
 pub use line::MAX_MESSAGE_BYTES;
 pub use origin::OriginPolicy;
