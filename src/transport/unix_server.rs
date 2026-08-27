@@ -1,4 +1,4 @@
-//! Unix Socket Server (daemon listener)
+//! Daemon listener (a Unix socket, and anything else it is given)
 //!
 //! Mirrors [`HttpServer`](crate::HttpServer) but over a Unix domain socket.
 //! Binds a [`UnixListener`], accepts connections, and spawns one
@@ -13,6 +13,13 @@
 //! - both honor [`UnixServer::idle_timeout`] - exit after N idle seconds so a
 //!   model-heavy daemon doesn't linger forever after the last client leaves.
 //!
+//! Two things can be added to that:
+//! - [`UnixServer::listener`] - more places connections may arrive from, on
+//!   equal terms with the Unix socket: same connection ceiling, same idle
+//!   clock, same per-connection server. See [`Listener`].
+//! - [`UnixServer::busy_check`] - a veto on idle exit, for a daemon whose work
+//!   outlives the client session that asked for it.
+//!
 //! For the whole pattern - this, the shim in front of it, and the `argv`
 //! dispatch that picks between them - in one call, see
 //! [`Server::serve_daemon`](crate::Server::serve_daemon).
@@ -21,18 +28,36 @@
 
 use crate::server::{Server, ServerConfig};
 use crate::socket::{ensure_private_parent_dir, owned_by_current_user};
-use crate::transport::UnixTransport;
+use crate::transport::signals::install_signal_handlers;
+use crate::transport::{Listener, Transport, UnixSocketListener};
 use crate::types::{McpError, Result};
 use std::io::{self, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 /// Setup function type for configuring tools on each connection.
 type SetupFn<C> = Box<dyn Fn(&mut Server<C>) -> Result<()> + Send + Sync>;
+
+/// Asks the application whether it still has work in hand.
+///
+/// See [`UnixServer::busy_check`]. Shared rather than owned because the idle
+/// watcher runs on its own thread and the daemon holds one of these across
+/// both.
+pub(crate) type BusyCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Connection bookkeeping, shared by every accept loop and both watchers.
+type Shared = Arc<(Mutex<ConnState>, Condvar)>;
+
+/// Every listener the daemon is serving on, **the primary Unix socket first**.
+///
+/// That order is load-bearing in one place: the primary's accept loop runs on
+/// the calling thread, so `serve` blocks exactly the way it always has, and
+/// every other listener gets a thread of its own.
+type Listeners = Vec<Arc<dyn Listener>>;
 
 /// Live connections allowed at once, by default.
 ///
@@ -50,161 +75,6 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 /// Long enough that a descriptor shortage cannot become a hot loop, short
 /// enough that a daemon recovers the moment there is room again.
 const ACCEPT_RETRY: Duration = Duration::from_millis(10);
-
-// ---- signal handling -----------------------------------------------------
-
-/// Write end of the self-pipe used by the signal handler. -1 when inactive.
-static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
-
-/// Signal handler: writes a byte to the self-pipe so the signal watcher
-/// thread can trigger a clean shutdown. Only uses async-signal-safe ops.
-extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
-    let fd = SIGNAL_WRITE_FD.load(Ordering::Relaxed);
-    if fd >= 0 {
-        unsafe {
-            libc::write(fd, b"x" as *const u8 as *const libc::c_void, 1);
-        }
-    }
-}
-
-/// Create a pipe for signal delivery. Returns (read_fd, write_fd).
-fn create_signal_pipe() -> Result<(i32, i32)> {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok((fds[0], fds[1]))
-}
-
-/// Install SIGTERM/SIGINT handlers and spawn a watcher thread that triggers
-/// the existing shutdown mechanism (set `state.shutdown`, self-connect to
-/// unblock accept). Returns a handle to the watcher thread.
-///
-/// On drop/cleanup: close the pipe and reset the global fd, which causes
-/// the watcher thread to exit naturally.
-fn install_signal_handlers(
-    shared: &Arc<(Mutex<ConnState>, Condvar)>,
-    socket_path: &Path,
-) -> Result<SignalGuard> {
-    let (sig_read, sig_write) = create_signal_pipe()?;
-
-    // Publish the write fd so the signal handler can reach it.
-    SIGNAL_WRITE_FD.store(sig_write, Ordering::SeqCst);
-
-    // Register handlers. Save previous handlers for restoration.
-    let prev_term;
-    let prev_int;
-    unsafe {
-        prev_term = libc::signal(
-            libc::SIGTERM,
-            shutdown_signal_handler as *const () as libc::sighandler_t,
-        );
-        prev_int = libc::signal(
-            libc::SIGINT,
-            shutdown_signal_handler as *const () as libc::sighandler_t,
-        );
-    }
-
-    let shared_clone = shared.clone();
-    let socket_clone = socket_path.to_path_buf();
-
-    let watcher = thread::Builder::new()
-        .name("signal-watcher".into())
-        .spawn(move || {
-            // Block until the signal handler writes, or the pipe closes.
-            let mut buf = [0u8; 1];
-            let n = unsafe { libc::read(sig_read, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-            unsafe {
-                libc::close(sig_read);
-            }
-
-            if n > 0 {
-                // Signal received — trigger clean shutdown.
-                let (lock, cv) = &*shared_clone;
-                if let Ok(mut state) = lock.lock() {
-                    state.shutdown = true;
-                    cv.notify_all();
-                }
-                // Unblock accept() via self-connect (same trick as idle_watcher).
-                let _ = UnixStream::connect(&socket_clone);
-            }
-        });
-
-    let watcher = match watcher {
-        Ok(watcher) => watcher,
-        Err(e) => {
-            // Nobody will ever read this pipe now, and the handler is holding
-            // a descriptor pointing into it: without this, both ends leak for
-            // the life of the process and every later signal writes into a
-            // pipe with no reader. Undo the installation in reverse.
-            restore_signal_handlers(prev_term, prev_int, sig_write);
-            // SAFETY: the watcher never started, so nothing else owns the read
-            // end - it is closed here rather than by the thread that would
-            // have been blocked on it.
-            unsafe {
-                libc::close(sig_read);
-            }
-
-            return Err(McpError::Internal(format!(
-                "failed to spawn signal watcher: {}",
-                e
-            )));
-        }
-    };
-
-    Ok(SignalGuard {
-        write_fd: sig_write,
-        prev_term,
-        prev_int,
-        watcher: Some(watcher),
-    })
-}
-
-/// Put the previous signal handlers back, unpublish the pipe, and close the
-/// write end of it.
-///
-/// Shared by [`SignalGuard::drop`] and the spawn-failure path above, because an
-/// installation that never got its watcher has to give back exactly what a
-/// finished one does - and the version that ran when the watcher failed to
-/// start gave back nothing at all.
-///
-/// The order is deliberate: the handlers go back first, so that clearing the
-/// descriptor underneath the handler cannot race a signal arriving.
-fn restore_signal_handlers(
-    prev_term: libc::sighandler_t,
-    prev_int: libc::sighandler_t,
-    write_fd: i32,
-) {
-    unsafe {
-        libc::signal(libc::SIGTERM, prev_term);
-        libc::signal(libc::SIGINT, prev_int);
-    }
-
-    SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
-    unsafe {
-        libc::close(write_fd);
-    }
-}
-
-/// RAII guard that restores signal handlers and cleans up the pipe on drop.
-struct SignalGuard {
-    write_fd: i32,
-    prev_term: libc::sighandler_t,
-    prev_int: libc::sighandler_t,
-    watcher: Option<thread::JoinHandle<()>>,
-}
-
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        // Closing the write end is also how the watcher is told to stop: if it
-        // is still blocked on `read`, it gets EOF and exits cleanly.
-        restore_signal_handlers(self.prev_term, self.prev_int, self.write_fd);
-
-        if let Some(w) = self.watcher.take() {
-            let _ = w.join();
-        }
-    }
-}
 
 /// Monotonic source of per-connection identifiers.
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -241,6 +111,10 @@ impl ConnState {
     /// descriptors, and a process that runs out of either is not the process
     /// that opened them. Without it the loop walked itself to `EMFILE`, where
     /// `accept` fails and the daemon used to exit.
+    ///
+    /// One count for the whole daemon, not one per listener: threads and
+    /// descriptors are a process's, and a ceiling that a peer could multiply
+    /// by opening a second kind of connection would not be one.
     fn admit(&mut self, max: usize) -> Admission {
         if self.shutdown {
             return Admission::ShuttingDown;
@@ -263,7 +137,7 @@ impl ConnState {
 /// Decrements the active-connection count when a connection thread exits,
 /// even on panic (RAII). Without this an unwinding handler would leave the
 /// daemon thinking a client is still connected and never idle-out.
-struct ActiveGuard(Arc<(Mutex<ConnState>, Condvar)>);
+struct ActiveGuard(Shared);
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
@@ -295,6 +169,12 @@ pub struct UnixServer<C> {
     setup: Option<SetupFn<C>>,
     idle_timeout: Option<Duration>,
     max_connections: usize,
+    /// Listeners beyond the Unix socket. Empty is the default and is exactly
+    /// the daemon this type has always been.
+    listeners: Listeners,
+    /// The application's veto on idle exit. `None` means the idle clock is the
+    /// only thing consulted, which is what it always was.
+    busy_check: Option<BusyCheck>,
 }
 
 impl<C: Send + Sync + 'static> UnixServer<C> {
@@ -305,6 +185,8 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
             setup: None,
             idle_timeout: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            listeners: Vec::new(),
+            busy_check: None,
         }
     }
 
@@ -324,6 +206,10 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
     /// Default: `None` (run forever). Recommended for model-heavy daemons so
     /// closing and reopening a terminal a few seconds apart doesn't reload
     /// multi-GB state.
+    ///
+    /// "Idle" means no live connections, on any listener. A daemon whose work
+    /// carries on after the client that asked for it has gone wants
+    /// [`busy_check`](Self::busy_check) as well.
     pub fn idle_timeout(mut self, duration: Duration) -> Self {
         self.idle_timeout = Some(duration);
         self
@@ -337,10 +223,89 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
     /// because the accept loop is the one thread that must never wait on a
     /// peer's reading pace.
     ///
+    /// One ceiling for the daemon, counted across every listener.
+    ///
     /// Zero is raised to one - a daemon that serves nobody is not a
     /// configuration anyone means.
     pub fn max_connections(mut self, connections: usize) -> Self {
         self.max_connections = connections.max(1);
+        self
+    }
+
+    /// Accept connections from here as well as from the Unix socket.
+    ///
+    /// May be called more than once. Every listener shares this daemon's
+    /// connection ceiling, its idle clock, and its per-connection server
+    /// setup - the only thing that differs is where the bytes came from.
+    ///
+    /// The listener is given a thread of its own; the Unix socket keeps the
+    /// calling thread, so [`serve`](Self::serve) blocks exactly as before.
+    ///
+    /// ```ignore
+    /// UnixServer::new(config)
+    ///     .listener(TcpSocketListener::bind("127.0.0.1:7743")?)
+    ///     .serve(socket_path, |conn_id| AppContext::new(conn_id))
+    /// ```
+    ///
+    /// See [`Listener`] for what implementing one costs - it is how a daemon
+    /// gets mTLS without this crate having a TLS dependency.
+    pub fn listener(self, listener: impl Listener) -> Self {
+        self.shared_listener(Arc::new(listener))
+    }
+
+    /// [`listener`](Self::listener) for one that is already shared.
+    ///
+    /// What [`DaemonOptions`](crate::DaemonOptions) hands over, having boxed
+    /// the listener when it was given one.
+    pub(crate) fn shared_listener(mut self, listener: Arc<dyn Listener>) -> Self {
+        self.listeners.push(listener);
+        self
+    }
+
+    /// Let the application veto idle exit while it still has work in hand.
+    ///
+    /// [`idle_timeout`](Self::idle_timeout) counts connections, which is the
+    /// right measure for a daemon that only works while a client is asking it
+    /// to. A daemon supervising something that outlives the session - a child
+    /// process, a background job - would idle out from under it. With a busy
+    /// check installed, the daemon exits only when it has been idle for the
+    /// whole window **and** `is_busy` answers `false`.
+    ///
+    /// ```ignore
+    /// let agents = registry.clone();
+    /// UnixServer::new(config)
+    ///     .idle_timeout(Duration::from_secs(300))
+    ///     .busy_check(move || agents.any_running())
+    /// ```
+    ///
+    /// The details worth knowing:
+    ///
+    /// - It is asked only at the moment the daemon is about to exit for being
+    ///   idle, and only then. A veto costs one more idle window: the watcher
+    ///   re-arms and asks again after `idle_timeout`, so the poll interval is
+    ///   that timeout and not a second knob.
+    /// - **SIGTERM and SIGINT are not vetoable.** "Stop now" means now; this
+    ///   is a guard on the daemon's own decision to leave, not on the
+    ///   operator's.
+    /// - It runs on the idle watcher's thread with no lock of ours held, so it
+    ///   may take whatever locks it likes - but it should be quick, since the
+    ///   idle decision waits on it.
+    /// - Without [`idle_timeout`](Self::idle_timeout) there is no idle exit to
+    ///   veto, and this is never called.
+    /// - A panic inside it kills the watcher thread, which leaves the daemon
+    ///   up for good. That is the safe direction to fail - the work survives,
+    ///   and an operator can still signal it - but it is a bug in the
+    ///   predicate either way.
+    pub fn busy_check<F>(self, is_busy: F) -> Self
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        self.shared_busy_check(Arc::new(is_busy))
+    }
+
+    /// [`busy_check`](Self::busy_check) for a predicate that is already shared.
+    pub(crate) fn shared_busy_check(mut self, is_busy: BusyCheck) -> Self {
+        self.busy_check = Some(is_busy);
         self
     }
 
@@ -390,6 +355,8 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
             setup,
             idle_timeout,
             max_connections,
+            listeners: extra,
+            busy_check,
         } = self;
 
         // The directory the socket goes in, private to this user, before
@@ -400,21 +367,29 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
         // Clear a stale socket (or refuse if a live server owns it).
         prepare_socket_path(&socket_path)?;
 
-        let listener = UnixListener::bind(&socket_path).map_err(|e| {
+        let bound = UnixListener::bind(&socket_path).map_err(|e| {
             McpError::Internal(format!("failed to bind {}: {}", socket_path.display(), e))
         })?;
 
+        // Primary first: see `Listeners`.
+        let mut listeners: Listeners = Vec::with_capacity(extra.len() + 1);
+        listeners.push(Arc::new(UnixSocketListener::new(bound, &socket_path)));
+        listeners.extend(extra);
+
         let setup = setup.map(Arc::new);
         let factory = Arc::new(context_factory);
-        let shared: Arc<(Mutex<ConnState>, Condvar)> =
-            Arc::new((Mutex::new(ConnState::default()), Condvar::new()));
+        let shared: Shared = Arc::new((Mutex::new(ConnState::default()), Condvar::new()));
 
-        // Signal handling: SIGTERM/SIGINT trigger a clean shutdown via the
-        // same self-connect mechanism the idle watcher uses. The SignalGuard
+        // Signal handling: SIGTERM/SIGINT flag the shutdown and wake every
+        // listener, through the same path the idle watcher uses. The guard
         // restores previous handlers on drop. Installed BEFORE the PID file
         // is written so that signals are handled from the moment external
         // processes can discover the daemon's PID.
-        let _signal_guard = install_signal_handlers(&shared, &socket_path)?;
+        let _signal_guard = {
+            let shared = shared.clone();
+            let listeners = listeners.clone();
+            install_signal_handlers(move || request_shutdown(&shared, &listeners))?
+        };
 
         // Daemon mode: now that we own the socket and signal handlers are
         // installed, publish the PID and detach stdio. Writing the PID after
@@ -427,19 +402,19 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
         eprintln!(
             "MCP Unix server `{}` listening on {}",
             config.name,
-            socket_path.display()
+            describe(&listeners)
         );
 
         // Optional idle watcher: exits the daemon after `idle_timeout` of zero
-        // connections. Wakes the accept loop by self-connecting the socket.
+        // connections, unless `busy_check` says otherwise.
         let watcher = idle_timeout.map(|timeout| {
             let shared = shared.clone();
-            let socket_path = socket_path.clone();
-            thread::spawn(move || idle_watcher(shared, timeout, socket_path))
+            let listeners = listeners.clone();
+            thread::spawn(move || idle_watcher(shared, timeout, listeners, busy_check))
         });
 
-        let result = accept_loop(
-            &listener,
+        let result = serve_listeners(
+            &listeners,
             &shared,
             max_connections,
             &config,
@@ -448,13 +423,9 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
         );
 
         // Make sure the watcher stops even if we exited for a non-idle reason.
-        {
-            let (lock, cv) = &*shared;
-            if let Ok(mut state) = lock.lock() {
-                state.shutdown = true;
-                cv.notify_all();
-            }
-        }
+        // `serve_listeners` has already flagged this, but not when it failed
+        // before reaching the accept loop at all.
+        request_shutdown(&shared, &listeners);
         if let Some(w) = watcher {
             let _ = w.join();
         }
@@ -464,11 +435,90 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
     }
 }
 
+/// Accept on every listener until the daemon is asked to stop.
+///
+/// The first listener keeps this thread - so `serve` blocks, and a daemon with
+/// no extra listeners spawns nothing it did not spawn before - and every other
+/// one gets a thread. Returns when the primary loop does, once the rest have
+/// been woken and joined.
+fn serve_listeners<C, F>(
+    listeners: &Listeners,
+    shared: &Shared,
+    max_connections: usize,
+    config: &ServerConfig,
+    setup: &Option<Arc<SetupFn<C>>>,
+    factory: &Arc<F>,
+) -> Result<()>
+where
+    C: Send + Sync + 'static,
+    F: Fn(&str) -> C + Send + Sync + 'static,
+{
+    let (primary, extra) = listeners
+        .split_first()
+        .expect("a daemon always has its Unix socket");
+
+    let mut accepting = Vec::with_capacity(extra.len());
+    let mut refused = None;
+
+    for listener in extra {
+        let name = listener.describe();
+        let listener = listener.clone();
+        let shared = shared.clone();
+        let config = config.clone();
+        let setup = setup.clone();
+        let factory = factory.clone();
+        let reported = name.clone();
+
+        let spawned = thread::Builder::new()
+            .name(format!("accept-{}", name))
+            .spawn(move || {
+                let outcome = accept_loop(
+                    &*listener,
+                    &shared,
+                    max_connections,
+                    &config,
+                    &setup,
+                    &factory,
+                );
+                if let Err(e) = outcome {
+                    eprintln!("listener {} stopped: {}", reported, e);
+                }
+            });
+
+        match spawned {
+            Ok(handle) => accepting.push(handle),
+            // A daemon that was told to listen somewhere and cannot is a
+            // daemon running a configuration nobody asked for. Better to say
+            // so than to serve half of it and look healthy.
+            Err(e) => {
+                refused = Some(McpError::Internal(format!(
+                    "failed to spawn an accept thread for {}: {}",
+                    name, e
+                )));
+                break;
+            }
+        }
+    }
+
+    let result = match refused {
+        Some(e) => Err(e),
+        None => accept_loop(&**primary, shared, max_connections, config, setup, factory),
+    };
+
+    // Whatever ended this, the other listeners are still parked in `accept`.
+    request_shutdown(shared, listeners);
+    for handle in accepting {
+        let _ = handle.join();
+    }
+
+    result
+}
+
 /// Main accept loop. Returns `Ok(())` on a clean shutdown break, `Err` only
 /// where the daemon's own bookkeeping has gone wrong.
 fn accept_loop<C, F>(
-    listener: &UnixListener,
-    shared: &Arc<(Mutex<ConnState>, Condvar)>,
+    listener: &dyn Listener,
+    shared: &Shared,
     max_connections: usize,
     config: &ServerConfig,
     setup: &Option<Arc<SetupFn<C>>>,
@@ -479,14 +529,15 @@ where
     F: Fn(&str) -> C + Send + Sync + 'static,
 {
     loop {
-        let (stream, _addr) = match listener.accept() {
-            Ok(pair) => pair,
+        let transport = match listener.accept() {
+            Ok(transport) => transport,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            // Out of descriptors, or a client that hung up between connecting
-            // and being accepted. Neither is a reason to stop listening, and
-            // neither is a reason to spin: a hot loop on `EMFILE` is its own
-            // outage. This used to end the daemon on the first one, which is
-            // exactly what a reconnect loop had to do to take it down.
+            // Out of descriptors, a client that hung up between connecting
+            // and being accepted, a handshake the peer failed. None is a
+            // reason to stop listening, and none is a reason to spin: a hot
+            // loop on `EMFILE` is its own outage. This used to end the daemon
+            // on the first one, which is exactly what a reconnect loop had to
+            // do to take it down.
             Err(_) => {
                 thread::sleep(ACCEPT_RETRY);
                 if shutdown_requested(shared) {
@@ -502,10 +553,10 @@ where
             // come back. Saying more would mean writing to a peer from the one
             // thread that must never wait on one.
             Admission::Full => {
-                drop(stream);
+                drop(transport);
                 continue;
             }
-            // The idle watcher or a signal self-connected to wake us.
+            // The idle watcher or a signal woke us on the way out.
             Admission::ShuttingDown => break,
         }
 
@@ -515,9 +566,9 @@ where
         let factory = factory.clone();
         let shared_thread = shared.clone();
 
-        let spawn = thread::Builder::new()
-            .name(conn_id.clone())
-            .spawn(move || handle_connection(stream, conn_id, cfg, setup, factory, shared_thread));
+        let spawn = thread::Builder::new().name(conn_id.clone()).spawn(move || {
+            handle_connection(transport, conn_id, cfg, setup, factory, shared_thread)
+        });
 
         if let Err(e) = spawn {
             eprintln!("failed to spawn connection thread: {}", e);
@@ -531,8 +582,39 @@ where
     Ok(())
 }
 
+/// Ask the daemon to stop, and unpark anything waiting for a client.
+///
+/// Both watchers and the teardown in `run` go through here, so "stop the
+/// daemon" is one code path that knows about every listener rather than three
+/// that each know about the socket path.
+///
+/// The flag goes up before the knocking, so a connection a `wake` produces is
+/// refused by the accept loop rather than served.
+fn request_shutdown(shared: &Shared, listeners: &[Arc<dyn Listener>]) {
+    {
+        let (lock, cv) = &**shared;
+        if let Ok(mut state) = lock.lock() {
+            state.shutdown = true;
+            cv.notify_all();
+        }
+    }
+
+    for listener in listeners {
+        let _ = listener.wake();
+    }
+}
+
+/// Every listener, as one line for the daemon's startup message.
+fn describe(listeners: &[Arc<dyn Listener>]) -> String {
+    listeners
+        .iter()
+        .map(|listener| listener.describe())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Take a slot for an accepted connection, under the lock.
-fn admit(shared: &Arc<(Mutex<ConnState>, Condvar)>, max: usize) -> Result<Admission> {
+fn admit(shared: &Shared, max: usize) -> Result<Admission> {
     let (lock, cv) = &**shared;
     let mut state = lock
         .lock()
@@ -547,7 +629,7 @@ fn admit(shared: &Arc<(Mutex<ConnState>, Condvar)>, max: usize) -> Result<Admiss
 }
 
 /// Give a slot back, for the one exit that has no [`ActiveGuard`] to do it.
-fn release(shared: &Arc<(Mutex<ConnState>, Condvar)>) {
+fn release(shared: &Shared) {
     let (lock, cv) = &**shared;
     if let Ok(mut state) = lock.lock() {
         state.active = state.active.saturating_sub(1);
@@ -559,7 +641,7 @@ fn release(shared: &Arc<(Mutex<ConnState>, Condvar)>) {
 ///
 /// A poisoned lock answers "yes": something panicked while holding the state,
 /// and a loop that cannot read it any more is a loop with no way out.
-fn shutdown_requested(shared: &Arc<(Mutex<ConnState>, Condvar)>) -> bool {
+fn shutdown_requested(shared: &Shared) -> bool {
     let (lock, _) = &**shared;
     lock.lock().map(|state| state.shutdown).unwrap_or(true)
 }
@@ -567,12 +649,12 @@ fn shutdown_requested(shared: &Arc<(Mutex<ConnState>, Condvar)>) -> bool {
 /// Per-connection worker: build a fresh server + context, then run the
 /// blocking MCP loop until the client disconnects.
 fn handle_connection<C, F>(
-    stream: UnixStream,
+    transport: Box<dyn Transport>,
     conn_id: String,
     config: ServerConfig,
     setup: Option<Arc<SetupFn<C>>>,
     factory: Arc<F>,
-    shared: Arc<(Mutex<ConnState>, Condvar)>,
+    shared: Shared,
 ) where
     C: Send + Sync + 'static,
     F: Fn(&str) -> C,
@@ -590,27 +672,16 @@ fn handle_connection<C, F>(
         }
     }
 
-    // Fallibly, because the descriptor this needs a second of is the one the
-    // process has run out of when it fails - and a daemon that panics one
-    // connection thread at a time under that pressure is a daemon printing
-    // backtraces where it could be declining politely.
-    let transport = match UnixTransport::try_from_stream(stream) {
-        Ok(transport) => transport,
-        Err(e) => {
-            eprintln!("[{}] connection dropped: {}", conn_id, e);
-            return;
-        }
-    };
-
     if let Err(e) = server.start(transport, context) {
         eprintln!("[{}] connection closed: {}", conn_id, e);
     }
 }
 
 /// Idle watcher thread. Sleeps until the daemon has been idle (zero
-/// connections) for `timeout`, then requests shutdown and wakes the accept
-/// loop. A new connection arriving during the window cancels the countdown.
-fn idle_watcher(shared: Arc<(Mutex<ConnState>, Condvar)>, timeout: Duration, socket_path: PathBuf) {
+/// connections) for `timeout`, then requests shutdown and wakes the listeners.
+/// A new connection arriving during the window cancels the countdown, and so
+/// does a `busy` that answers `true`.
+fn idle_watcher(shared: Shared, timeout: Duration, listeners: Listeners, busy: Option<BusyCheck>) {
     let (lock, cv) = &*shared;
     loop {
         let mut state = match lock.lock() {
@@ -640,17 +711,38 @@ fn idle_watcher(shared: Arc<(Mutex<ConnState>, Condvar)>, timeout: Duration, soc
         if state.shutdown {
             return;
         }
-        if res.timed_out() && state.active == 0 && state.generation == gen_at_idle {
-            // Genuinely idle for the whole window - shut down.
-            state.shutdown = true;
-            cv.notify_all();
-            drop(state);
-            // Unblock the accept loop's blocking `accept()` so it observes the
-            // shutdown flag and returns.
-            let _ = UnixStream::connect(&socket_path);
-            return;
+        if !(res.timed_out() && state.active == 0 && state.generation == gen_at_idle) {
+            // Activity arrived; loop and re-evaluate from the top.
+            continue;
         }
-        // Otherwise activity arrived; loop and re-evaluate from the top.
+
+        // Nobody has connected for the whole window. The connection count is
+        // the daemon's own measure of idleness; the application may have a
+        // better one, and this is the only moment it is asked for it.
+        if let Some(check) = busy.as_ref() {
+            // Never under our lock: it is application code, it may take locks
+            // of its own, and holding this one would stall every accept.
+            drop(state);
+            let busy_now = check();
+
+            state = match lock.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if state.shutdown {
+                return;
+            }
+            // A veto costs another window, not the daemon. So does a client
+            // that arrived while the predicate was running.
+            if busy_now || state.active != 0 || state.generation != gen_at_idle {
+                continue;
+            }
+        }
+
+        // Genuinely idle for the whole window, and nothing is holding us.
+        drop(state);
+        request_shutdown(&shared, &listeners);
+        return;
     }
 }
 
@@ -1154,8 +1246,9 @@ mod tests {
         // into. The loop has to keep listening through it - and still notice a
         // shutdown, rather than being wedged in the retry.
         let sock = temp_socket();
-        let listener = UnixListener::bind(&sock).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let raw = UnixListener::bind(&sock).unwrap();
+        raw.set_nonblocking(true).unwrap();
+        let listener = UnixSocketListener::new(raw, &sock);
 
         let shared: Arc<(Mutex<ConnState>, Condvar)> =
             Arc::new((Mutex::new(ConnState::default()), Condvar::new()));
@@ -1204,58 +1297,10 @@ mod tests {
     }
 
     //
-    // Signal handling
+    // Signal handling lives in `crate::transport::signals` now, and so do its
+    // tests: what it owes this module is one call when a signal lands, which
+    // `run` turns into `request_shutdown`.
     //
-
-    #[test]
-    fn test_restoring_the_handlers_closes_the_pipe_it_published() {
-        // What the spawn-failure path leans on. Without it, a daemon whose
-        // watcher thread never started leaked both ends of the pipe and left
-        // the signal handler holding a descriptor nobody would ever read.
-        let (read_fd, write_fd) = create_signal_pipe().unwrap();
-        let published = SIGNAL_WRITE_FD.swap(write_fd, Ordering::SeqCst);
-
-        // `SIG_DFL` both ways: nothing in this suite installs a handler that
-        // outlives its own server, and nothing here sends a signal.
-        restore_signal_handlers(libc::SIG_DFL, libc::SIG_DFL, write_fd);
-
-        assert_eq!(
-            SIGNAL_WRITE_FD.load(Ordering::SeqCst),
-            -1,
-            "the handler must not be left pointing at a closed pipe"
-        );
-        assert!(is_closed(write_fd), "the write end must not be left open");
-        assert!(
-            !is_closed(read_fd),
-            "the read end belongs to whoever is blocked on it, or to the \
-             spawn-failure path"
-        );
-
-        // Which is what that path then does with it.
-        unsafe { libc::close(read_fd) };
-        assert!(is_closed(read_fd));
-
-        SIGNAL_WRITE_FD.store(published, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn test_a_signal_pipe_has_two_usable_ends() {
-        let (read_fd, write_fd) = create_signal_pipe().unwrap();
-
-        assert!(!is_closed(read_fd));
-        assert!(!is_closed(write_fd));
-        assert_ne!(read_fd, write_fd);
-
-        unsafe {
-            libc::close(read_fd);
-            libc::close(write_fd);
-        }
-    }
-
-    /// Whether `fd` is closed, asked the only way a process can ask.
-    fn is_closed(fd: i32) -> bool {
-        unsafe { libc::fcntl(fd, libc::F_GETFD) == -1 }
-    }
 
     #[test]
     fn test_write_pid_file_and_cleanup() {

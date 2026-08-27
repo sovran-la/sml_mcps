@@ -10,14 +10,21 @@
 //! [`Server::serve_daemon`] is those forty lines. Build the server as usual,
 //! then hand it a socket path, an idle timeout, and a context factory.
 //!
+//! [`Server::serve_daemon_with`] is the same dispatch with everything else the
+//! daemon can be told: more listeners, a connection ceiling, and a veto on
+//! idle exit. See [`DaemonOptions`].
+//!
 //! Unix-only: gated behind `#[cfg(unix)]`, like [`UnixServer`] and [`Bridge`].
 
 use crate::bridge::Bridge;
 use crate::server::Server;
 use crate::socket::ensure_private_parent_dir;
-use crate::transport::{StdioTransport, Transport, UnixServer};
+use crate::transport::unix_server::BusyCheck;
+use crate::transport::{Listener, StdioTransport, Transport, UnixServer};
 use crate::types::{McpError, Result};
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Launch this binary as the detached daemon.
@@ -39,6 +46,132 @@ enum Mode {
     Foreground,
     /// Proxy stdio to a daemon, starting one if none is up.
     Shim,
+}
+
+/// Everything a [`serve_daemon`](Server::serve_daemon) daemon can be told.
+///
+/// [`Server::serve_daemon`] takes the three arguments a daemon always needs.
+/// This is the same thing with the rest of them, for a daemon that listens in
+/// more than one place or has an opinion about when it is allowed to exit:
+///
+/// ```ignore
+/// server.serve_daemon_with(
+///     DaemonOptions::new(user_socket_path("my-daemon", "server.sock"))
+///         .idle_timeout(Duration::from_secs(300))
+///         .listener(TcpSocketListener::bind("100.72.37.20:7743")?)
+///         .busy_check({
+///             let jobs = jobs.clone();
+///             move || jobs.any_running()
+///         }),
+///     move |conn_id| AppContext::new(conn_id, state.clone()),
+/// )
+/// ```
+///
+/// Every field but the socket path is optional, and the defaults are what a
+/// daemon built without this gets - with one difference worth knowing:
+/// [`idle_timeout`](Self::idle_timeout) here defaults to *never* idling out,
+/// which is what a resident service wants, while
+/// [`serve_daemon`](Server::serve_daemon) requires one.
+pub struct DaemonOptions {
+    socket_path: PathBuf,
+    idle_timeout: Option<Duration>,
+    max_connections: Option<usize>,
+    listeners: Vec<Arc<dyn Listener>>,
+    busy_check: Option<BusyCheck>,
+}
+
+impl DaemonOptions {
+    /// A daemon on `socket_path`, with everything else left at its default.
+    ///
+    /// The path decides where the daemon binds in every mode, and where the
+    /// shim looks for it - the same argument
+    /// [`serve_daemon`](Server::serve_daemon) takes.
+    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            idle_timeout: None,
+            max_connections: None,
+            listeners: Vec::new(),
+            busy_check: None,
+        }
+    }
+
+    /// Exit after this long with no connections. Default: never.
+    ///
+    /// See [`UnixServer::idle_timeout`].
+    pub fn idle_timeout(mut self, duration: Duration) -> Self {
+        self.idle_timeout = Some(duration);
+        self
+    }
+
+    /// How many connections may be live at once, across every listener.
+    ///
+    /// Default: [`DEFAULT_MAX_CONNECTIONS`](crate::transport::DEFAULT_MAX_CONNECTIONS).
+    /// See [`UnixServer::max_connections`].
+    pub fn max_connections(mut self, connections: usize) -> Self {
+        self.max_connections = Some(connections);
+        self
+    }
+
+    /// Accept connections from here as well as from the Unix socket.
+    ///
+    /// May be called more than once. See [`UnixServer::listener`] and
+    /// [`Listener`].
+    pub fn listener(mut self, listener: impl Listener) -> Self {
+        self.listeners.push(Arc::new(listener));
+        self
+    }
+
+    /// Let the application veto idle exit while it still has work in hand.
+    ///
+    /// See [`UnixServer::busy_check`], which this is passed straight through
+    /// to - including that a signal is not vetoable, and that without an
+    /// [`idle_timeout`](Self::idle_timeout) there is nothing to veto.
+    pub fn busy_check<F>(mut self, is_busy: F) -> Self
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        self.busy_check = Some(Arc::new(is_busy));
+        self
+    }
+
+    /// Hand these settings to the server that will run them.
+    fn configure<C: Send + Sync + 'static>(self, mut daemon: UnixServer<C>) -> UnixServer<C> {
+        if let Some(timeout) = self.idle_timeout {
+            daemon = daemon.idle_timeout(timeout);
+        }
+        if let Some(connections) = self.max_connections {
+            daemon = daemon.max_connections(connections);
+        }
+        if let Some(is_busy) = self.busy_check {
+            daemon = daemon.shared_busy_check(is_busy);
+        }
+        for listener in self.listeners {
+            daemon = daemon.shared_listener(listener);
+        }
+
+        daemon
+    }
+}
+
+/// Names what was configured, without pretending it can show a closure.
+impl fmt::Debug for DaemonOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DaemonOptions")
+            .field("socket_path", &self.socket_path)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_connections", &self.max_connections)
+            .field(
+                "listeners",
+                &self
+                    .listeners
+                    .iter()
+                    .map(|l| l.describe())
+                    .collect::<Vec<_>>(),
+            )
+            .field("busy_check", &self.busy_check.is_some())
+            .finish()
+    }
 }
 
 impl<C: Send + Sync + 'static> Server<C> {
@@ -114,24 +247,48 @@ impl<C: Send + Sync + 'static> Server<C> {
     where
         F: Fn(&str) -> C + Send + Sync + 'static,
     {
-        self.serve_daemon_from(
-            std::env::args(),
-            socket_path.as_ref(),
-            idle_timeout,
+        self.serve_daemon_with(
+            DaemonOptions::new(socket_path.as_ref()).idle_timeout(idle_timeout),
             context_factory,
         )
     }
 
-    /// [`serve_daemon`](Self::serve_daemon) with the command line supplied
-    /// rather than read from the process.
+    /// [`serve_daemon`](Self::serve_daemon) with everything else the daemon
+    /// can be told.
+    ///
+    /// The same three-mode `argv` dispatch, over a daemon that may listen in
+    /// more than one place and may refuse to idle out. See [`DaemonOptions`];
+    /// nothing about the shim, the socket, or the modes changes.
+    ///
+    /// ```ignore
+    /// server.serve_daemon_with(
+    ///     DaemonOptions::new(user_socket_path("my-daemon", "server.sock"))
+    ///         .idle_timeout(Duration::from_secs(300))
+    ///         .listener(TcpSocketListener::bind("127.0.0.1:7743")?)
+    ///         .busy_check(move || jobs.any_running()),
+    ///     move |conn_id| AppContext::new(conn_id),
+    /// )
+    /// ```
+    ///
+    /// Extra listeners belong to the *daemon*, so a process dispatched into
+    /// shim mode ignores them - it proxies stdio to whatever is already on the
+    /// socket, which is the daemon that opened them.
+    pub fn serve_daemon_with<F>(self, options: DaemonOptions, context_factory: F) -> Result<()>
+    where
+        F: Fn(&str) -> C + Send + Sync + 'static,
+    {
+        self.serve_daemon_from(std::env::args(), options, context_factory)
+    }
+
+    /// [`serve_daemon_with`](Self::serve_daemon_with) with the command line
+    /// supplied rather than read from the process.
     ///
     /// `argv` is process-global and tests run threaded inside one process, so
     /// taking it as an argument is the only way the dispatch itself is testable.
     fn serve_daemon_from<I, F>(
         self,
         args: I,
-        socket_path: &Path,
-        idle_timeout: Duration,
+        options: DaemonOptions,
         context_factory: F,
     ) -> Result<()>
     where
@@ -142,22 +299,16 @@ impl<C: Send + Sync + 'static> Server<C> {
         // Before the fork, so a directory that cannot be created is reported
         // to whoever ran the command rather than to `/dev/null`. Private to
         // this user, because a socket is as private as the directory it is in.
-        ensure_private_parent_dir(socket_path)?;
+        ensure_private_parent_dir(&options.socket_path)?;
 
         match mode_from_args(args) {
-            Mode::Shim => shim(socket_path, StdioTransport::new()),
-            mode => self.serve_socket(mode, socket_path, idle_timeout, context_factory),
+            Mode::Shim => shim(&options.socket_path, StdioTransport::new()),
+            mode => self.serve_socket(mode, options, context_factory),
         }
     }
 
     /// Hand this server's registrations to a [`UnixServer`] and run it.
-    fn serve_socket<F>(
-        self,
-        mode: Mode,
-        socket_path: &Path,
-        idle_timeout: Duration,
-        context_factory: F,
-    ) -> Result<()>
+    fn serve_socket<F>(self, mode: Mode, options: DaemonOptions, context_factory: F) -> Result<()>
     where
         F: Fn(&str) -> C + Send + Sync + 'static,
     {
@@ -166,12 +317,15 @@ impl<C: Send + Sync + 'static> Server<C> {
         // hands each of them the same handles instead.
         let blueprint = self.into_blueprint();
 
-        let daemon = UnixServer::new(blueprint.config().clone())
-            .idle_timeout(idle_timeout)
-            .with_tools(move |server: &mut Server<C>| {
+        let daemon = UnixServer::new(blueprint.config().clone()).with_tools(
+            move |server: &mut Server<C>| {
                 blueprint.apply(server);
                 Ok(())
-            });
+            },
+        );
+
+        let socket_path = options.socket_path.clone();
+        let daemon = options.configure(daemon);
 
         match mode {
             Mode::Daemon => daemon.serve_daemon(socket_path, context_factory),
@@ -388,8 +542,7 @@ mod tests {
         let handle = thread::spawn(move || {
             server.serve_daemon_from(
                 ["prog", FOREGROUND_FLAG],
-                &socket_for_server,
-                Duration::from_secs(30),
+                DaemonOptions::new(socket_for_server).idle_timeout(Duration::from_secs(30)),
                 move |conn_id| Ctx {
                     conn_id: conn_id.to_string(),
                     counter: counter.clone(),
@@ -594,8 +747,7 @@ mod tests {
 
         let outcome = server_with_tools().serve_daemon_from(
             ["prog"],
-            &socket,
-            Duration::from_secs(1),
+            DaemonOptions::new(&socket).idle_timeout(Duration::from_secs(1)),
             move |conn_id| Ctx {
                 conn_id: conn_id.to_string(),
                 counter: Arc::new(AtomicI64::new(0)),

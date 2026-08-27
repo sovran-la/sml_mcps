@@ -16,10 +16,16 @@ mod http;
 mod http1;
 
 #[cfg(unix)]
+mod listener;
+
+#[cfg(unix)]
+mod signals;
+
+#[cfg(unix)]
 mod unix;
 
 #[cfg(unix)]
-mod unix_server;
+pub(crate) mod unix_server;
 
 pub use line::MAX_MESSAGE_BYTES;
 pub use origin::OriginPolicy;
@@ -29,6 +35,12 @@ pub use tcp::TcpTransport;
 
 #[cfg(feature = "http")]
 pub use http::{HttpServer, HttpTransport};
+
+#[cfg(unix)]
+pub use listener::{Listener, TcpSocketListener};
+
+#[cfg(unix)]
+pub(crate) use listener::UnixSocketListener;
 
 #[cfg(unix)]
 pub use unix::UnixTransport;

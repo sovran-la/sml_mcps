@@ -47,8 +47,9 @@ pub mod cli;
 #[cfg(unix)]
 pub mod bridge;
 
-/// Adds [`Server::serve_daemon`], which needs no import - the module exports
-/// nothing, it only extends `Server`.
+/// Adds [`Server::serve_daemon`] and [`Server::serve_daemon_with`], which need
+/// no import - the module extends `Server`, and exports only the options the
+/// second of them takes.
 #[cfg(unix)]
 mod daemon;
 
@@ -72,7 +73,10 @@ pub use transport::{HttpServer, HttpTransport};
 pub use bridge::Bridge;
 
 #[cfg(unix)]
+pub use daemon::DaemonOptions;
+
+#[cfg(unix)]
 pub use socket::user_socket_path;
 
 #[cfg(unix)]
-pub use transport::{UnixServer, UnixTransport};
+pub use transport::{Listener, TcpSocketListener, UnixServer, UnixTransport};
