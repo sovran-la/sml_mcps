@@ -1,6 +1,6 @@
 [package]
 name = "sml_mcps"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Small MCP Server - sync, no tokio, just works"
@@ -91,6 +91,11 @@ name = "unix_server"
 # The same three modes as unix_server, through Server::serve_daemon
 [[example]]
 name = "serve_daemon"
+
+# serve_daemon_with: a Unix socket plus TCP plus a hand-written listener, and
+# an application veto on idle exit. Unix-only, no extra features needed.
+[[example]]
+name = "multi_listener"
 
 # install/uninstall/serve/health, plus a custom subcommand
 [[example]]

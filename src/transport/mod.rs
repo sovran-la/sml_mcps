@@ -4,13 +4,25 @@
 
 mod line;
 mod origin;
+mod socket_stream;
 mod stdio;
+mod stream;
+mod tcp;
 
 #[cfg(feature = "http")]
 mod http;
 
 #[cfg(feature = "http")]
 mod http1;
+
+#[cfg(unix)]
+pub(crate) mod daemon_state;
+
+#[cfg(unix)]
+mod listener;
+
+#[cfg(unix)]
+mod signals;
 
 #[cfg(unix)]
 mod unix;
@@ -21,9 +33,17 @@ mod unix_server;
 pub use line::MAX_MESSAGE_BYTES;
 pub use origin::OriginPolicy;
 pub use stdio::StdioTransport;
+pub use stream::StreamTransport;
+pub use tcp::TcpTransport;
 
 #[cfg(feature = "http")]
 pub use http::{HttpServer, HttpTransport};
+
+#[cfg(unix)]
+pub use listener::{Listener, TcpSocketListener};
+
+#[cfg(unix)]
+pub(crate) use listener::UnixSocketListener;
 
 #[cfg(unix)]
 pub use unix::UnixTransport;
