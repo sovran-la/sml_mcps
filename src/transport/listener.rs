@@ -392,8 +392,11 @@ mod tests {
 
     #[test]
     fn test_waking_a_listener_bound_to_every_interface_works() {
-        // The unit above says which address is chosen; this says the choice is
-        // the right one, against a real listener.
+        // Which address is chosen is the test above; this one only says the
+        // choice reaches a real listener. It cannot tell you the substitution
+        // was needed - most kernels route a connection to `0.0.0.0` to
+        // loopback anyway - which is exactly why the intent is pinned there
+        // and not here.
         let listener = TcpSocketListener::bind("0.0.0.0:0").unwrap();
         assert!(listener.local_addr().ip().is_unspecified());
 

@@ -198,6 +198,108 @@ fn main() -> Result<()> {
 See `examples/unix_server.rs` for a complete single-binary daemon + shim wired up
 by hand, and `examples/serve_daemon.rs` for the same thing in one call.
 
+### More than one listener
+
+A daemon can accept from more than one place at once. `DaemonOptions` is
+`serve_daemon` with everything else it can be told:
+
+```rust
+use sml_mcps::{DaemonOptions, Server, TcpSocketListener, user_socket_path};
+use std::time::Duration;
+
+server.serve_daemon_with(
+    DaemonOptions::new(user_socket_path("my-daemon", "server.sock"))
+        .idle_timeout(Duration::from_secs(300))
+        .listener(TcpSocketListener::bind("127.0.0.1:7743")?)
+        .busy_check(move || jobs.any_running()),
+    move |conn_id| AppContext::new(conn_id),
+)
+```
+
+Every listener shares one connection ceiling, one idle clock, and the same
+per-connection `Server` — the only thing that differs is where the bytes came
+from. The Unix socket keeps the calling thread, so `serve` blocks exactly as it
+did; each extra listener gets a thread of its own. The same two methods exist on
+`UnixServer` directly (`.listener(...)`, `.busy_check(...)`) if you are driving
+that rather than the one-call dispatch.
+
+**`TcpSocketListener` is in the clear.** No encryption, no authentication —
+anything that can route to the address gets an MCP session, and an MCP session
+runs tools as the daemon's user. Bind it somewhere only people you already trust
+can reach.
+
+**For anything else — mTLS included — implement `Listener` yourself.** It has
+three methods, and `accept` hands back a `Box<dyn Transport>`, so whatever the
+connection needs before it can carry messages happens on your side of the seam.
+sml_mcps carries no TLS dependency and never learns of one:
+
+```rust
+use sml_mcps::{Listener, StreamTransport, Transport};
+use std::io;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+
+struct MtlsListener {
+    tcp: TcpListener,
+    addr: SocketAddr,
+    acceptor: MyRustlsAcceptor,
+}
+
+impl Listener for MtlsListener {
+    fn accept(&self) -> io::Result<Box<dyn Transport>> {
+        let (stream, _peer) = self.tcp.accept()?;
+        // A client without a valid certificate fails here, and the daemon
+        // treats that as one connection lost — not a daemon down.
+        let secured = self.acceptor.handshake(stream)?;
+        Ok(Box::new(StreamTransport::new(secured)))
+    }
+
+    // Must return a thread parked in `accept`: the daemon joins its accept
+    // threads on the way out, so a listener that cannot be woken is a daemon
+    // that cannot exit.
+    fn wake(&self) -> io::Result<()> {
+        TcpStream::connect(self.addr).map(|_| ())
+    }
+
+    fn describe(&self) -> String { format!("mtls://{}", self.addr) }
+}
+```
+
+`StreamTransport` wraps anything `Read + Write + Send` in the same
+newline-delimited JSON-RPC framing. It is honest about what an opaque stream
+cannot do — it reports that it can neither be split into an independent writer
+nor carry a read deadline — which costs exactly one thing: task workers on those
+connections may not make server-initiated requests (elicitation, sampling).
+Tools, resources, prompts, notifications and logging are unaffected. `Server`
+already handles both, the same way it does for the HTTP transport.
+
+### Staying up while work is running
+
+Idle shutdown counts *connections*. A daemon supervising something that outlives
+the session that asked for it — a child process, a background job — would idle
+out from under it. `busy_check` is the veto:
+
+```rust
+UnixServer::new(config)
+    .idle_timeout(Duration::from_secs(300))
+    .busy_check({
+        let jobs = jobs.clone();
+        move || jobs.any_running()
+    })
+```
+
+The daemon exits only when it has been idle for the whole window **and**
+`is_busy` answers `false`. A veto costs one more window: the watcher re-arms and
+asks again after `idle_timeout`, so the poll interval is that timeout and not a
+second knob. It is asked only at the moment the daemon is about to leave, and
+never while a client is connected.
+
+**A signal is not vetoable.** SIGTERM and SIGINT mean now; this is a guard on the
+daemon's own decision to leave, not on the operator's.
+
+With no `busy_check` configured, nothing about the idle path changes.
+
+See `examples/multi_listener.rs` for all of it in one binary.
+
 ## HTTP Transport (Streamable HTTP with SSE)
 
 With the `http` feature, `HttpServer` handles all the HTTP boilerplate for you.
@@ -520,6 +622,9 @@ for the decision log and the breaking changes from 0.5.x.
   notifications - all optional, and none are declared as capabilities
 - **SSE resumability** (`Last-Event-ID`) - a response is one buffered body, so
   there is no long-lived stream to resume
+- **TLS for the daemon** - `Listener` takes the streams you already secured, so
+  the handshake, the certificates and the policy stay in your crate. The `tls`
+  feature is HTTPS for the HTTP transport and nothing else
 
 ## License
 
