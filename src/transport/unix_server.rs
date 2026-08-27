@@ -878,6 +878,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Instant;
 
     // ---- test scaffolding ------------------------------------------------
@@ -1642,5 +1643,377 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&sock);
+    }
+
+    //
+    // Shutting down, and the idle watcher that decides when
+    //
+
+    /// A listener that never accepts anything and remembers being woken.
+    struct RecordingListener {
+        woken: Arc<AtomicUsize>,
+    }
+
+    impl Listener for RecordingListener {
+        fn accept(&self) -> io::Result<Box<dyn Transport>> {
+            Err(io::Error::other("this listener never accepts"))
+        }
+
+        fn wake(&self) -> io::Result<()> {
+            self.woken.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn describe(&self) -> String {
+            "recording://test".to_string()
+        }
+    }
+
+    /// Fresh connection bookkeeping, as `run` builds it.
+    fn conn_state() -> Shared {
+        Arc::new((Mutex::new(ConnState::default()), Condvar::new()))
+    }
+
+    /// Block until `shutdown` is set, or give up and say so.
+    fn wait_for_shutdown(shared: &Shared, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if shared.0.lock().unwrap().shutdown {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn test_request_shutdown_flags_the_daemon_and_knocks_on_every_listener() {
+        let shared = conn_state();
+        let woken = Arc::new(AtomicUsize::new(0));
+        let listeners: Listeners = (0..3)
+            .map(|_| {
+                Arc::new(RecordingListener {
+                    woken: woken.clone(),
+                }) as Arc<dyn Listener>
+            })
+            .collect();
+
+        request_shutdown(&shared, &listeners);
+
+        assert!(shared.0.lock().unwrap().shutdown);
+        assert_eq!(
+            woken.load(Ordering::SeqCst),
+            3,
+            "a listener left parked in `accept` is a daemon that cannot exit"
+        );
+    }
+
+    #[test]
+    fn test_a_listener_that_will_not_wake_does_not_stop_the_others() {
+        /// The failure a real listener has when its socket is already gone.
+        struct Deaf;
+        impl Listener for Deaf {
+            fn accept(&self) -> io::Result<Box<dyn Transport>> {
+                Err(io::Error::other("no"))
+            }
+            fn wake(&self) -> io::Result<()> {
+                Err(io::Error::other("cannot reach myself"))
+            }
+            fn describe(&self) -> String {
+                "deaf://test".to_string()
+            }
+        }
+
+        let shared = conn_state();
+        let woken = Arc::new(AtomicUsize::new(0));
+        let listeners: Listeners = vec![
+            Arc::new(Deaf),
+            Arc::new(RecordingListener {
+                woken: woken.clone(),
+            }),
+        ];
+
+        request_shutdown(&shared, &listeners);
+
+        assert_eq!(
+            woken.load(Ordering::SeqCst),
+            1,
+            "the second listener must still be knocked on"
+        );
+    }
+
+    #[test]
+    fn test_describe_names_every_listener() {
+        let woken = Arc::new(AtomicUsize::new(0));
+        let listeners: Listeners = vec![
+            Arc::new(RecordingListener {
+                woken: woken.clone(),
+            }),
+            Arc::new(RecordingListener { woken }),
+        ];
+
+        assert_eq!(describe(&listeners), "recording://test, recording://test");
+        assert_eq!(describe(&[]), "");
+    }
+
+    #[test]
+    fn test_the_idle_watcher_exits_a_daemon_nobody_is_using() {
+        // The baseline the guard is measured against: no busy check, no
+        // connections, one window.
+        let shared = conn_state();
+        let watching = {
+            let shared = shared.clone();
+            thread::spawn(move || idle_watcher(shared, Duration::from_millis(50), Vec::new(), None))
+        };
+
+        assert!(wait_for_shutdown(&shared, Duration::from_secs(5)));
+        watching.join().unwrap();
+    }
+
+    #[test]
+    fn test_a_busy_check_that_says_no_changes_nothing() {
+        // The guard is not a delay: an application that is not busy gets the
+        // same idle exit it would have got without one.
+        let shared = conn_state();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+
+        let watching = {
+            let shared = shared.clone();
+            let check: BusyCheck = Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                false
+            });
+            thread::spawn(move || {
+                idle_watcher(shared, Duration::from_millis(50), Vec::new(), Some(check))
+            })
+        };
+
+        assert!(wait_for_shutdown(&shared, Duration::from_secs(5)));
+        watching.join().unwrap();
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "asked once, at the moment it mattered"
+        );
+    }
+
+    #[test]
+    fn test_a_busy_application_keeps_the_daemon_alive() {
+        // The whole point: no connections for window after window, and the
+        // daemon stays up because the work it is supervising has not finished.
+        let shared = conn_state();
+        let busy = Arc::new(AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+
+        let watching = {
+            let shared = shared.clone();
+            let busy = busy.clone();
+            let asked = asked.clone();
+            let check: BusyCheck = Arc::new(move || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                busy.load(Ordering::SeqCst)
+            });
+            thread::spawn(move || {
+                idle_watcher(shared, Duration::from_millis(50), Vec::new(), Some(check))
+            })
+        };
+
+        // Several windows go by with nobody connected...
+        thread::sleep(Duration::from_millis(400));
+        assert!(
+            !shared.0.lock().unwrap().shutdown,
+            "a busy application must outlive its idle timeout"
+        );
+        assert!(
+            asked.load(Ordering::SeqCst) >= 2,
+            "and the veto has to be re-asked, not taken once and cached"
+        );
+
+        // ...and the moment the work is done, the next window ends it.
+        busy.store(false, Ordering::SeqCst);
+        assert!(wait_for_shutdown(&shared, Duration::from_secs(5)));
+        watching.join().unwrap();
+    }
+
+    #[test]
+    fn test_a_client_arriving_during_the_veto_cancels_the_exit() {
+        // The predicate runs without the lock held, so the world can move
+        // while it is thinking. A connection that arrived in that window is a
+        // connection, and the daemon must not exit out from under it.
+        let shared = conn_state();
+        let arrived = Arc::new(AtomicBool::new(false));
+
+        let watching = {
+            let shared = shared.clone();
+            let state = shared.clone();
+            let arrived = arrived.clone();
+            let check: BusyCheck = Arc::new(move || {
+                // Exactly the race: a client lands while the application is
+                // being asked, and answers "not busy".
+                if !arrived.swap(true, Ordering::SeqCst) {
+                    let (lock, cv) = &*state;
+                    let mut conns = lock.lock().unwrap();
+                    conns.admit(8);
+                    cv.notify_all();
+                }
+                false
+            });
+            thread::spawn(move || {
+                idle_watcher(shared, Duration::from_millis(50), Vec::new(), Some(check))
+            })
+        };
+
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !shared.0.lock().unwrap().shutdown,
+            "a connection that arrived during the check is still a connection"
+        );
+
+        // Let it go, and the daemon leaves as it should.
+        release(&shared);
+        assert!(wait_for_shutdown(&shared, Duration::from_secs(5)));
+        watching.join().unwrap();
+    }
+
+    #[test]
+    fn test_the_busy_check_is_not_asked_while_a_client_is_connected() {
+        // Connections are the daemon's own measure of idleness and they come
+        // first: the application is only consulted once that measure says the
+        // daemon would otherwise leave.
+        let shared = conn_state();
+        shared.0.lock().unwrap().admit(8);
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let watching = {
+            let shared = shared.clone();
+            let asked = asked.clone();
+            let check: BusyCheck = Arc::new(move || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                false
+            });
+            thread::spawn(move || {
+                idle_watcher(shared, Duration::from_millis(50), Vec::new(), Some(check))
+            })
+        };
+
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "nothing to veto while a client is being served"
+        );
+
+        release(&shared);
+        assert!(wait_for_shutdown(&shared, Duration::from_secs(5)));
+        watching.join().unwrap();
+    }
+
+    #[test]
+    fn test_the_busy_check_runs_without_the_state_lock_held() {
+        // It is application code and it may take locks of its own. Running it
+        // under ours would deadlock a predicate that so much as looked at the
+        // daemon, and would stall every accept while it thought.
+        let shared = conn_state();
+        let was_free = Arc::new(AtomicBool::new(false));
+
+        let watching = {
+            let shared = shared.clone();
+            let state = shared.clone();
+            let was_free = was_free.clone();
+            let check: BusyCheck = Arc::new(move || {
+                // `try_lock` rather than `lock`: a test that deadlocks tells
+                // you far less than one that fails.
+                was_free.store(state.0.try_lock().is_ok(), Ordering::SeqCst);
+                false
+            });
+            thread::spawn(move || {
+                idle_watcher(shared, Duration::from_millis(50), Vec::new(), Some(check))
+            })
+        };
+
+        assert!(wait_for_shutdown(&shared, Duration::from_secs(5)));
+        watching.join().unwrap();
+        assert!(
+            was_free.load(Ordering::SeqCst),
+            "the connection state was locked while the application was asked"
+        );
+    }
+
+    #[test]
+    fn test_the_idle_watcher_wakes_the_listeners_on_its_way_out() {
+        // Its own exit is the daemon's exit, and the accept loops are parked.
+        let shared = conn_state();
+        let woken = Arc::new(AtomicUsize::new(0));
+        let listeners: Listeners = vec![Arc::new(RecordingListener {
+            woken: woken.clone(),
+        })];
+
+        let watching = {
+            let shared = shared.clone();
+            thread::spawn(move || idle_watcher(shared, Duration::from_millis(50), listeners, None))
+        };
+
+        assert!(wait_for_shutdown(&shared, Duration::from_secs(5)));
+        watching.join().unwrap();
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_a_shutdown_already_asked_for_ends_the_watcher_without_a_veto() {
+        // A signal is not vetoable, and this is the shape of that: the flag is
+        // up before the watcher looks, and it leaves without asking anyone.
+        let shared = conn_state();
+        shared.0.lock().unwrap().shutdown = true;
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let watching = {
+            let shared = shared.clone();
+            let asked = asked.clone();
+            let check: BusyCheck = Arc::new(move || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            thread::spawn(move || {
+                idle_watcher(shared, Duration::from_millis(50), Vec::new(), Some(check))
+            })
+        };
+
+        watching.join().unwrap();
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    //
+    // What the builder holds
+    //
+
+    #[test]
+    fn test_a_server_has_no_extra_listeners_and_no_busy_check_unless_asked() {
+        // The default is the daemon this type has always been.
+        let server: UnixServer<()> = UnixServer::new(test_config());
+
+        assert!(server.listeners.is_empty());
+        assert!(server.busy_check.is_none());
+        assert!(server.idle_timeout.is_none());
+    }
+
+    #[test]
+    fn test_listeners_accumulate_in_the_order_they_were_added() {
+        let woken = Arc::new(AtomicUsize::new(0));
+        let server: UnixServer<()> = UnixServer::new(test_config())
+            .listener(RecordingListener {
+                woken: woken.clone(),
+            })
+            .listener(RecordingListener { woken });
+
+        assert_eq!(server.listeners.len(), 2);
+    }
+
+    #[test]
+    fn test_a_busy_check_is_kept_as_given() {
+        let server: UnixServer<()> = UnixServer::new(test_config()).busy_check(|| true);
+
+        let check = server.busy_check.expect("the predicate should be held");
+        assert!(check(), "and it should be the one that was handed over");
     }
 }

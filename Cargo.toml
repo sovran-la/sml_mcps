@@ -92,6 +92,11 @@ name = "unix_server"
 [[example]]
 name = "serve_daemon"
 
+# serve_daemon_with: a Unix socket plus TCP plus a hand-written listener, and
+# an application veto on idle exit. Unix-only, no extra features needed.
+[[example]]
+name = "multi_listener"
+
 # install/uninstall/serve/health, plus a custom subcommand
 [[example]]
 name = "cli"
