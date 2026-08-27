@@ -97,6 +97,17 @@ impl<R: DeadlineRead> LineReader<R> {
         self.max_bytes = max_bytes.max(1);
     }
 
+    /// The byte source this reader was built on.
+    ///
+    /// For a transport whose stream is the same object in both directions and
+    /// cannot be cloned - anything already wrapped by the time it reaches us,
+    /// a TLS session most of all - this is how a write reaches the socket the
+    /// reader is holding. Writing through it is safe: the buffer here is a
+    /// *read* buffer, and the two directions do not share one.
+    pub(crate) fn source_mut(&mut self) -> &mut R {
+        self.inner.get_mut()
+    }
+
     /// Push `deadline` down to the source, if that changes anything.
     fn arm(&mut self, deadline: Option<Instant>) -> Result<()> {
         match deadline {

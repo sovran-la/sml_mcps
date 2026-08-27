@@ -9,52 +9,24 @@
 //! - [`UnixTransport::from_stream`] - server/daemon side, wraps a stream handed
 //!   back by [`UnixListener::accept`](std::os::unix::net::UnixListener::accept).
 //!
+//! The framing, the split reader/writer and the deadlines are
+//! [`SocketTransport`]'s, shared with [`TcpTransport`](crate::TcpTransport):
+//! what is here is the dialing, and the name.
+//!
 //! Unix-only: the whole module is gated behind `#[cfg(unix)]`, no feature flag.
 
 use crate::transport::Transport;
-use crate::transport::line::{DeadlineRead, LineReader};
+use crate::transport::socket_stream::SocketTransport;
 use crate::types::{JsonRpcMessage, Result};
-use std::io::{Read, Write};
-use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Transport over a Unix domain socket stream.
 ///
 /// Holds a buffered reader and a cloned write handle to the same socket, so
 /// reads and writes are independent (the standard split-stream pattern).
-pub struct UnixTransport {
-    reader: LineReader<TimedStream>,
-    writer: UnixStream,
-    /// Applied to the next read; `None` blocks indefinitely.
-    read_timeout: Option<Duration>,
-}
-
-/// A `UnixStream` whose reads honor a deadline via `SO_RCVTIMEO`.
-struct TimedStream {
-    stream: UnixStream,
-}
-
-impl Read for TimedStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.read(buf)
-    }
-}
-
-impl DeadlineRead for TimedStream {
-    fn set_deadline(&mut self, deadline: Option<Instant>) -> std::io::Result<()> {
-        // The socket reads a zero timeout as "block forever", so an already
-        // passed deadline has to round up rather than down. A nanosecond is the
-        // smallest thing that still means "expire".
-        let remaining = deadline.map(|deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_nanos(1))
-        });
-        self.stream.set_read_timeout(remaining)
-    }
-}
+pub struct UnixTransport(SocketTransport<UnixStream>);
 
 impl UnixTransport {
     /// Connect to an existing daemon socket (shim/client side).
@@ -84,68 +56,38 @@ impl UnixTransport {
     /// exactly when the process has run out of them - which is a condition a
     /// server is expected to survive, not one it should die of.
     pub fn try_from_stream(stream: UnixStream) -> Result<Self> {
-        let writer = stream.try_clone()?;
-        Ok(Self {
-            reader: LineReader::new(TimedStream { stream }),
-            writer,
-            read_timeout: None,
-        })
+        Ok(Self(SocketTransport::try_from_stream(stream)?))
     }
 }
 
 impl Transport for UnixTransport {
     fn read(&mut self) -> Result<JsonRpcMessage> {
-        self.reader.read_message(self.read_timeout)
+        self.0.read()
     }
 
     fn write(&mut self, message: &JsonRpcMessage) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, message)?;
-        writeln!(self.writer)?;
-        self.writer.flush()?;
-        Ok(())
+        self.0.write(message)
     }
 
     fn close(&mut self) -> Result<()> {
-        // Best-effort shutdown; ignore NotConnected (already closed).
-        match self.writer.shutdown(Shutdown::Both) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        self.0.close()
     }
 
     fn close_write(&mut self) -> Result<()> {
-        // Half-close: shut down only the write direction so the peer reads EOF
-        // while we can still read anything still in flight.
-        match self.writer.shutdown(Shutdown::Write) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        self.0.close_write()
     }
 
     fn try_clone_writer(&self) -> Option<Box<dyn Transport>> {
-        // Clone the underlying fd so the bridge's other direction has an
-        // independent write handle to the same socket connection.
-        //
-        // Both clones are fallible and both are answered with `None`: the
-        // second used to go through `from_stream`, which panics, so a process
-        // that ran out of descriptors between the two - the exact condition
-        // this method exists to report - took the caller down instead.
-        let stream = self.writer.try_clone().ok()?;
-        let transport = UnixTransport::try_from_stream(stream).ok()?;
-
-        Some(Box::new(transport))
+        self.0.try_clone_writer()
     }
 
     /// Supported: the deadline rides on the socket's own `SO_RCVTIMEO`.
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<bool> {
-        self.read_timeout = timeout;
-        Ok(true)
+        self.0.set_read_timeout(timeout)
     }
 
     fn set_max_message_bytes(&mut self, max: usize) {
-        self.reader.set_limit(max);
+        self.0.set_max_message_bytes(max)
     }
 }
 
@@ -153,6 +95,7 @@ impl Transport for UnixTransport {
 mod tests {
     use super::*;
     use crate::types::{JsonRpcMessage, McpError};
+    use std::time::Instant;
 
     #[test]
     fn test_roundtrip_through_pair() {

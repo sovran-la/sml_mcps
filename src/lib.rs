@@ -62,7 +62,7 @@ pub use server::{
     LogLevel, PromptDef, Resource, Server, ServerConfig, StderrLogging, Tool, ToolEnv,
 };
 pub use tasks::{Task, TaskConfig, TaskStatus, TaskStore};
-pub use transport::{OriginPolicy, StdioTransport, Transport};
+pub use transport::{OriginPolicy, StdioTransport, StreamTransport, TcpTransport, Transport};
 pub use types::*;
 
 #[cfg(feature = "http")]

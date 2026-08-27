@@ -4,7 +4,10 @@
 
 mod line;
 mod origin;
+mod socket_stream;
 mod stdio;
+mod stream;
+mod tcp;
 
 #[cfg(feature = "http")]
 mod http;
@@ -21,6 +24,8 @@ mod unix_server;
 pub use line::MAX_MESSAGE_BYTES;
 pub use origin::OriginPolicy;
 pub use stdio::StdioTransport;
+pub use stream::StreamTransport;
+pub use tcp::TcpTransport;
 
 #[cfg(feature = "http")]
 pub use http::{HttpServer, HttpTransport};
