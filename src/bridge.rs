@@ -26,7 +26,7 @@
 //! Unix-only: gated behind `#[cfg(unix)]`.
 
 use crate::server::{error_id, is_malformed};
-use crate::socket::owned_by_current_user;
+use crate::socket::{SocketLock, owned_by_current_user};
 use crate::transport::{Transport, UnixTransport, pid_path_for};
 use crate::types::{JsonRpcMessage, McpError, Result};
 use std::os::unix::net::UnixStream;
@@ -420,7 +420,24 @@ fn is_unreachable(e: &std::io::Error) -> bool {
 /// after the first connect attempt must not have its socket deleted out from
 /// under it. That leaves it listening on an inode with no name, unreachable to
 /// every client, until it idles out.
+///
+/// The unlink happens only under the path's [`SocketLock`]. Repeated probes
+/// shrink the window in which a daemon between `bind` and `listen` looks
+/// abandoned; the claim closes it. A daemon in that state is holding its
+/// claim, so failing to take it here *is* the answer: not stale, touch
+/// nothing, and let the caller's connect/wait/spawn logic find the owner.
 fn clear_socket(socket_path: &Path, pid_path: Option<&Path>) -> Option<UnixTransport> {
+    let _claim = match SocketLock::acquire(socket_path) {
+        Ok(Some(claim)) => claim,
+        // Held, or unanswerable. Either way the unlink is off the table:
+        // deleting a socket we cannot prove unclaimed is how a live daemon
+        // gets orphaned onto a nameless inode. The holder may already be
+        // listening - a serving daemon holds its claim for life - in which
+        // case a connection to it is the answer; a holder still mid-bind
+        // gives `None`, and the caller's wait-or-spawn logic finds it.
+        Ok(None) | Err(_) => return UnixTransport::connect(socket_path).ok(),
+    };
+
     match probe_socket(socket_path, PROBE_ATTEMPTS, PROBE_GAP) {
         Probe::Live(transport) => return Some(transport),
         Probe::Dead => {

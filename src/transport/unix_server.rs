@@ -27,7 +27,7 @@
 //! Unix-only: gated behind `#[cfg(unix)]`, no feature flag.
 
 use crate::server::{Server, ServerConfig};
-use crate::socket::{ensure_private_parent_dir, owned_by_current_user};
+use crate::socket::{SocketLock, ensure_private_parent_dir, owned_by_current_user};
 use crate::transport::daemon_state::{
     ActiveGuard, Admission, BusyCheck, ConnState, Listeners, Shared, admit, describe, idle_watcher,
     release, request_shutdown, shutdown_requested,
@@ -281,8 +281,15 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
         // directly gets the same treatment `Server::serve_daemon` arranges.
         ensure_private_parent_dir(&socket_path)?;
 
+        // The claim on the socket path, held until this server has stopped
+        // serving and unlinked its own socket (`cleanup` runs before `claim`
+        // drops). Everything between here and `bind` - the staleness probe,
+        // the unlink - happens under it, so no other server can misread this
+        // one mid-bind as stale and delete its socket. See [`SocketLock`].
+        let claim = claim_socket_path(&socket_path)?;
+
         // Clear a stale socket (or refuse if a live server owns it).
-        prepare_socket_path(&socket_path)?;
+        prepare_socket_path(&socket_path, &claim)?;
 
         let bound = UnixListener::bind(&socket_path).map_err(|e| {
             McpError::Internal(format!("failed to bind {}: {}", socket_path.display(), e))
@@ -545,12 +552,50 @@ fn cleanup(socket_path: &Path, pid_path: Option<&Path>) {
     }
 }
 
+/// Take the claim on the socket path, or say who beat us to it.
+///
+/// A refusal is not retried and not waited on: `Bridge::auto_start` - the
+/// thing that spawns daemons - ignores the loser's exit and polls the socket,
+/// which the winner binds milliseconds later. The losing daemon standing down
+/// with an error *is* the machine converging on one daemon.
+fn claim_socket_path(path: &Path) -> Result<SocketLock> {
+    if let Some(claim) = SocketLock::acquire(path)? {
+        return Ok(claim);
+    }
+
+    // Somebody holds the claim. If the socket answers, it is the error this
+    // crate has always given for a running daemon; if it does not, the holder
+    // is between deciding to serve and binding - exactly the state that used
+    // to be misread as stale.
+    if UnixStream::connect(path).is_ok() {
+        Err(McpError::Internal(format!(
+            "socket {} is already in use by a live server",
+            path.display()
+        )))
+    } else {
+        Err(McpError::Internal(format!(
+            "socket {} is being claimed by another starting server - refusing to bind over it",
+            path.display()
+        )))
+    }
+}
+
 /// Clear the socket path before binding.
 ///
 /// Three answers: a path belonging to another account is refused outright, a
 /// live server's socket is refused rather than clobbered, and a stale socket
 /// file is removed.
-fn prepare_socket_path(path: &Path) -> Result<()> {
+///
+/// Requires the caller to hold the path's [`SocketLock`], and that is what
+/// makes the one-connect staleness check below sound: a cooperating daemon
+/// between `bind` and `listen` - which refuses a connect exactly the way an
+/// abandoned socket does - would be holding the claim, so it can never be
+/// observed here. A refusal under the claim is the leftovers of a dead
+/// process, and removing it is correct. (A listener that never took the
+/// claim, such as a pre-claim build or a foreign process, is still caught by
+/// the connect when it is listening; its own bind-to-listen window is the one
+/// thing that cannot be closed from this side.)
+fn prepare_socket_path(path: &Path, _claim: &SocketLock) -> Result<()> {
     // `symlink_metadata` rather than `exists`, which follows links and so says
     // "nothing here" about a dangling symlink that `bind` will refuse.
     if std::fs::symlink_metadata(path).is_err() {
@@ -573,7 +618,8 @@ fn prepare_socket_path(path: &Path) -> Result<()> {
             path.display()
         ))),
         Err(_) => {
-            // Nothing listening - stale socket, safe to remove.
+            // Nothing listening, nobody mid-bind (they would hold the claim
+            // we are holding) - stale socket, safe to remove.
             std::fs::remove_file(path)?;
             Ok(())
         }
@@ -1006,6 +1052,13 @@ mod tests {
         assert!(!pid.exists());
     }
 
+    /// The claim on `path`, for tests exercising what happens under it.
+    fn claim(path: &Path) -> SocketLock {
+        SocketLock::acquire(path)
+            .expect("the lock file should be creatable")
+            .expect("nobody else should hold a test path's claim")
+    }
+
     #[test]
     fn test_prepare_socket_path_removes_stale() {
         let sock = temp_socket();
@@ -1013,7 +1066,7 @@ mod tests {
         std::fs::write(&sock, b"stale").unwrap();
         assert!(sock.exists());
 
-        prepare_socket_path(&sock).unwrap();
+        prepare_socket_path(&sock, &claim(&sock)).unwrap();
         assert!(!sock.exists());
     }
 
@@ -1023,7 +1076,7 @@ mod tests {
         let _listener = UnixListener::bind(&sock).unwrap();
 
         // A live listener owns the path -> prepare must refuse, not remove.
-        let result = prepare_socket_path(&sock);
+        let result = prepare_socket_path(&sock, &claim(&sock));
         assert!(result.is_err());
         assert!(sock.exists());
 
@@ -1034,12 +1087,14 @@ mod tests {
     fn test_prepare_socket_path_refuses_a_path_it_does_not_own() {
         // The other half of the shim's refusal: neither side races the other to
         // bind a path that belongs to a third account. `/` stands in for one -
-        // it is root's on every machine this runs on.
+        // it is root's on every machine this runs on. No claim can be taken on
+        // `/`, so the witness comes from a path of our own; the refusal under
+        // test is about ownership, not the claim.
         if unsafe { libc::getuid() } == 0 {
             return;
         }
 
-        let error = prepare_socket_path(Path::new("/"))
+        let error = prepare_socket_path(Path::new("/"), &claim(&temp_socket()))
             .expect_err("a path this user does not own must not be served on");
 
         assert!(
@@ -1054,7 +1109,7 @@ mod tests {
         let sock = temp_socket();
         assert!(!sock.exists());
 
-        prepare_socket_path(&sock).unwrap();
+        prepare_socket_path(&sock, &claim(&sock)).unwrap();
 
         assert!(!sock.exists(), "and nothing is created in passing");
     }

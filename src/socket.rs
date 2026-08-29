@@ -20,7 +20,8 @@
 
 use crate::types::{McpError, Result};
 use std::ffi::OsString;
-use std::fs::DirBuilder;
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -156,6 +157,86 @@ pub(crate) fn owned_by_current_user(path: &Path) -> Option<bool> {
     }
 
     Some(std::fs::metadata(path).ok()?.uid() == uid)
+}
+
+/// The exclusive right to touch what is at a socket path.
+///
+/// An `flock(LOCK_EX | LOCK_NB)` on the socket's sibling `.lock` file. The
+/// rules it enforces, between every process built on this crate:
+///
+/// 1. A daemon takes the claim before it probes, removes, or binds anything at
+///    the socket path, and holds it until it has stopped serving and unlinked
+///    its own socket.
+/// 2. Nobody unlinks a socket file without holding its claim.
+///
+/// Those two rules are what make "a refused connect means a stale socket"
+/// sound. Without them it is a guess, and a wrong one: `UnixListener::bind` is
+/// `bind` then `listen`, two syscalls, and a connect landing between them is
+/// refused exactly the way an abandoned socket file refuses. A process that
+/// believed that refusal deleted a live daemon's socket file and bound its
+/// own, leaving the live daemon serving an inode with no name - unreachable
+/// to every client and to SIGTERM (which wakes a parked `accept` by
+/// connecting to the now-deleted path), forever. Under the claim that state
+/// cannot be observed from outside: whoever is mid-bind is holding it.
+///
+/// The lock lives on the open file description, so the kernel releases it when
+/// the last descriptor closes - including a holder killed with `-9`. There is
+/// no stale-lock state and nothing to clean up. The `.lock` file itself is
+/// never unlinked: removing it would reopen the race, because a new claimer
+/// could lock the old inode while a fresh file takes the name.
+#[derive(Debug)]
+pub(crate) struct SocketLock {
+    /// Held for the flock, never read or written; released on drop.
+    _file: File,
+}
+
+impl SocketLock {
+    /// Take the claim on `socket_path`, or `None` if another process (or
+    /// thread - flock excludes per open file description) already holds it.
+    ///
+    /// `Err` is reserved for the lock file being unopenable or the flock
+    /// failing for some reason other than being held - answers that mean the
+    /// machine, not the race.
+    pub(crate) fn acquire(socket_path: &Path) -> Result<Option<Self>> {
+        let path = lock_path_for(socket_path);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| {
+                McpError::Internal(format!(
+                    "could not open {} to claim the socket path: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+        // SAFETY: `flock` reads a descriptor and a flag and touches no memory.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(Self { _file: file }));
+        }
+
+        let refused = std::io::Error::last_os_error();
+        match refused.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => Ok(None),
+            // A lock that cannot be taken for any other reason is not a busy
+            // socket, and pretending it is would let a second daemon through
+            // on a filesystem that does not do flock.
+            _ => Err(McpError::Internal(format!(
+                "could not lock {}: {}",
+                path.display(),
+                refused
+            ))),
+        }
+    }
+}
+
+/// Compute the claim-file path for a socket path: replace the extension with
+/// `lock` (e.g. `server.sock` -> `server.lock`), next to the `.pid` file.
+fn lock_path_for(socket_path: &Path) -> PathBuf {
+    let mut p = socket_path.to_path_buf();
+    p.set_extension("lock");
+    p
 }
 
 /// The real user id of this process.
