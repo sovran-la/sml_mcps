@@ -245,6 +245,77 @@ fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// Test scaffolding for the claim, shared with `unix_server` and `bridge`
+/// tests: the race those modules pin lives between two of *their* callers, so
+/// the state it hinges on is built here, once.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// A socket held in the exact kernel state of a daemon caught between
+    /// `bind` and `listen` - the two syscalls inside `UnixListener::bind`.
+    ///
+    /// A connect to it is refused precisely the way a stale socket file
+    /// refuses one, which is the misreading the whole claim exists to
+    /// prevent. Unlike the real window, which is two adjacent syscalls wide,
+    /// this one stays open until [`listen`](Self::listen) is called - so the
+    /// race is tested deterministically, not probabilistically.
+    pub(crate) struct MidBindSocket {
+        fd: OwnedFd,
+    }
+
+    impl MidBindSocket {
+        /// Bind at `path` and stop there, the way `UnixListener::bind` never
+        /// lets a caller do.
+        pub(crate) fn bind(path: &Path) -> Self {
+            let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            assert!(raw >= 0, "socket: {}", std::io::Error::last_os_error());
+            // SAFETY: `raw` is a freshly created descriptor we own.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = path.as_os_str().as_bytes();
+            assert!(
+                bytes.len() < addr.sun_path.len(),
+                "socket path too long for sun_path: {}",
+                path.display()
+            );
+            for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+                *dst = *src as libc::c_char;
+            }
+
+            // SAFETY: `addr` is a properly initialized sockaddr_un and `fd`
+            // is a valid unbound socket.
+            let rc = unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    std::ptr::addr_of!(addr).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "bind {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+
+            Self { fd }
+        }
+
+        /// Finish what `UnixListener::bind` would have: start listening.
+        pub(crate) fn listen(&self) {
+            // SAFETY: `fd` is a valid bound socket.
+            let rc = unsafe { libc::listen(self.fd.as_raw_fd(), 16) };
+            assert_eq!(rc, 0, "listen: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +600,64 @@ mod tests {
         assert_eq!(owned_by_current_user(&link), Some(false));
 
         let _ = std::fs::remove_file(&link);
+    }
+
+    //
+    // The claim
+    //
+
+    #[test]
+    fn a_claim_excludes_a_second_taker() {
+        // flock exclusion is per open file description, so this holds between
+        // two threads of one process exactly as it does between two daemons.
+        let sock = temp_path("claim");
+
+        let held = SocketLock::acquire(&sock).unwrap().expect("first taker");
+        assert!(
+            SocketLock::acquire(&sock).unwrap().is_none(),
+            "one claim per socket path at a time"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_file(lock_path_for(&sock));
+    }
+
+    #[test]
+    fn a_dropped_claim_can_be_taken_again() {
+        // The kernel releases the flock with the last descriptor - including a
+        // holder killed with -9 - which is why there is no stale-lock case.
+        let sock = temp_path("reclaim");
+
+        drop(SocketLock::acquire(&sock).unwrap().expect("first taker"));
+        assert!(
+            SocketLock::acquire(&sock).unwrap().is_some(),
+            "the claim goes with its holder"
+        );
+
+        let _ = std::fs::remove_file(lock_path_for(&sock));
+    }
+
+    #[test]
+    fn the_claim_lives_beside_the_socket() {
+        // Next to the .pid file, in the same 0700 directory - not somewhere a
+        // second configuration of the same server would fail to find it.
+        assert_eq!(
+            lock_path_for(Path::new("/x/server.sock")),
+            PathBuf::from("/x/server.lock")
+        );
+        assert_eq!(
+            lock_path_for(Path::new("/x/server")),
+            PathBuf::from("/x/server.lock")
+        );
+    }
+
+    #[test]
+    fn a_claim_that_cannot_be_asked_for_is_an_error_not_a_pass() {
+        // `/` has no lock-file sibling to create. An unanswerable claim must
+        // fail loudly: treating it as "free" would let two daemons through on
+        // exactly the filesystems where flock cannot arbitrate.
+        let error = SocketLock::acquire(Path::new("/")).unwrap_err();
+        assert!(error.to_string().contains("could not open"), "{error}");
     }
 
     #[test]

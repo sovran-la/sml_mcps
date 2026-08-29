@@ -1027,6 +1027,50 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_socket_leaves_a_claimed_socket_alone() {
+        // The shim side of the mid-bind pin. A daemon between `bind` and
+        // `listen` refuses a connect exactly the way a corpse does - for
+        // longer than any probe schedule cares to wait, if the scheduler says
+        // so - but it holds its claim, and an unlink only ever happens under
+        // the claim. Repeated probes shrink this window; the claim closes it.
+        let sock = temp_path("sock");
+        let daemon_holds = SocketLock::acquire(&sock)
+            .unwrap()
+            .expect("the test is the first claimer");
+        let mid_bind = crate::socket::test_support::MidBindSocket::bind(&sock);
+
+        assert!(
+            clear_socket(&sock, None).is_none(),
+            "nothing to connect to yet - and nothing to delete either"
+        );
+        assert!(
+            sock.exists(),
+            "the daemon's socket file must survive the shim's cleanup"
+        );
+
+        // The daemon finishes binding, and every client can still find it.
+        mid_bind.listen();
+        assert!(UnixStream::connect(&sock).is_ok());
+
+        drop(daemon_holds);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_clear_socket_still_clears_the_genuinely_dead() {
+        // The claim is a guard on the unlink, not a new way to leave corpses
+        // lying around: a socket file nobody answers on and nobody has
+        // claimed is stale, and goes - PID file with it.
+        let sock = dead_socket("sock");
+        let pid = temp_path("pid");
+        std::fs::write(&pid, b"999999\n").unwrap();
+
+        assert!(clear_socket(&sock, Some(&pid)).is_none());
+        assert!(!sock.exists(), "an unclaimed corpse is cleared as before");
+        assert!(!pid.exists(), "and its PID file with it");
+    }
+
+    #[test]
     fn test_probe_socket_classifies_each_state() {
         // Live.
         let live = temp_path("sock");

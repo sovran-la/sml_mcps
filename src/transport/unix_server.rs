@@ -1114,6 +1114,119 @@ mod tests {
         assert!(!sock.exists(), "and nothing is created in passing");
     }
 
+    //
+    // The claim on the socket path
+    //
+
+    #[test]
+    fn test_a_mid_bind_socket_survives_a_racing_server() {
+        // The orphaned-daemon bug, held open instead of raced: a socket that
+        // is bound but not yet listening refuses a connect exactly the way a
+        // stale socket file does. The old code took one such refusal as proof
+        // of staleness and unlinked a live daemon's socket out from under it,
+        // leaving that daemon serving a nameless inode forever. Under the
+        // claim, the loser never gets to ask the misleading question.
+        use crate::socket::test_support::MidBindSocket;
+
+        let sock = temp_socket();
+        let winner = claim(&sock); // what a daemon holds while it binds
+        let mid_bind = MidBindSocket::bind(&sock);
+
+        let error =
+            claim_socket_path(&sock).expect_err("a second server must be stopped at the claim");
+        assert!(
+            error
+                .to_string()
+                .contains("being claimed by another starting server"),
+            "{error}"
+        );
+        assert!(
+            sock.exists(),
+            "the winner's socket file must survive the loser's attempt"
+        );
+
+        // The winner finishes its bind undisturbed, and is reachable at its
+        // own path - the outcome the old code destroyed.
+        mid_bind.listen();
+        assert!(
+            UnixStream::connect(&sock).is_ok(),
+            "the winner must still be reachable where it bound"
+        );
+
+        drop(winner);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_a_live_server_is_refused_by_name() {
+        // A serving daemon holds its claim for life, so a second server is
+        // refused at the claim - with the same words this crate has always
+        // used for a socket that answers.
+        let sock = temp_socket();
+        let store = Arc::new(StdMutex::new(HashMap::new()));
+        let _server = spawn_server(&sock, Some(Duration::from_secs(10)), store);
+        let mut client = connect_retry(&sock);
+        initialize(&mut client, 1);
+
+        let error =
+            claim_socket_path(&sock).expect_err("a socket being served must not be claimable");
+        assert!(
+            error
+                .to_string()
+                .contains("already in use by a live server"),
+            "{error}"
+        );
+        assert!(sock.exists());
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn test_the_claim_is_released_with_the_server() {
+        // Restarts depend on this: a daemon that exited - here by idling out -
+        // must leave the path claimable for its successor.
+        let sock = temp_socket();
+        let store = Arc::new(StdMutex::new(HashMap::new()));
+        let server = spawn_server(&sock, Some(Duration::from_millis(300)), store);
+        {
+            let mut client = connect_retry(&sock);
+            initialize(&mut client, 1);
+            // drops -> idle countdown -> exit
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !server.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(server.is_finished(), "the server should have idled out");
+        assert!(server.join().unwrap().is_ok());
+
+        assert!(
+            SocketLock::acquire(&sock).unwrap().is_some(),
+            "a stopped server must have released its claim"
+        );
+    }
+
+    #[test]
+    fn test_a_dead_servers_leftovers_do_not_block_a_restart() {
+        // What a `kill -9` leaves behind: a socket file nobody answers on and
+        // a lock file nobody holds - the kernel released the flock with the
+        // process. A new server must claim the path, clear the corpse, and
+        // serve.
+        let sock = temp_socket();
+        std::fs::write(&sock, b"stale").unwrap();
+        let mut lock = sock.clone();
+        lock.set_extension("lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        let store = Arc::new(StdMutex::new(HashMap::new()));
+        let _server = spawn_server(&sock, Some(Duration::from_secs(10)), store);
+        let mut client = connect_retry(&sock);
+        initialize(&mut client, 1);
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
     #[test]
     fn test_serving_creates_the_socket_directory_privately() {
         // A socket is only as private as the directory holding it, and a
