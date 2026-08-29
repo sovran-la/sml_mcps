@@ -195,6 +195,8 @@ fn main() -> Result<()> {
 
 `auto_start` connects to a running daemon, or starts one if needed (handling stale sockets and PID files, and refusing a socket this user does not own). The shim is a transparent proxy — MCP over stdio on one side, Unix socket on the other.
 
+Staleness is decided under a claim, not guessed: the daemon holds an `flock` on a sibling `.lock` file (next to the `.pid` file) for as long as it serves, and nothing — daemon or shim — unlinks a socket file without holding that claim. This is what stops a server racing to the same path from misreading a daemon caught between `bind` and `listen` as dead and deleting its socket out from under it. The `.lock` file is deliberately never removed; the kernel releases the lock itself when its holder exits, however it exits.
+
 See `examples/unix_server.rs` for a complete single-binary daemon + shim wired up
 by hand, and `examples/serve_daemon.rs` for the same thing in one call.
 

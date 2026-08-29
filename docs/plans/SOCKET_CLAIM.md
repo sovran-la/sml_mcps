@@ -175,3 +175,30 @@ behavior, watch the mid-bind tests fail with the socket deleted), each new
 guard is mutation-checked (delete it, watch a test fail), the full suite runs
 five times for flakiness, and sovran-agents builds and tests against the
 modified crate. All tests use temp paths; no test touches a real daemon home.
+
+## What the implementation changed about this plan
+
+Written after the fact, so the next reader does not have to diff prose against
+code.
+
+- **`clear_socket` on a held claim answers with a connection when it can.**
+  The plan said: claim held, delete nothing, return `None`, let the caller's
+  wait-or-spawn logic find the owner. The pre-existing test
+  `test_clear_socket_returns_a_live_daemon_instead_of_deleting_it` disagreed,
+  correctly: a *serving* daemon holds its claim for life, so the commonest
+  holder is one that is already listening, and a bare `None` there would have
+  downgraded "connect to the daemon that is right in front of you" into a
+  pointless spawn-and-wait. The implementation connects when the socket
+  answers and returns `None` only for a holder still mid-bind - which the
+  wait-or-spawn path then finds.
+- **One test the inventory did not list:** an unanswerable claim (the lock
+  file cannot even be opened) is an error, not a pass - treating it as "free"
+  would let two daemons through on exactly the filesystems where flock cannot
+  arbitrate.
+- **Revert evidence, as promised:** with the flock neutered, the mid-bind pin
+  fails at "a second server must be stopped at the claim" and the shim pin
+  fails at "the daemon's socket file must survive the shim's cleanup" - the
+  deleted-socket outcome, reproduced on demand. Restored, all pass. Each guard
+  was also mutated independently (clear_socket without the claim; the claim
+  dropped after bind instead of held for life) and each mutant was killed by a
+  named test.
