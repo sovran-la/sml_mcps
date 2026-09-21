@@ -515,6 +515,82 @@ mod tests {
         );
     }
 
+    //
+    // Remote entries
+    //
+
+    #[test]
+    fn install_writes_a_remote_entry_with_the_connect_flag_in_its_arguments() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+
+        client
+            .install(&entry().with_connect("jetson-memory:7211"))
+            .unwrap();
+
+        let written = &config_of(&client)["mcpServers"]["my-mcp"];
+        assert_eq!(written["command"], our_command());
+        assert_eq!(
+            written["args"],
+            json!(["serve", "--connect", "jetson-memory:7211"])
+        );
+    }
+
+    #[test]
+    fn a_remote_entry_is_installed_only_if_its_address_matches() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+        let remote = entry().with_connect("jetson-memory:7211");
+        client.install(&remote).unwrap();
+
+        assert_eq!(client.check_existing(&remote), InstallStatus::Installed);
+        // A different address, or no address, is a different entry.
+        assert_eq!(
+            client.check_existing(&entry().with_connect("other-host:7211")),
+            InstallStatus::NeedsRefresh
+        );
+        assert_eq!(client.check_existing(&entry()), InstallStatus::NeedsRefresh);
+    }
+
+    #[test]
+    fn install_turns_a_local_entry_into_a_remote_one_and_back() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+        client.install(&entry()).unwrap();
+
+        client
+            .install(&entry().with_connect("jetson-memory:7211"))
+            .unwrap();
+        assert_eq!(
+            config_of(&client)["mcpServers"]["my-mcp"]["args"],
+            json!(["serve", "--connect", "jetson-memory:7211"])
+        );
+
+        client.install(&entry()).unwrap();
+        assert_eq!(
+            config_of(&client)["mcpServers"]["my-mcp"]["args"],
+            json!(["serve"])
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_a_remote_entry_whatever_address_it_was_written_with() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir, "mcpServers");
+        client
+            .install(&entry().with_connect("jetson-memory:7211"))
+            .unwrap();
+
+        // By name: the entry asked about carries no address at all.
+        client.uninstall(&entry()).unwrap();
+
+        assert!(config_of(&client)["mcpServers"]["my-mcp"].is_null());
+        assert_eq!(
+            client.check_existing(&entry().with_connect("jetson-memory:7211")),
+            InstallStatus::NotInstalled
+        );
+    }
+
     #[test]
     fn install_writes_the_entry_under_its_own_name() {
         let dir = TempDir::new().unwrap();

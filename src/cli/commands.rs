@@ -515,6 +515,75 @@ mod tests {
     }
 
     #[test]
+    fn install_writes_a_remote_entry_to_every_client_and_uninstall_removes_it() {
+        // Every registry format, through the command: the flag lands in each
+        // config's `args`, each client reports it installed, and the plain
+        // entry - no address - is enough to take it out again.
+        let dir = TempDir::new().unwrap();
+        let remote = entry().with_connect("jetson-memory:7211");
+
+        let report = install(&remote, detected_clients(&dir), &[]);
+
+        assert_eq!(report.outcome, Outcome::Done);
+        assert!(report.text.contains("Detected 6 client(s), changed 6."));
+        for client in clients_under(dir.path()) {
+            assert_eq!(
+                client.check_existing(&remote),
+                InstallStatus::Installed,
+                "{}",
+                client.name()
+            );
+            let text = std::fs::read_to_string(client.config_path()).unwrap();
+            assert!(
+                text.contains("--connect") && text.contains("jetson-memory:7211"),
+                "{}: {text}",
+                client.name()
+            );
+        }
+
+        let report = uninstall(&entry(), detected_clients(&dir), &[]);
+
+        assert_eq!(report.outcome, Outcome::Done);
+        assert!(report.text.contains("Removed from 6 client(s)."));
+        for client in clients_under(dir.path()) {
+            assert_eq!(
+                client.check_existing(&remote),
+                InstallStatus::NotInstalled,
+                "{}",
+                client.name()
+            );
+            let text = std::fs::read_to_string(client.config_path()).unwrap();
+            assert!(
+                !text.contains("jetson-memory:7211"),
+                "{}: {text}",
+                client.name()
+            );
+        }
+    }
+
+    #[test]
+    fn install_over_a_local_entry_with_an_address_updates_every_client() {
+        // A server already installed locally, then pointed at another
+        // machine: `install --connect` is an update, not a no-op.
+        let dir = TempDir::new().unwrap();
+        install(&entry(), detected_clients(&dir), &[]);
+
+        let report = install(
+            &entry().with_connect("jetson-memory:7211"),
+            detected_clients(&dir),
+            &[],
+        );
+
+        assert_eq!(report.outcome, Outcome::Done);
+        assert!(
+            report.text.contains("Detected 6 client(s), changed 6."),
+            "{}",
+            report.text
+        );
+        assert!(report.text.contains(": updated ("), "{}", report.text);
+    }
+
+    #[test]
     fn install_names_the_binary_and_the_entry() {
         let dir = TempDir::new().unwrap();
 

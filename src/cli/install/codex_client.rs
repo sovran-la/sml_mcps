@@ -90,8 +90,8 @@ impl CodexClient {
         table.insert("command", value(entry.command()));
 
         let mut arguments = Array::new();
-        for argument in entry.args {
-            arguments.push(*argument);
+        for argument in entry.arguments() {
+            arguments.push(argument);
         }
         table.insert("args", value(arguments));
 
@@ -134,7 +134,7 @@ fn matches_entry(existing: &Item, entry: &ServerEntry) -> bool {
         .get("args")
         .and_then(Item::as_array)
         .and_then(|array| array.iter().map(Value::as_str).collect());
-    let arguments_match = arguments.as_deref() == Some(entry.args);
+    let arguments_match = arguments == Some(entry.arguments().iter().map(String::as_str).collect());
 
     // Against the deduped view of the entry's environment, because that is what
     // `build_entry` writes: a table cannot hold `A` twice, so comparing the
@@ -534,6 +534,106 @@ mod tests {
             .map(|item| item.as_str().unwrap().to_string())
             .collect();
         assert_eq!(arguments, vec!["serve", "--stdio"]);
+    }
+
+    /// The `args` of the entry table, as strings.
+    fn arguments_of(client: &CodexClient) -> Vec<String> {
+        entry_of(client).unwrap()["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    //
+    // Remote entries
+    //
+
+    #[test]
+    fn install_writes_a_remote_entry_with_the_connect_flag_in_its_arguments() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir);
+
+        client
+            .install(&entry().with_connect("jetson-memory:7211"))
+            .unwrap();
+
+        assert_eq!(
+            arguments_of(&client),
+            ["serve", "--connect", "jetson-memory:7211"]
+        );
+        assert_eq!(
+            entry_of(&client).unwrap()["command"].as_str().unwrap(),
+            our_command()
+        );
+    }
+
+    #[test]
+    fn a_remote_entry_is_installed_only_if_its_address_matches() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir);
+        let remote = entry().with_connect("jetson-memory:7211");
+        client.install(&remote).unwrap();
+
+        assert_eq!(client.check_existing(&remote), InstallStatus::Installed);
+        assert_eq!(
+            client.check_existing(&entry().with_connect("other-host:7211")),
+            InstallStatus::NeedsRefresh
+        );
+        assert_eq!(client.check_existing(&entry()), InstallStatus::NeedsRefresh);
+    }
+
+    #[test]
+    fn install_turns_a_local_entry_into_a_remote_one_and_back() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir);
+        client.install(&entry()).unwrap();
+
+        client
+            .install(&entry().with_connect("jetson-memory:7211"))
+            .unwrap();
+        assert_eq!(
+            arguments_of(&client),
+            ["serve", "--connect", "jetson-memory:7211"]
+        );
+
+        client.install(&entry()).unwrap();
+        assert_eq!(arguments_of(&client), ["serve"]);
+    }
+
+    #[test]
+    fn uninstall_removes_a_remote_entry_whatever_address_it_was_written_with() {
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir);
+        client
+            .install(&entry().with_connect("jetson-memory:7211"))
+            .unwrap();
+
+        client.uninstall(&entry()).unwrap();
+
+        assert!(entry_of(&client).is_none());
+        assert_eq!(
+            client.check_existing(&entry().with_connect("jetson-memory:7211")),
+            InstallStatus::NotInstalled
+        );
+    }
+
+    #[test]
+    fn a_remote_entry_reads_back_where_codex_looks() {
+        // Codex reads `args` as an array of strings on the entry table. A
+        // remote entry is the same shape with two more strings in it.
+        let dir = TempDir::new().unwrap();
+        let client = client(&dir);
+        client
+            .install(&entry().with_connect("jetson-memory:7211"))
+            .unwrap();
+
+        let text = std::fs::read_to_string(client.config_path()).unwrap();
+        assert!(
+            text.contains(r#"args = ["serve", "--connect", "jetson-memory:7211"]"#),
+            "{text}"
+        );
     }
 
     #[test]

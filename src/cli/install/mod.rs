@@ -107,6 +107,17 @@ pub struct ServerEntry {
     /// today means [`CodexClient`] alone - see [`JsonClient`] for why the JSON
     /// clients cannot.
     pub auto_approve: bool,
+
+    /// A daemon on another machine the installed binary should dial, as
+    /// `host:port`.
+    ///
+    /// Set by `install --connect <host:port>`. When present, the entry's
+    /// arguments end with `--connect <host:port>`, so the client launches the
+    /// binary as a remote shim - see
+    /// [`Server::serve_daemon_with`](crate::Server::serve_daemon_with) - and
+    /// nothing on this machine is consulted, spawned, or bound. Owned rather
+    /// than `'static` because it is always a runtime value.
+    pub connect: Option<String>,
 }
 
 impl ServerEntry {
@@ -117,12 +128,30 @@ impl ServerEntry {
             args,
             env: Vec::new(),
             auto_approve: false,
+            connect: None,
         }
     }
 
     /// Pin one environment variable in the entry.
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Point the installed binary at a daemon on another machine.
+    ///
+    /// What `install --connect <host:port>` does to the entry before writing
+    /// it. The value is written as given - a MagicDNS name is the usual case -
+    /// and validated by the command, not here.
+    ///
+    /// ```
+    /// use sml_mcps::cli::ServerEntry;
+    ///
+    /// let entry = ServerEntry::new("my-mcp", &["serve"]).with_connect("jetson-memory:7211");
+    /// assert_eq!(entry.arguments(), ["serve", "--connect", "jetson-memory:7211"]);
+    /// ```
+    pub fn with_connect(mut self, addr: impl Into<String>) -> Self {
+        self.connect = Some(addr.into());
         self
     }
 
@@ -164,9 +193,20 @@ impl ServerEntry {
     }
 
     /// [`args`](Self::args) as owned strings, which is what both config formats
-    /// want.
+    /// want - followed by `--connect <host:port>` when
+    /// [`connect`](Self::connect) is set.
+    ///
+    /// The one place the argument list is assembled, so the two config writers
+    /// and the two comparisons behind
+    /// [`check_existing`](McpClient::check_existing) cannot drift apart on
+    /// where the flag goes.
     pub fn arguments(&self) -> Vec<String> {
-        self.args.iter().map(|arg| (*arg).to_string()).collect()
+        let mut arguments: Vec<String> = self.args.iter().map(|arg| (*arg).to_string()).collect();
+        if let Some(addr) = &self.connect {
+            arguments.push(crate::remote::CONNECT_FLAG.to_string());
+            arguments.push(addr.clone());
+        }
+        arguments
     }
 
     /// The pinned environment as the map both config formats store it as.
@@ -542,9 +582,67 @@ mod tests {
             args: &["serve"],
             env: vec![],
             auto_approve: false,
+            connect: None,
         };
 
         assert_eq!(entry, ServerEntry::new("my-mcp", &["serve"]));
+    }
+
+    //
+    // Remote mode
+    //
+
+    #[test]
+    fn a_fresh_entry_dials_nothing() {
+        assert!(entry().connect.is_none());
+        assert_eq!(entry().arguments(), ["serve"]);
+    }
+
+    #[test]
+    fn a_connect_address_is_appended_to_the_arguments() {
+        // After the author's own arguments, so `serve --connect h:p` reaches
+        // the author's `serve` handler with the flag in its slice - and so
+        // `serve_daemon_with` finds it in `argv`.
+        assert_eq!(
+            entry().with_connect("jetson-memory:7211").arguments(),
+            ["serve", "--connect", "jetson-memory:7211"]
+        );
+        assert_eq!(
+            ServerEntry::new("bare", &[])
+                .with_connect("127.0.0.1:7211")
+                .arguments(),
+            ["--connect", "127.0.0.1:7211"]
+        );
+    }
+
+    #[test]
+    fn a_connect_address_reaches_the_json_entry_and_the_snippet() {
+        let entry = entry().with_connect("jetson-memory:7211");
+
+        assert_eq!(
+            entry.json_entry()["args"],
+            json!(["serve", "--connect", "jetson-memory:7211"])
+        );
+        let parsed: Value = serde_json::from_str(&entry.snippet()).unwrap();
+        assert_eq!(
+            parsed["mcpServers"]["my-mcp"]["args"],
+            json!(["serve", "--connect", "jetson-memory:7211"])
+        );
+    }
+
+    #[test]
+    fn a_connect_address_is_part_of_what_makes_two_entries_different() {
+        assert_ne!(entry(), entry().with_connect("h:1"));
+        assert_ne!(entry().with_connect("h:1"), entry().with_connect("h:2"));
+        assert_eq!(entry().with_connect("h:1"), entry().with_connect("h:1"));
+    }
+
+    #[test]
+    fn a_later_connect_replaces_an_earlier_one() {
+        assert_eq!(
+            entry().with_connect("a:1").with_connect("b:2").connect,
+            Some("b:2".to_string())
+        );
     }
 
     #[test]

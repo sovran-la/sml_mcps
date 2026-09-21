@@ -608,6 +608,213 @@ fn health_runs_the_authors_check() {
     );
 }
 
+//
+// Remote mode
+//
+
+#[test]
+fn install_with_connect_writes_the_flag_into_every_client_config() {
+    let home = home_with_clients();
+
+    let output = run(home.path(), &["install", "--connect", "jetson-memory:7211"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("Detected 3 client(s), changed 3."),
+        "{}",
+        stdout(&output)
+    );
+
+    // Exactly what the client will launch: the binary, then `serve`, then the
+    // flag and its value as two separate arguments.
+    let expected = serde_json::json!(["serve", "--connect", "jetson-memory:7211"]);
+    for json_config in [".cursor/mcp.json", ".claude.json"] {
+        let config = json_at(&home.path().join(json_config));
+        assert_eq!(
+            config["mcpServers"][ENTRY_NAME]["command"],
+            EXAMPLE_BINARY.display().to_string(),
+            "{json_config}"
+        );
+        assert_eq!(
+            config["mcpServers"][ENTRY_NAME]["args"], expected,
+            "{json_config}"
+        );
+    }
+    let codex = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+    assert!(
+        codex.contains(r#"args = ["serve", "--connect", "jetson-memory:7211"]"#),
+        "{codex}"
+    );
+}
+
+#[test]
+fn install_with_connect_over_a_local_install_updates_and_uninstall_removes() {
+    let home = home_with_clients();
+    run(home.path(), &["install"]);
+
+    let output = run(home.path(), &["install", "--connect", "jetson-memory:7211"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("Cursor: updated ("),
+        "{}",
+        stdout(&output)
+    );
+
+    let output = run(home.path(), &["uninstall"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("Removed from 3 client(s)."),
+        "{}",
+        stdout(&output)
+    );
+    for path in config_files(&home) {
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("jetson-memory"),
+            "{}: {text}",
+            path.display()
+        );
+        assert!(!text.contains(ENTRY_NAME), "{}: {text}", path.display());
+    }
+}
+
+#[test]
+fn install_with_a_bad_connect_value_exits_two_and_writes_nothing() {
+    let home = home_with_clients();
+
+    for bad in [
+        vec!["install", "--connect"],
+        vec!["install", "--connect", "jetson-memory"],
+        vec!["install", "--connect", "jetson-memory:port"],
+    ] {
+        let output = run(home.path(), &bad);
+        assert_eq!(code(&output), 2, "{bad:?}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("host:port"),
+            "{bad:?}: {}",
+            stderr(&output)
+        );
+    }
+    assert!(config_files(&home).is_empty(), "nothing may be written");
+    assert!(
+        !data_dir(&home).exists(),
+        "the install hook must not have run"
+    );
+}
+
+#[test]
+fn install_help_lists_connect() {
+    let home = tempfile::TempDir::new().unwrap();
+    let output = run(home.path(), &["install", "--help"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(
+        stdout(&output).contains("--connect <host:port>"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// A real MCP server on loopback, serving one connection in a thread.
+fn one_shot_server() -> (String, std::thread::JoinHandle<()>) {
+    use sml_mcps::{Server, ServerConfig, TcpTransport};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut server: Server<()> = Server::new(ServerConfig {
+            name: "far-end".into(),
+            version: "9.9.9".into(),
+            ..Default::default()
+        });
+        let _ = server.start(TcpTransport::from_stream(stream), ());
+    });
+
+    (addr, handle)
+}
+
+#[test]
+fn health_with_connect_probes_the_daemon_instead_of_running_the_local_check() {
+    let home = home_with_clients();
+    let (addr, server) = one_shot_server();
+
+    let output = run(home.path(), &["health", "--connect", &addr]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.contains(&format!("ok - {addr} is serving far-end 9.9.9")),
+        "{report}"
+    );
+    assert!(
+        !report.contains("MCP client(s) detected"),
+        "the author's local check must not run: {report}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn health_with_connect_reaches_a_daemon_by_hostname() {
+    let home = home_with_clients();
+    let (addr, server) = one_shot_server();
+    let port = addr.rsplit_once(':').unwrap().1;
+    let by_name = format!("localhost:{port}");
+
+    let output = run(home.path(), &["health", "--connect", &by_name]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains(&format!("ok - {by_name} is serving far-end")),
+        "{}",
+        stdout(&output)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn health_with_connect_reports_an_unreachable_daemon_and_exits_one() {
+    let home = home_with_clients();
+    let addr = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
+
+    let output = run(home.path(), &["health", "--connect", &addr]);
+
+    assert_eq!(code(&output), 1);
+    let errors = stderr(&output);
+    assert!(errors.contains("cannot connect to"), "{errors}");
+    assert!(errors.contains(&addr), "{errors}");
+}
+
+#[test]
+fn health_with_a_name_that_does_not_resolve_exits_one_cleanly() {
+    let home = home_with_clients();
+
+    let output = run(
+        home.path(),
+        &["health", "--connect", "no-such-host.invalid:7211"],
+    );
+
+    assert_eq!(code(&output), 1);
+    assert!(
+        stderr(&output).contains("cannot connect to no-such-host.invalid:7211"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn health_with_a_bad_connect_value_exits_two() {
+    let home = home_with_clients();
+
+    let output = run(home.path(), &["health", "--connect", "jetson-memory"]);
+
+    assert_eq!(code(&output), 2);
+    assert!(stderr(&output).contains("host:port"), "{}", stderr(&output));
+}
+
 #[test]
 fn a_machine_with_no_home_gets_the_pasteable_snippet() {
     // Not a failure worth hiding: there is nothing to configure, so say what

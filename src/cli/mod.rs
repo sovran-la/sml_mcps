@@ -64,15 +64,29 @@
 //! # What this is not
 //!
 //! An argument parser. Subcommand names are matched, `--help` is answered, and
-//! `install`'s own `--client` is read. Everything after a custom command's name
-//! is handed to its closure as `&[String]` untouched: the flags declared on a
+//! the harness's own flags are read: `install`'s `--client` and `--connect`,
+//! `health`'s `--connect`. Everything after a custom command's name is handed
+//! to its closure as `&[String]` untouched: the flags declared on a
 //! [`SubCommand`] exist to be *printed*, and nothing validates that the ones
 //! that arrived are among them.
+//!
+//! # Remote mode
+//!
+//! `install --connect <host:port>` writes an entry whose arguments end in
+//! `--connect <host:port>`, so the client launches this binary as a shim to a
+//! daemon on another machine - see
+//! [`Server::serve_daemon_with`](crate::Server::serve_daemon_with). `health
+//! --connect <host:port>` asks that daemon whether it answers as an MCP server,
+//! instead of running the author's local check. Neither consults anything on
+//! this machine beyond the client configs. **TCP is in the clear**; bind the
+//! daemon's listener to an interface only trusted machines can reach.
 
 pub mod install;
 
 mod commands;
+mod health;
 
+use crate::remote::{RemoteAddr, connect_from_args};
 use commands::Outcome;
 
 pub use install::{
@@ -181,10 +195,15 @@ impl Builtin {
     fn subcommand(self) -> SubCommand {
         match self {
             Self::Install => {
-                SubCommand::new("install", "Install this server into MCP client configs").flag(
-                    "--client <name>",
-                    "Only configure the named client (repeatable)",
-                )
+                SubCommand::new("install", "Install this server into MCP client configs")
+                    .flag(
+                        "--client <name>",
+                        "Only configure the named client (repeatable)",
+                    )
+                    .flag(
+                        "--connect <host:port>",
+                        "Point clients at a daemon on another machine, over TCP",
+                    )
             }
             Self::Uninstall => {
                 SubCommand::new("uninstall", "Remove this server from MCP client configs").flag(
@@ -193,7 +212,10 @@ impl Builtin {
                 )
             }
             Self::Serve => SubCommand::new("serve", "Start the MCP server"),
-            Self::Health => SubCommand::new("health", "Run health checks"),
+            Self::Health => SubCommand::new("health", "Run health checks").flag(
+                "--connect <host:port>",
+                "Probe a daemon on another machine instead of checking locally",
+            ),
         }
     }
 }
@@ -304,6 +326,12 @@ impl Cli {
     }
 
     /// What `health` should do.
+    ///
+    /// Called with everything after `health` on the command line - except
+    /// when that includes `--connect <host:port>`. A remote daemon is probed
+    /// by the harness itself (an `initialize` and a `ping` over TCP), and
+    /// this handler is not called at all: whatever it checks is local to this
+    /// machine, and the daemon being asked about is not.
     pub fn on_health<F>(mut self, handler: F) -> Self
     where
         F: FnOnce(&[String]) -> CommandResult + 'static,
@@ -426,7 +454,7 @@ impl Cli {
                 None => self.unknown("serve"),
             },
             Plan::Builtin(Builtin::Health, args) => match self.health.take() {
-                Some(handler) => finish(handler(&args)),
+                Some(handler) => self.health(handler, &args),
                 None => self.unknown("health"),
             },
             Plan::Custom(index, args) => {
@@ -452,8 +480,8 @@ impl Cli {
 
     /// Run the built-in `install`, and the author's own work before it.
     fn install(&mut self, args: &[String]) -> ExitCode {
-        let selectors = match client_selectors(args) {
-            Ok(selectors) => selectors,
+        let HarnessArgs { selectors, connect } = match HarnessArgs::parse(args) {
+            Ok(parsed) => parsed,
             Err(message) => return self.usage_error(&message, "install"),
         };
 
@@ -470,13 +498,25 @@ impl Cli {
             return failed;
         }
 
-        self.report(commands::install(&self.entry, clients, &selectors))
+        // `--connect` lands on the entry, not the flag list: `arguments()` is
+        // the one place the argument list is assembled, so both config
+        // formats write it and both comparisons see it.
+        let entry = match connect {
+            Some(addr) => self.entry.clone().with_connect(addr.to_string()),
+            None => self.entry.clone(),
+        };
+
+        self.report(commands::install(&entry, clients, &selectors))
     }
 
     /// Run the built-in `uninstall`, and the author's own cleanup after it.
+    ///
+    /// `--connect` is accepted here so the line that installed a remote entry
+    /// uninstalls it with one word changed, but it decides nothing: an entry
+    /// is removed by name, whatever address it was written with.
     fn uninstall(&mut self, args: &[String]) -> ExitCode {
-        let selectors = match client_selectors(args) {
-            Ok(selectors) => selectors,
+        let HarnessArgs { selectors, .. } = match HarnessArgs::parse(args) {
+            Ok(parsed) => parsed,
             Err(message) => return self.usage_error(&message, "uninstall"),
         };
 
@@ -492,6 +532,20 @@ impl Cli {
         // way. A hook that fails fails the process without undoing anything -
         // there is nothing to undo it with.
         hook_failure(self.after_uninstall.take(), args).unwrap_or(removals)
+    }
+
+    /// Run `health`: the author's check, or the remote probe if the line asks
+    /// for one.
+    fn health(&self, handler: Handler, args: &[String]) -> ExitCode {
+        match connect_from_args(args) {
+            Ok(Some(addr)) => finish(
+                health::probe(&addr)
+                    .map(|report| println!("{report}"))
+                    .map_err(Into::into),
+            ),
+            Ok(None) => finish(handler(args)),
+            Err(message) => self.usage_error(&message, "health"),
+        }
     }
 
     /// Print what a built-in command had to say, and exit accordingly.
@@ -623,6 +677,13 @@ impl Cli {
         };
         let rest = args[1..].to_vec();
 
+        // The same bare server installed with `--connect` is launched as
+        // `<binary> --connect host:port`, which is `serve` with the flag - the
+        // flag is for `serve_daemon_with` to read, not a command of its own.
+        if self.entry.args.is_empty() && self.serve.is_some() && is_connect_flag(first) {
+            return Plan::Builtin(Builtin::Serve, args.to_vec());
+        }
+
         if is_help_flag(first) || first == "help" {
             return match rest.first() {
                 Some(name) if self.find(name).is_some() => Plan::CommandHelp(name.clone()),
@@ -733,34 +794,65 @@ fn is_help_flag(argument: &str) -> bool {
     argument == "--help" || argument == "-h"
 }
 
-/// The `--client` values in `args`, or what was wrong with them.
+/// Whether `argument` is `--connect`, in either spelling.
+fn is_connect_flag(argument: &str) -> bool {
+    argument == crate::remote::CONNECT_FLAG
+        || argument.starts_with(&format!("{}=", crate::remote::CONNECT_FLAG))
+}
+
+/// The flags `install` and `uninstall` read for themselves.
 ///
-/// The one place the harness reads a flag, because `--client` is the harness's
-/// own. Anything else is a typo worth reporting: an `install --clients cursor`
-/// that quietly configured everything is the sort of thing nobody notices.
-fn client_selectors(args: &[String]) -> Result<Vec<String>, String> {
-    let mut selectors = Vec::new();
-    let mut remaining = args.iter();
+/// The one place the harness parses a command line, because these flags are
+/// the harness's own. Anything else is a typo worth reporting: an `install
+/// --clients cursor` that quietly configured everything is the sort of thing
+/// nobody notices.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HarnessArgs {
+    /// Every `--client` value, in order.
+    selectors: Vec<String>,
 
-    while let Some(argument) = remaining.next() {
-        let value = if argument == "--client" {
-            remaining
-                .next()
-                .ok_or_else(|| "`--client` needs a client name".to_string())?
-                .clone()
-        } else if let Some(value) = argument.strip_prefix("--client=") {
-            value.to_string()
-        } else {
-            return Err(format!("unknown argument `{argument}`"));
-        };
+    /// The `--connect` value, if there was one.
+    connect: Option<RemoteAddr>,
+}
 
-        if value.is_empty() {
-            return Err("`--client` needs a client name".to_string());
+impl HarnessArgs {
+    /// What `args` asks for, or what was wrong with it.
+    fn parse(args: &[String]) -> Result<Self, String> {
+        // `--connect` first, so its own message wins for a bad value; then the
+        // rest, with the pair it consumed skipped.
+        let connect = connect_from_args(args)?;
+
+        let mut selectors = Vec::new();
+        let mut remaining = args.iter();
+
+        while let Some(argument) = remaining.next() {
+            if argument == crate::remote::CONNECT_FLAG {
+                remaining.next();
+                continue;
+            }
+            if is_connect_flag(argument) {
+                continue;
+            }
+
+            let value = if argument == "--client" {
+                remaining
+                    .next()
+                    .ok_or_else(|| "`--client` needs a client name".to_string())?
+                    .clone()
+            } else if let Some(value) = argument.strip_prefix("--client=") {
+                value.to_string()
+            } else {
+                return Err(format!("unknown argument `{argument}`"));
+            };
+
+            if value.is_empty() {
+                return Err("`--client` needs a client name".to_string());
+            }
+            selectors.push(value);
         }
-        selectors.push(value);
-    }
 
-    Ok(selectors)
+        Ok(Self { selectors, connect })
+    }
 }
 
 /// How wide the left column of a help listing has to be.
@@ -1453,6 +1545,12 @@ mod tests {
     // --client parsing
     //
 
+    /// The `--client` half of the harness's flags, as the tests below have
+    /// always asked for it.
+    fn client_selectors(args: &[String]) -> Result<Vec<String>, String> {
+        HarnessArgs::parse(args).map(|parsed| parsed.selectors)
+    }
+
     #[test]
     fn no_client_flag_selects_nothing_in_particular() {
         assert_eq!(client_selectors(&[]).unwrap(), Vec::<String>::new());
@@ -1494,6 +1592,299 @@ mod tests {
         let error = client_selectors(&["--force".to_string()]).unwrap_err();
 
         assert!(error.contains("--force"), "{error}");
+    }
+
+    //
+    // --connect parsing
+    //
+
+    /// Owned strings, which is what the harness is handed.
+    fn args(line: &[&str]) -> Vec<String> {
+        line.iter().map(|argument| argument.to_string()).collect()
+    }
+
+    #[test]
+    fn no_connect_flag_dials_nothing() {
+        assert_eq!(HarnessArgs::parse(&[]).unwrap().connect, None);
+        assert_eq!(
+            HarnessArgs::parse(&args(&["--client", "cursor"]))
+                .unwrap()
+                .connect,
+            None
+        );
+    }
+
+    #[test]
+    fn a_connect_flag_takes_the_next_argument() {
+        let parsed = HarnessArgs::parse(&args(&["--connect", "jetson-memory:7211"])).unwrap();
+
+        assert_eq!(parsed.connect.unwrap().to_string(), "jetson-memory:7211");
+        assert!(parsed.selectors.is_empty());
+    }
+
+    #[test]
+    fn a_connect_flag_also_takes_an_equals_sign() {
+        let parsed = HarnessArgs::parse(&args(&["--connect=127.0.0.1:7211"])).unwrap();
+
+        assert_eq!(parsed.connect.unwrap().to_string(), "127.0.0.1:7211");
+    }
+
+    #[test]
+    fn connect_and_client_flags_mix_in_any_order() {
+        for line in [
+            ["--connect", "h:1", "--client", "cursor", "--client=codex"],
+            ["--client", "cursor", "--connect", "h:1", "--client=codex"],
+            ["--client", "cursor", "--client=codex", "--connect", "h:1"],
+        ] {
+            let parsed = HarnessArgs::parse(&args(&line)).unwrap();
+            assert_eq!(parsed.selectors, ["cursor", "codex"], "{line:?}");
+            assert_eq!(parsed.connect.unwrap().to_string(), "h:1", "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_connect_flag_with_nothing_after_it_is_an_error() {
+        let error = HarnessArgs::parse(&args(&["--connect"])).unwrap_err();
+        assert!(error.contains("needs a host:port"), "{error}");
+
+        let error = HarnessArgs::parse(&args(&["--connect="])).unwrap_err();
+        assert!(error.contains("needs a host:port"), "{error}");
+    }
+
+    #[test]
+    fn a_connect_flag_with_a_bad_value_is_an_error() {
+        // A hostname without a port, and a port that is not a number: both
+        // refused at the command line, before any config is opened.
+        for value in ["jetson-memory", "jetson-memory:port", ":7211", "h:0"] {
+            let error = HarnessArgs::parse(&args(&["--connect", value])).unwrap_err();
+            assert!(error.contains("not a host:port"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_connect_flag_accepts_a_hostname_without_resolving_it() {
+        // Not resolved at parse time: `install` must work on a laptop whose
+        // daemon is switched off, and a name is only the resolver's business
+        // once something dials it.
+        let parsed =
+            HarnessArgs::parse(&args(&["--connect", "no-such-host.invalid:7211"])).unwrap();
+        assert_eq!(
+            parsed.connect.unwrap().to_string(),
+            "no-such-host.invalid:7211"
+        );
+    }
+
+    #[test]
+    fn a_connect_flag_does_not_swallow_a_client_flag_as_its_value() {
+        let error = HarnessArgs::parse(&args(&["--connect", "--client", "cursor"])).unwrap_err();
+        assert!(error.contains("not a host:port"), "{error}");
+    }
+
+    #[test]
+    fn install_with_a_bad_connect_value_is_a_usage_error() {
+        let log = log();
+        assert_eq!(
+            run(
+                cli().on_install(refuser(&log)),
+                &["my-mcp", "install", "--connect", "jetson-memory"]
+            ),
+            usage()
+        );
+        assert!(
+            seen(&log).is_empty(),
+            "a refused command line must not reach the install hook"
+        );
+    }
+
+    #[test]
+    fn install_with_a_connect_flag_reaches_the_install_hook_with_it() {
+        let log = log();
+        assert_eq!(
+            run(
+                cli().on_install(refuser(&log)),
+                &["my-mcp", "install", "--connect", "jetson-memory:7211"]
+            ),
+            failure()
+        );
+        assert_eq!(seen(&log), vec![args(&["--connect", "jetson-memory:7211"])]);
+    }
+
+    #[test]
+    fn uninstall_accepts_a_connect_flag_and_removes_by_name() {
+        // The line that installed a remote entry, with one word changed. The
+        // address decides nothing; the stranger has no entry anywhere.
+        assert_eq!(
+            run(
+                stranger(),
+                &["my-mcp", "uninstall", "--connect", "jetson-memory:7211"]
+            ),
+            success()
+        );
+        assert_eq!(
+            run(stranger(), &["my-mcp", "uninstall", "--connect", "nope"]),
+            usage()
+        );
+    }
+
+    //
+    // health --connect
+    //
+
+    #[test]
+    fn health_with_a_connect_flag_does_not_reach_the_authors_check() {
+        // Nothing is listening on the address, so the probe fails - and the
+        // handler must still not have run, because the question was about
+        // another machine.
+        let addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+        let log = log();
+
+        assert_eq!(
+            run(
+                cli().on_health(recorder(&log)),
+                &["my-mcp", "health", "--connect", &addr]
+            ),
+            failure()
+        );
+        assert!(seen(&log).is_empty());
+    }
+
+    #[test]
+    fn health_with_a_connect_flag_reports_a_reachable_daemon() {
+        use crate::server::{Server, ServerConfig};
+        use crate::transport::TcpTransport;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut server: Server<()> = Server::new(ServerConfig::default());
+            let _ = server.start(TcpTransport::from_stream(stream), ());
+        });
+        let log = log();
+
+        assert_eq!(
+            run(
+                cli().on_health(recorder(&log)),
+                &["my-mcp", "health", "--connect", &addr]
+            ),
+            success()
+        );
+        assert!(seen(&log).is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn health_with_a_name_that_does_not_resolve_fails_cleanly() {
+        let log = log();
+        assert_eq!(
+            run(
+                cli().on_health(recorder(&log)),
+                &["my-mcp", "health", "--connect", "no-such-host.invalid:7211"]
+            ),
+            failure()
+        );
+        assert!(seen(&log).is_empty());
+    }
+
+    #[test]
+    fn health_with_a_bad_connect_value_is_a_usage_error() {
+        let log = log();
+        assert_eq!(
+            run(
+                cli().on_health(recorder(&log)),
+                &["my-mcp", "health", "--connect", "jetson-memory"]
+            ),
+            usage()
+        );
+        assert!(seen(&log).is_empty());
+    }
+
+    #[test]
+    fn health_without_a_connect_flag_still_reaches_the_authors_check() {
+        let log = log();
+        assert_eq!(
+            run(
+                cli().on_health(recorder(&log)),
+                &["my-mcp", "health", "--deep"]
+            ),
+            success()
+        );
+        assert_eq!(seen(&log), vec![args(&["--deep"])]);
+    }
+
+    #[test]
+    fn health_lists_its_connect_flag() {
+        let help = cli().on_health(|_| Ok(())).command_help("health").unwrap();
+        assert!(help.contains("--connect <host:port>"), "{help}");
+    }
+
+    #[test]
+    fn install_lists_its_connect_flag() {
+        let help = cli().command_help("install").unwrap();
+        assert!(help.contains("--connect <host:port>"), "{help}");
+    }
+
+    //
+    // A bare entry launched remotely
+    //
+
+    #[test]
+    fn a_bare_server_launched_with_connect_is_serve_with_the_flag() {
+        // What the installed entry of a bare server runs: `<bin> --connect
+        // host:port`. That is `serve`, and the flag has to reach it.
+        let log = log();
+        let cli = Cli::new(ServerEntry::new("bare", &[]))
+            .bin_name("bare")
+            .on_serve(recorder(&log));
+
+        assert_eq!(
+            run(cli, &["bare", "--connect", "jetson-memory:7211"]),
+            success()
+        );
+        assert_eq!(seen(&log), vec![args(&["--connect", "jetson-memory:7211"])]);
+    }
+
+    #[test]
+    fn a_bare_server_launched_with_connect_equals_is_serve_too() {
+        let log = log();
+        let cli = Cli::new(ServerEntry::new("bare", &[]))
+            .bin_name("bare")
+            .on_serve(recorder(&log));
+
+        assert_eq!(run(cli, &["bare", "--connect=h:1"]), success());
+        assert_eq!(seen(&log), vec![args(&["--connect=h:1"])]);
+    }
+
+    #[test]
+    fn a_server_with_arguments_launched_with_connect_alone_is_still_unknown() {
+        // `my-mcp --connect h:1` for a server whose entry is `serve`: the
+        // installed line would have been `my-mcp serve --connect h:1`, and
+        // this one is a mistake worth reporting rather than guessing at.
+        let log = log();
+        assert_eq!(
+            run(
+                cli().on_serve(recorder(&log)),
+                &["my-mcp", "--connect", "h:1"]
+            ),
+            usage()
+        );
+        assert!(seen(&log).is_empty());
+    }
+
+    #[test]
+    fn serve_with_connect_reaches_the_serve_handler_with_it() {
+        let log = log();
+        assert_eq!(
+            run(
+                cli().on_serve(recorder(&log)),
+                &["my-mcp", "serve", "--connect", "jetson-memory:7211"]
+            ),
+            success()
+        );
+        assert_eq!(seen(&log), vec![args(&["--connect", "jetson-memory:7211"])]);
     }
 
     //
