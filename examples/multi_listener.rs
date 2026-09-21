@@ -31,6 +31,11 @@
 //!     | nc -U /tmp/multi.sock
 //! echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"increment"}}' \
 //!     | nc 127.0.0.1 7743
+//!
+//! # Or through the same binary as a remote shim - what an MCP client on
+//! # another machine launches (a MagicDNS name works as well as an IP):
+//! echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"increment"}}' \
+//!     | cargo run --example multi_listener -- --connect 127.0.0.1:7743
 //! ```
 //!
 //! Note that a shim relaunches the daemon with exactly `--daemon --socket

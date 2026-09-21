@@ -44,6 +44,11 @@ pub mod auth;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+/// The `--connect <host:port>` remote shim: the flag, its value, and the
+/// connection it makes. Shared by the daemon dispatch and the CLI harness, so
+/// it is gated by neither.
+mod remote;
+
 #[cfg(unix)]
 pub mod bridge;
 
