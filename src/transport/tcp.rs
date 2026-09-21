@@ -6,16 +6,24 @@
 //! [`SocketTransport`](crate::transport::socket_stream::SocketTransport)
 //! underneath.
 //!
-//! Two constructors cover both sides of a connection:
+//! Three constructors cover both sides of a connection:
 //! - [`TcpTransport::connect`] - client side, dials a listening daemon.
+//! - [`TcpTransport::connect_timeout`] - the same with a deadline per resolved
+//!   address, for a host that drops rather than refuses.
 //! - [`TcpTransport::from_stream`] - server side, wraps a stream handed back by
 //!   [`TcpListener::accept`](std::net::TcpListener::accept).
 //!
+//! This is what the *remote shim* rides on: a binary launched with
+//! `--connect <host:port>` dials a daemon on another machine - one serving
+//! through a [`TcpSocketListener`](crate::TcpSocketListener) - and proxies
+//! stdio to it. See [`Server::serve_daemon_with`](crate::Server::serve_daemon_with).
+//!
 //! **This is not an encrypted transport.** A daemon that listens on TCP is
 //! reachable by anything that can route to it, and this carries whatever it is
-//! given in the clear. Bind it to an interface only the people you trust can
-//! reach, or - what [`Listener`](crate::Listener) exists for - do the accepting
-//! yourself, wrap the stream in TLS, and hand the result in as a
+//! given in the clear - every tool call, every result. Bind it to an interface
+//! only the people you trust can reach (a Tailscale address, a loopback behind
+//! an SSH tunnel), or - what [`Listener`](crate::Listener) exists for - do the
+//! accepting yourself, wrap the stream in TLS, and hand the result in as a
 //! [`StreamTransport`](crate::StreamTransport).
 
 use crate::transport::Transport;
@@ -35,6 +43,37 @@ impl TcpTransport {
     pub fn connect(addr: impl ToSocketAddrs) -> Result<Self> {
         let stream = TcpStream::connect(addr)?;
         Self::try_from_stream(stream)
+    }
+
+    /// [`connect`](Self::connect), giving up on each resolved address after
+    /// `timeout`.
+    ///
+    /// `TcpStream::connect` has no deadline of its own: a host that is routed
+    /// but not answering - a machine that is off, a firewall that drops rather
+    /// than refuses - holds the caller for the kernel's SYN retry schedule,
+    /// which is minutes. A shim dialing a daemon on another machine needs to
+    /// say "unreachable" well before that.
+    ///
+    /// A name that resolves to several addresses is tried in order, each with
+    /// its own `timeout`, and the last failure is the one reported. A name that
+    /// resolves to nothing at all is an error too, not a silent success.
+    pub fn connect_timeout(addr: impl ToSocketAddrs, timeout: Duration) -> Result<Self> {
+        let mut last_error: Option<std::io::Error> = None;
+        for candidate in addr.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&candidate, timeout) {
+                Ok(stream) => return Self::try_from_stream(stream),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the address resolved to nothing",
+                )
+            })
+            .into())
     }
 
     /// Wrap an already-accepted stream (server side).
@@ -285,6 +324,83 @@ mod tests {
         };
 
         assert!(TcpTransport::connect(addr).is_err());
+    }
+
+    #[test]
+    fn test_connect_timeout_reaches_a_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = TcpTransport::connect_timeout(addr, Duration::from_secs(5)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut server = TcpTransport::from_stream(server);
+
+        let msg = JsonRpcMessage::request(1i64, "ping", None);
+        client.write(&msg).unwrap();
+        assert_eq!(server.read().unwrap(), msg);
+    }
+
+    #[test]
+    fn test_connect_timeout_resolves_a_name() {
+        // `localhost`, not a literal: the whole point of taking `ToSocketAddrs`
+        // is that a MagicDNS name works, and this is the one name every box
+        // resolves. It may resolve to both `::1` and `127.0.0.1`; whichever
+        // order they come in, one of them is the listener and the other is a
+        // refusal that must not end the attempt.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut client =
+            TcpTransport::connect_timeout(format!("localhost:{port}"), Duration::from_secs(5))
+                .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut server = TcpTransport::from_stream(server);
+
+        let msg = JsonRpcMessage::request(1i64, "ping", None);
+        client.write(&msg).unwrap();
+        assert_eq!(server.read().unwrap(), msg);
+    }
+
+    #[test]
+    fn test_connect_timeout_is_refused_when_nobody_is_listening() {
+        let addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let started = Instant::now();
+        let Err(err) = TcpTransport::connect_timeout(addr, Duration::from_secs(5)) else {
+            panic!("nothing is listening there");
+        };
+        assert!(matches!(err, McpError::Io(_)), "{err:?}");
+        // A refusal is immediate; the timeout is for silence, not for this.
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn test_connect_timeout_reports_a_name_that_does_not_resolve() {
+        // `.invalid` is reserved (RFC 2606) precisely so it never resolves.
+        let Err(err) =
+            TcpTransport::connect_timeout("no-such-host.invalid:7211", Duration::from_secs(5))
+        else {
+            panic!("a reserved-invalid name must not resolve");
+        };
+        assert!(matches!(err, McpError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_connect_timeout_gives_up_on_silence() {
+        // 10.255.255.1 is in a private range this test box is not routed to,
+        // so a SYN there is dropped rather than refused - the case the
+        // deadline exists for. If the network *does* answer (a refusal, or a
+        // listener), that is still an outcome within the deadline, which is all
+        // the assertion needs.
+        let started = Instant::now();
+        let _ = TcpTransport::connect_timeout("10.255.255.1:9", Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect_timeout should not wait out the kernel's SYN retries"
+        );
     }
 
     #[test]
