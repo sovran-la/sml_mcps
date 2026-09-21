@@ -92,7 +92,7 @@ fn main() -> Result<()> {
 
 For servers with expensive state (ML models, indexes, agent registries), you don't want every client spawning its own instance. `UnixServer` runs a daemon that multiple clients share via lightweight shims.
 
-**One binary, three modes** — `Server::serve_daemon` reads `argv` and dispatches:
+**One binary, four modes** — `Server::serve_daemon` reads `argv` and dispatches:
 
 ```rust
 use sml_mcps::{Server, ServerConfig, Result, user_socket_path};
@@ -122,12 +122,14 @@ fn main() -> Result<()> {
 |---|---|
 | `my-daemon --daemon` | double-forks, detaches, serves on the socket |
 | `my-daemon --foreground` | serves without detaching (debugging) |
+| `my-daemon --connect <host:port>` | acts as a *remote* shim: dials a daemon on another machine over TCP, proxies stdio to it |
 | `my-daemon` | acts as a shim: starts the daemon if needed, proxies stdio to it |
 
-An MCP client only ever launches the last one. Socket directories are created if
-missing, and every connection gets a fresh `Server` carrying the tools,
-resources, prompts and task runtime you registered. See
-`examples/serve_daemon.rs`.
+An MCP client only ever launches one of the last two. Socket directories are
+created if missing (never by the remote shim, which touches nothing local), and
+every connection gets a fresh `Server` carrying the tools, resources, prompts
+and task runtime you registered. See `examples/serve_daemon.rs`, and *Remote
+mode* below.
 
 **Where the socket goes matters.** `user_socket_path("my-daemon",
 "server.sock")` resolves to `$XDG_RUNTIME_DIR/my-daemon/server.sock` where the
@@ -301,6 +303,37 @@ daemon's own decision to leave, not on the operator's.
 With no `busy_check` configured, nothing about the idle path changes.
 
 See `examples/multi_listener.rs` for all of it in one binary.
+
+### Remote mode: a shim on one machine, the daemon on another
+
+A daemon with a `TcpSocketListener` can be reached from an MCP client on a
+different machine. The same binary, launched with `--connect <host:port>`, is a
+shim that dials that listener instead of looking for a Unix socket:
+
+```text
+# On the box with the hardware - a daemon that also listens on its Tailscale IP:
+my-mcp --daemon        # with .listener(TcpSocketListener::bind("100.72.37.20:7211")?)
+
+# On the laptop - what the MCP client launches:
+my-mcp --connect jetson-memory:7211
+```
+
+`--connect` takes a hostname or an IP literal; the resolver decides, so a
+Tailscale MagicDNS name works as written. The remote shim proxies stdio over the
+connection exactly as the Unix shim does, through the same `Bridge`. What it
+does *not* do is the point:
+
+- it never spawns a daemon - there is nothing on this machine to spawn;
+- it never touches the socket path, its directory, or a PID file;
+- it never reads local configuration - the remote daemon owns its own;
+- it never retries. A daemon it cannot reach is an error on stderr naming the
+  address and a non-zero exit, within a bounded connect timeout.
+
+`--connect` with `--daemon`, `--foreground` or `--socket` is an argument error,
+not a silent choice.
+
+**TCP is in the clear.** Bind the daemon's TCP listener to an interface only
+the people you trust can reach - a Tailscale address - never a public one.
 
 ## HTTP Transport (Streamable HTTP with SSE)
 
@@ -576,6 +609,20 @@ nothing is written, so a failed setup leaves no client pointing at a server that
 is not ready. `on_uninstall` is the other end of it, and runs after the entries
 have been removed. A command line that is refused - an unknown flag, an unknown
 `--client` - reaches neither.
+
+A server whose daemon runs on another machine is installed with the address:
+
+```text
+$ my-mcp install --connect jetson-memory:7211
+```
+
+That writes an entry whose arguments end in `--connect jetson-memory:7211` -
+`["serve", "--connect", "jetson-memory:7211"]` for the entry above - so the
+client launches the binary as a remote shim (see *Remote mode* under the Unix
+socket transport). `uninstall` removes it by name, address or no address.
+`health --connect <host:port>` asks that daemon whether it answers as an MCP
+server - an `initialize` and a `ping` over TCP - instead of running the
+author's local check, which is about a machine the daemon is not on.
 
 The registry is public API in its own right, for servers that own their command
 line already:
