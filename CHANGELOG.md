@@ -1,8 +1,8 @@
 # Changelog
 
-Versioning is `0.BREAKING.FEATUREORFIX` until 1.0: a change that breaks an
-existing consumer bumps the middle component, everything else the last.
-History before 0.7.0 is in `git log`.
+Versioning is `BREAKING.FEATURE.FIX`: a change that breaks an existing
+consumer bumps the first component, a compatible addition the second, and a
+fix the third. History before 0.7.0 is in `git log`.
 
 ## 0.7.0
 
