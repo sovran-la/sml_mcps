@@ -32,6 +32,7 @@ use crate::transport::daemon_state::{
     ActiveGuard, Admission, BusyCheck, ConnState, Listeners, Shared, admit, describe, idle_watcher,
     release, request_shutdown, shutdown_requested,
 };
+use crate::transport::pid_file::write_pid_file;
 use crate::transport::signals::install_signal_handlers;
 use crate::transport::{Listener, Transport, UnixSocketListener};
 use crate::types::{McpError, Result};
@@ -624,13 +625,6 @@ fn prepare_socket_path(path: &Path, _claim: &SocketLock) -> Result<()> {
             Ok(())
         }
     }
-}
-
-/// Write the current process PID to `path`.
-pub(crate) fn write_pid_file(path: &Path) -> Result<()> {
-    let pid = unsafe { libc::getpid() };
-    std::fs::write(path, format!("{}\n", pid))?;
-    Ok(())
 }
 
 /// Double-fork + setsid to detach from the controlling terminal.

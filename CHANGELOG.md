@@ -3,6 +3,12 @@
 Before 1.0, versioning is `0.BREAKING.FEATUREORFIX`. Compatible additions
 and fixes increment the last component; breaking changes increment the middle.
 
+## 0.7.2
+
+- Publish daemon PID files atomically after writing their complete contents.
+  Readers can no longer observe an empty or partial PID during startup.
+  Failed writes preserve the previous PID file and clean up temporary files.
+
 ## 0.7.1
 
 - Add `Cli::remote_connector` so applications can provide an authenticated
