@@ -13,7 +13,9 @@
 //! takes the round-trips.
 
 use crate::remote::RemoteAddr;
-use crate::transport::{TcpTransport, Transport};
+#[cfg(test)]
+use crate::transport::TcpTransport;
+use crate::transport::Transport;
 use crate::types::{JsonRpcMessage, McpError, Result};
 use serde_json::Value;
 use std::fmt;
@@ -45,8 +47,18 @@ impl fmt::Display for ProbeReport {
 
 /// Ask the daemon at `addr` who it is.
 pub(super) fn probe(addr: &RemoteAddr) -> Result<ProbeReport> {
-    let mut transport = addr.connect()?;
-    transport.set_read_timeout(Some(PROBE_TIMEOUT))?;
+    probe_transport(addr, Box::new(addr.connect()?))
+}
+
+pub(super) fn probe_transport(
+    addr: &RemoteAddr,
+    mut transport: Box<dyn Transport>,
+) -> Result<ProbeReport> {
+    if !transport.set_read_timeout(Some(PROBE_TIMEOUT))? {
+        return Err(McpError::Internal(
+            "remote health transport must support read deadlines".into(),
+        ));
+    }
 
     let initialize = JsonRpcMessage::request(
         1i64,
@@ -93,7 +105,7 @@ pub(super) fn probe(addr: &RemoteAddr) -> Result<ProbeReport> {
 /// read that follows - `EPIPE` on the write, or EOF on the read, depending on
 /// which side the kernel notices first - and both have to say the same thing.
 fn send(
-    transport: &mut TcpTransport,
+    transport: &mut dyn Transport,
     addr: &RemoteAddr,
     message: &JsonRpcMessage,
     method: &str,
@@ -107,7 +119,7 @@ fn send(
 
 /// The result of the request just sent, skipping any notification the daemon
 /// volunteers in between.
-fn answer(transport: &mut TcpTransport, addr: &RemoteAddr, method: &str) -> Result<Value> {
+fn answer(transport: &mut dyn Transport, addr: &RemoteAddr, method: &str) -> Result<Value> {
     loop {
         match transport.read() {
             Ok(JsonRpcMessage::Response(response)) => {

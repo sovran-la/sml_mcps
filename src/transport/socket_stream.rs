@@ -7,7 +7,7 @@
 //! half-close on teardown. That shared body lives here once, over whatever
 //! stream can answer the three questions in [`SocketStream`].
 //!
-//! Not public: the two transports built on it are.
+//! Applications can implement SocketStream for authenticated duplex streams.
 
 use crate::transport::Transport;
 use crate::transport::line::{DeadlineRead, LineReader};
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 ///
 /// `Sync` as well as `Send` because [`Transport`] requires it, and a transport
 /// is only as `Sync` as what it holds.
-pub(crate) trait SocketStream: Read + Write + Send + Sync + Sized + 'static {
+pub trait SocketStream: Read + Write + Send + Sync + Sized + 'static {
     /// A second descriptor for the same connection.
     fn try_clone(&self) -> std::io::Result<Self>;
 
@@ -101,7 +101,7 @@ impl<S: SocketStream> DeadlineRead for TimedStream<S> {
 ///
 /// Holds a buffered reader and a cloned write handle to the same socket, so
 /// reads and writes are independent (the standard split-stream pattern).
-pub(crate) struct SocketTransport<S: SocketStream> {
+pub struct SocketTransport<S: SocketStream> {
     reader: LineReader<TimedStream<S>>,
     writer: S,
     /// Applied to the next read; `None` blocks indefinitely.
@@ -114,7 +114,7 @@ impl<S: SocketStream> SocketTransport<S> {
     /// The clone is a second descriptor for the same socket, so this fails
     /// exactly when the process has run out of them - which is a condition a
     /// server is expected to survive, not one it should die of.
-    pub(crate) fn try_from_stream(stream: S) -> Result<Self> {
+    pub fn try_from_stream(stream: S) -> Result<Self> {
         let writer = stream.try_clone()?;
         Ok(Self {
             reader: LineReader::new(TimedStream { stream }),

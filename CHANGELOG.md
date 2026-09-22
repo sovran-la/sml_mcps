@@ -1,8 +1,15 @@
 # Changelog
 
-Versioning is `BREAKING.FEATURE.FIX`: a change that breaks an existing
-consumer bumps the first component, a compatible addition the second, and a
-fix the third. History before 0.7.0 is in `git log`.
+Before 1.0, versioning is `0.BREAKING.FEATUREORFIX`. Compatible additions
+and fixes increment the last component; breaking changes increment the middle.
+
+## 0.7.1
+
+- Add `Cli::remote_connector` so applications can provide an authenticated
+  transport for both remote serve and health. A connector error never falls
+  back to plaintext. Installed `serve --connect` entries use that same path.
+- Expose `transport::SocketStream` and `SocketTransport` for application-owned
+  duplex streams with framing, deadlines, and half-close support.
 
 ## 0.7.0
 

@@ -335,6 +335,19 @@ not a silent choice.
 **TCP is in the clear.** Bind the daemon's TCP listener to an interface only
 the people you trust can reach - a Tailscale address - never a public one.
 
+For application-owned mTLS, configure `Cli::remote_connector` alongside
+`on_serve` and `on_health`. Its closure receives the remote address and returns
+a `Box<dyn Transport>` only after authentication. Both remote commands use it;
+errors terminate the command without a plaintext retry. Local commands retain
+their usual handlers. The server side supplies its authenticated `Listener`.
+
+The remote transport must support `try_clone_writer` for the stdio bridge and
+read deadlines for health. `transport::SocketTransport` supplies framing over
+an application implementation of `SocketStream`; a plain `StreamTransport`
+cannot split. TLS state must not be locked across a blocking socket read.
+This hook adds no TLS dependency to sml_mcps. Without the hook, the existing
+raw TCP behavior remains available; the application must choose its policy.
+
 ## HTTP Transport (Streamable HTTP with SSE)
 
 With the `http` feature, `HttpServer` handles all the HTTP boilerplate for you.

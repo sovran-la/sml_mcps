@@ -78,7 +78,9 @@
 //! [`Server::serve_daemon_with`](crate::Server::serve_daemon_with). `health
 //! --connect <host:port>` asks that daemon whether it answers as an MCP server,
 //! instead of running the author's local check. Neither consults anything on
-//! this machine beyond the client configs. **TCP is in the clear**; bind the
+//! this machine beyond the client configs unless an application supplies
+//! [`Cli::remote_connector`] for authenticated transport. The default
+//! **TCP is in the clear**; bind the
 //! daemon's listener to an interface only trusted machines can reach.
 
 pub mod install;
@@ -224,6 +226,8 @@ impl Builtin {
 // The builder
 //
 
+type RemoteConnector = Box<dyn Fn(&str) -> crate::Result<Box<dyn crate::Transport>>>;
+
 /// A command line for an MCP server.
 ///
 /// See the [module documentation](self) for the whole shape. Every method but
@@ -256,6 +260,7 @@ pub struct Cli {
 
     /// Commands the author added, in the order they were added.
     custom: Vec<(SubCommand, Handler)>,
+    remote_connector: Option<RemoteConnector>,
 }
 
 impl fmt::Debug for Cli {
@@ -293,6 +298,7 @@ impl Cli {
             before_install: None,
             after_uninstall: None,
             custom: Vec::new(),
+            remote_connector: None,
         }
     }
 
@@ -313,7 +319,8 @@ impl Cli {
 
     /// What `serve` should do.
     ///
-    /// Called with everything after `serve` on the command line. Whether this
+    /// With a remote connector, `serve --connect` bypasses this local handler.
+    /// Otherwise called with everything after `serve` on the command line. Whether this
     /// starts a [`StdioTransport`](crate::StdioTransport), calls
     /// [`Server::serve_daemon`](crate::Server::serve_daemon), or listens on
     /// HTTP is entirely the author's business.
@@ -337,6 +344,19 @@ impl Cli {
         F: FnOnce(&[String]) -> CommandResult + 'static,
     {
         self.health = Some(Box::new(handler));
+        self
+    }
+
+    /// Supply the transport for both remote serve and health.
+    ///
+    /// Connection errors are final; there is no plaintext fallback.
+    /// The transport must support independent writers and read deadlines.
+    #[cfg(unix)]
+    pub fn remote_connector<F>(mut self, connector: F) -> Self
+    where
+        F: Fn(&str) -> crate::Result<Box<dyn crate::Transport>> + 'static,
+    {
+        self.remote_connector = Some(Box::new(connector));
         self
     }
 
@@ -449,10 +469,37 @@ impl Cli {
             },
             Plan::Builtin(Builtin::Install, args) => self.install(&args),
             Plan::Builtin(Builtin::Uninstall, args) => self.uninstall(&args),
-            Plan::Builtin(Builtin::Serve, args) => match self.serve.take() {
-                Some(handler) => finish(handler(&args)),
-                None => self.unknown("serve"),
-            },
+            Plan::Builtin(Builtin::Serve, args) => {
+                #[cfg(unix)]
+                if let Some(connector) = &self.remote_connector {
+                    match connect_from_args(&args) {
+                        Ok(Some(addr)) => {
+                            if args.iter().any(|arg| {
+                                matches!(arg.as_str(), "--daemon" | "--foreground" | "--socket")
+                                    || arg.starts_with("--socket=")
+                            }) {
+                                return self.usage_error(
+                                    "--connect cannot be combined with daemon or socket flags",
+                                    "serve",
+                                );
+                            }
+                            return finish(
+                                connector(&addr.to_string())
+                                    .and_then(|transport| {
+                                        crate::Bridge::run(crate::StdioTransport::new(), transport)
+                                    })
+                                    .map_err(Into::into),
+                            );
+                        }
+                        Err(message) => return self.usage_error(&message, "serve"),
+                        Ok(None) => {}
+                    }
+                }
+                match self.serve.take() {
+                    Some(handler) => finish(handler(&args)),
+                    None => self.unknown("serve"),
+                }
+            }
             Plan::Builtin(Builtin::Health, args) => match self.health.take() {
                 Some(handler) => self.health(handler, &args),
                 None => self.unknown("health"),
@@ -539,7 +586,15 @@ impl Cli {
     fn health(&self, handler: Handler, args: &[String]) -> ExitCode {
         match connect_from_args(args) {
             Ok(Some(addr)) => finish(
-                health::probe(&addr)
+                self.remote_connector
+                    .as_ref()
+                    .map_or_else(
+                        || health::probe(&addr),
+                        |connector| {
+                            connector(&addr.to_string())
+                                .and_then(|transport| health::probe_transport(&addr, transport))
+                        },
+                    )
                     .map(|report| println!("{report}"))
                     .map_err(Into::into),
             ),
@@ -1921,3 +1976,6 @@ mod tests {
             .collect()
     }
 }
+
+#[cfg(all(test, unix))]
+mod remote_tests;

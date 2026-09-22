@@ -32,6 +32,7 @@ mod unix_server;
 
 pub use line::MAX_MESSAGE_BYTES;
 pub use origin::OriginPolicy;
+pub use socket_stream::{SocketStream, SocketTransport};
 pub use stdio::StdioTransport;
 pub use stream::StreamTransport;
 pub use tcp::TcpTransport;
