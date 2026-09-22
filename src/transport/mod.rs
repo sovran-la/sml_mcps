@@ -22,6 +22,9 @@ pub(crate) mod daemon_state;
 mod listener;
 
 #[cfg(unix)]
+mod pid_file;
+
+#[cfg(unix)]
 mod signals;
 
 #[cfg(unix)]
