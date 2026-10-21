@@ -1,6 +1,6 @@
 [package]
 name = "sml_mcps"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Small MCP Server - sync, no tokio, just works"
@@ -96,6 +96,11 @@ name = "serve_daemon"
 # an application veto on idle exit. Unix-only, no extra features needed.
 [[example]]
 name = "multi_listener"
+
+# serve_daemon_with's shim_transform: each shim stamps its caller on tool calls.
+# Unix-only, no extra features needed.
+[[example]]
+name = "shim_transform"
 
 # install/uninstall/serve/health, plus a custom subcommand
 [[example]]
