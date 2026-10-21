@@ -165,20 +165,63 @@ impl Drop for SignalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
+    /// Set in the copy of this test binary that [`alone`] starts, so the test
+    /// it names knows it is the only one running there.
+    const ALONE: &str = "SML_MCPS_SIGNAL_TEST_ALONE";
+
+    /// Run `body` as the only test in a fresh copy of this test binary.
+    ///
+    /// For the tests that assert on process-wide state. In the shared suite
+    /// every other thread is fair game to change it underneath them: the
+    /// daemon tests install handlers of their own and publish their own pipe,
+    /// and any test that opens a file can be handed a descriptor number one of
+    /// these has just closed, so "is it closed" stops meaning anything. A lock
+    /// would have to be taken by every test that opens a descriptor; a process
+    /// of their own needs nothing from anybody.
+    fn alone(test: &str, body: impl FnOnce()) {
+        if std::env::var_os(ALONE).is_some() {
+            return body();
+        }
+
+        let (_crate, module) = module_path!().split_once("::").unwrap();
+        let name = format!("{module}::{test}");
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--test-threads=1"])
+            .env(ALONE, "1")
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // A filter that matches nothing also exits zero, having tested nothing.
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "`{name}` did not pass on its own:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn test_restoring_the_handlers_closes_the_pipe_it_published() {
+        alone(
+            "test_restoring_the_handlers_closes_the_pipe_it_published",
+            restoring_the_handlers_closes_the_pipe_it_published,
+        );
+    }
+
+    fn restoring_the_handlers_closes_the_pipe_it_published() {
         // What the spawn-failure path leans on. Without it, a daemon whose
         // watcher thread never started leaked both ends of the pipe and left
         // the signal handler holding a descriptor nobody would ever read.
         let (read_fd, write_fd) = create_signal_pipe().unwrap();
         let published = SIGNAL_WRITE_FD.swap(write_fd, Ordering::SeqCst);
 
-        // `SIG_DFL` both ways: nothing in this suite installs a handler that
-        // outlives its own server, and nothing here sends a signal.
+        // `SIG_DFL` both ways: this process installs no other handler, and
+        // nothing here sends a signal.
         restore_signal_handlers(libc::SIG_DFL, libc::SIG_DFL, write_fd);
 
         assert_eq!(
@@ -246,6 +289,13 @@ mod tests {
 
     #[test]
     fn test_dropping_the_guard_ends_the_watcher_without_running_the_callback() {
+        alone(
+            "test_dropping_the_guard_ends_the_watcher_without_running_the_callback",
+            dropping_the_guard_ends_the_watcher_without_running_the_callback,
+        );
+    }
+
+    fn dropping_the_guard_ends_the_watcher_without_running_the_callback() {
         // A daemon that exited for its own reasons must not have its shutdown
         // callback fired on the way out: `run` has already torn down by then,
         // and waking listeners that are gone is at best noise.
