@@ -23,8 +23,15 @@
 //! including deciding from `argv` whether this process is the shim or the
 //! daemon it proxies to.
 //!
+//! [`Bridge::run_with_transform`] is the same proxy with one hook: a rewrite
+//! applied to each message the client sends before it is forwarded. See
+//! [`transform`] for what it is given and what a failure does.
+//!
 //! Unix-only: gated behind `#[cfg(unix)]`.
 
+pub mod transform;
+
+use self::transform::{ShimTransform, Verdict};
 use crate::server::{error_id, is_malformed};
 use crate::socket::{SocketLock, owned_by_current_user};
 use crate::transport::{Transport, UnixTransport, pid_path_for};
@@ -115,37 +122,37 @@ impl Bridge {
         client: A,
         upstream: B,
     ) -> Result<()> {
-        let mut client = client;
-        let mut upstream = upstream;
+        run_inner(client, upstream, None)
+    }
 
-        // Shared, because each direction answers unreadable input on the sink
-        // the *other* direction owns.
-        let client_sink = SharedWriter::new(client.try_clone_writer().ok_or_else(|| {
-            McpError::Internal("client transport cannot be split for proxying".into())
-        })?);
-        let upstream_sink = SharedWriter::new(upstream.try_clone_writer().ok_or_else(|| {
-            McpError::Internal("upstream transport cannot be split for proxying".into())
-        })?);
-
-        // client -> upstream (requests). Detached: ends when the client hits
-        // EOF, at which point it half-closes the upstream so the daemon can
-        // finish up. If the daemon vanished while the client is still talking,
-        // this thread outlives `run` and dies when the process exits.
-        let mut to_upstream = upstream_sink.clone();
-        let mut to_client = client_sink.clone();
-        let _c2u = thread::spawn(move || {
-            let _ = pump(&mut client, &mut to_upstream, &mut to_client);
-            let _ = to_upstream.close_write();
-        });
-
-        // upstream -> client (responses). Joined: its completion means the
-        // upstream connection has drained and closed - the definitive
-        // end-of-session signal.
-        let mut to_client = client_sink;
-        let mut to_upstream = upstream_sink;
-        let result = pump(&mut upstream, &mut to_client, &mut to_upstream);
-        let _ = to_client.close_write();
-        result
+    /// [`run`](Self::run), with `transform` applied to every message read from
+    /// `client` before it is forwarded to `upstream`.
+    ///
+    /// Messages from `upstream` are relayed untouched. A transform that fails
+    /// or panics keeps its message from being forwarded: a request is answered
+    /// with a JSON-RPC error instead, and anything else is dropped. See
+    /// [`transform`] for the whole contract.
+    ///
+    /// ```ignore
+    /// let upstream = Bridge::auto_start(socket, exe, &["--daemon"])?;
+    /// Bridge::run_with_transform(StdioTransport::new(), upstream, |message| {
+    ///     if let JsonRpcMessage::Request(request) = message {
+    ///         eprintln!("-> {}", request.method);
+    ///     }
+    ///     Ok(())
+    /// })
+    /// ```
+    ///
+    /// [`DaemonOptions::shim_transform`](crate::DaemonOptions::shim_transform)
+    /// installs one in the shim [`Server::serve_daemon_with`](crate::Server::serve_daemon_with)
+    /// runs, which is where most servers want it.
+    pub fn run_with_transform<A, B, F>(client: A, upstream: B, transform: F) -> Result<()>
+    where
+        A: Transport + 'static,
+        B: Transport + 'static,
+        F: Fn(&mut JsonRpcMessage) -> Result<()> + Send + Sync + 'static,
+    {
+        run_transformed(client, upstream, Arc::new(transform))
     }
 
     /// Bridge stdio (stdin/stdout) to a Unix transport.
@@ -161,6 +168,62 @@ impl Bridge {
     pub fn run_stdio(upstream: UnixTransport) -> Result<()> {
         Self::run(crate::StdioTransport::new(), upstream)
     }
+}
+
+/// [`Bridge::run_with_transform`] for a transform that is already shared, which
+/// is how [`DaemonOptions`](crate::DaemonOptions) holds one.
+pub(crate) fn run_transformed<A: Transport + 'static, B: Transport + 'static>(
+    client: A,
+    upstream: B,
+    transform: ShimTransform,
+) -> Result<()> {
+    run_inner(client, upstream, Some(transform))
+}
+
+/// [`Bridge::run`] and [`Bridge::run_with_transform`], which differ only in
+/// whether client messages are rewritten on the way through.
+fn run_inner<A: Transport + 'static, B: Transport + 'static>(
+    client: A,
+    upstream: B,
+    transform: Option<ShimTransform>,
+) -> Result<()> {
+    let mut client = client;
+    let mut upstream = upstream;
+
+    // Shared, because each direction answers unreadable input on the sink
+    // the *other* direction owns.
+    let client_sink = SharedWriter::new(client.try_clone_writer().ok_or_else(|| {
+        McpError::Internal("client transport cannot be split for proxying".into())
+    })?);
+    let upstream_sink = SharedWriter::new(upstream.try_clone_writer().ok_or_else(|| {
+        McpError::Internal("upstream transport cannot be split for proxying".into())
+    })?);
+
+    // client -> upstream (requests). Detached: ends when the client hits
+    // EOF, at which point it half-closes the upstream so the daemon can
+    // finish up. If the daemon vanished while the client is still talking,
+    // this thread outlives `run` and dies when the process exits.
+    let mut to_upstream = upstream_sink.clone();
+    let mut to_client = client_sink.clone();
+    let _c2u = thread::spawn(move || {
+        let _ = pump(
+            &mut client,
+            &mut to_upstream,
+            &mut to_client,
+            transform.as_ref(),
+        );
+        let _ = to_upstream.close_write();
+    });
+
+    // upstream -> client (responses). Joined: its completion means the
+    // upstream connection has drained and closed - the definitive
+    // end-of-session signal.
+    let mut to_client = client_sink;
+    let mut to_upstream = upstream_sink;
+    // Never transformed: the hook is for what the client says.
+    let result = pump(&mut upstream, &mut to_client, &mut to_upstream, None);
+    let _ = to_client.close_write();
+    result
 }
 
 /// A write sink both pump directions can reach.
@@ -218,14 +281,34 @@ impl Transport for SharedWriter {
 /// shim used to forward verbatim.
 ///
 /// Teardown is reserved for the connection actually failing.
+///
+/// `transform`, when there is one, sees each message before it is written. A
+/// message it refuses is not written; [`Verdict::Answer`] goes back the same
+/// way an unreadable message's answer does.
 fn pump(
     reader: &mut dyn Transport,
     writer: &mut dyn Transport,
     back: &mut dyn Transport,
+    transform: Option<&ShimTransform>,
 ) -> Result<()> {
     loop {
         match reader.read() {
-            Ok(msg) => writer.write(&msg)?,
+            Ok(mut msg) => {
+                if let Some(transform) = transform {
+                    match transform::apply(transform, &mut msg) {
+                        Verdict::Forward => {}
+                        Verdict::Answer(answer) => {
+                            // As below: no way back means no connection left.
+                            if back.write(&answer).is_err() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        Verdict::Drop => continue,
+                    }
+                }
+                writer.write(&msg)?
+            }
             Err(McpError::TransportClosed) => return Ok(()),
             Err(e) if is_malformed(&e) => {
                 let answer = JsonRpcMessage::error(error_id(&e), e.to_jsonrpc_error());

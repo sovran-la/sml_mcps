@@ -304,6 +304,84 @@ With no `busy_check` configured, nothing about the idle path changes.
 
 See `examples/multi_listener.rs` for all of it in one binary.
 
+### Telling the daemon about the client: `shim_transform`
+
+The daemon builds one context per connection and learns nothing else about
+who is on the other end; a tool sees its arguments. The shim is the MCP
+client's own child — it has the client's environment and working directory —
+and sees every message. `DaemonOptions::shim_transform` lets it write what it
+knows into each message before forwarding it:
+
+```rust
+use sml_mcps::{DaemonOptions, JsonRpcMessage};
+use serde_json::Value;
+
+// Which agent is calling, from the environment its runtime gave the shim.
+let caller = std::env::var("MY_AGENT_ID").ok();
+
+server.serve_daemon_with(
+    DaemonOptions::new(user_socket_path("my-daemon", "server.sock"))
+        .shim_transform(move |message| {
+            let JsonRpcMessage::Request(request) = message else { return Ok(()) };
+            if request.method != "tools/call" {
+                return Ok(());
+            }
+            if let Some(arguments) = request
+                .params
+                .as_mut()
+                .and_then(|params| params.get_mut("arguments"))
+                .and_then(Value::as_object_mut)
+            {
+                // Replace whatever a model put there, or take it out.
+                match &caller {
+                    Some(id) => arguments.insert("_caller".into(), id.clone().into()),
+                    None => arguments.remove("_caller"),
+                };
+            }
+            Ok(())
+        }),
+    move |conn_id| AppContext::new(conn_id),
+)
+```
+
+The same hook serves any fact only the client side has — a daemon shared by
+clients in different projects can be told each call's working directory, and a
+transform that cannot find one can refuse the call rather than let the daemon
+guess:
+
+```rust
+DaemonOptions::new(socket).shim_transform(|message| {
+    // ... as above, for `tools/call` ...
+    let cwd = std::env::current_dir()
+        .map_err(|e| McpError::Internal(format!("no working directory: {e}")))?;
+    arguments.insert("_cwd".into(), cwd.display().to_string().into());
+    Ok(())
+})
+```
+
+What it sees, and what it does not:
+
+- **Every message the client sends**, one at a time, in order — requests,
+  notifications, and the client's answers to the server's own requests
+  (sampling, elicitation, roots). **Nothing the daemon sends** goes through it.
+- It runs **in the local shim only**: never in the daemon, so connections on
+  the daemon's other listeners are not rewritten, and never in the
+  `--connect` shim — what this process knows about itself is a fact about this
+  machine, not one a daemon on another machine can use.
+- **A failure fails closed.** A transform that returns `Err` keeps its message
+  from being forwarded at all. A request is answered by the shim with a
+  JSON-RPC error carrying the request's id and the transform's error; a
+  notification or response is dropped, since JSON-RPC cannot answer either.
+- **A panic is a failure**, message by message: caught, answered or dropped as
+  above, and the session carries on. The panic hook still reports it on the
+  shim's stderr, which is where an MCP client keeps a server's logs.
+- **Without one, nothing changes**: the shim forwards exactly as it always has.
+
+The closure is built in every mode, because `serve_daemon_with` has not yet
+read `argv` when you build `DaemonOptions` — keep it cheap. `Bridge::run_with_transform`
+is the same hook for a shim wired by hand around `Bridge::auto_start`. See
+`examples/shim_transform.rs`.
+
 ### Remote mode: a shim on one machine, the daemon on another
 
 A daemon with a `TcpSocketListener` can be reached from an MCP client on a

@@ -21,12 +21,13 @@
 //! Unix-only: gated behind `#[cfg(unix)]`, like [`UnixServer`] and [`Bridge`].
 
 use crate::bridge::Bridge;
+use crate::bridge::transform::ShimTransform;
 use crate::remote::{RemoteAddr, connect_from_args};
 use crate::server::Server;
 use crate::socket::ensure_private_parent_dir;
 use crate::transport::daemon_state::BusyCheck;
 use crate::transport::{Listener, StdioTransport, Transport, UnixServer};
-use crate::types::{McpError, Result};
+use crate::types::{JsonRpcMessage, McpError, Result};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -106,6 +107,7 @@ pub struct DaemonOptions {
     max_connections: Option<usize>,
     listeners: Vec<Arc<dyn Listener>>,
     busy_check: Option<BusyCheck>,
+    shim_transform: Option<ShimTransform>,
 }
 
 impl DaemonOptions {
@@ -121,6 +123,7 @@ impl DaemonOptions {
             max_connections: None,
             listeners: Vec::new(),
             busy_check: None,
+            shim_transform: None,
         }
     }
 
@@ -163,6 +166,46 @@ impl DaemonOptions {
         self
     }
 
+    /// Rewrite each message the MCP client sends before the shim forwards it
+    /// to the daemon. Default: forward every message as it was read.
+    ///
+    /// For what a daemon cannot otherwise know about the client on the other
+    /// end of a connection - which agent it is, what directory it runs in -
+    /// and only the shim, the client's own child process, can read:
+    ///
+    /// ```ignore
+    /// let caller = std::env::var("MY_AGENT_ID").ok();
+    ///
+    /// DaemonOptions::new(socket).shim_transform(move |message| {
+    ///     stamp_caller(message, caller.as_deref());
+    ///     Ok(())
+    /// })
+    /// ```
+    ///
+    /// Runs in the local shim only - the process [`Server::serve_daemon_with`]
+    /// dispatches into with no mode flag - and never in the daemon, so the
+    /// daemon's own clients on its other listeners are not rewritten. Not in
+    /// the `--connect` shim either: what this process knows about itself is
+    /// a fact about this machine, and means nothing to a daemon on another one.
+    ///
+    /// It sees every client message in order - requests, notifications, and
+    /// the client's answers to the server's own requests - and none of the
+    /// daemon's. A transform that returns an error, or panics, keeps its
+    /// message from being forwarded at all: a request is answered by the shim
+    /// with a JSON-RPC error carrying the request's id, and anything else is
+    /// dropped. See [`crate::bridge::transform`] for the whole contract, and
+    /// [`Bridge::run_with_transform`] for the same hook on a hand-wired shim.
+    ///
+    /// The shim reads this when it starts, so it is built in every mode -
+    /// keep it cheap, and keep anything only the daemon should do out of it.
+    pub fn shim_transform<F>(mut self, transform: F) -> Self
+    where
+        F: Fn(&mut JsonRpcMessage) -> Result<()> + Send + Sync + 'static,
+    {
+        self.shim_transform = Some(Arc::new(transform));
+        self
+    }
+
     /// Hand these settings to the server that will run them.
     fn configure<C: Send + Sync + 'static>(self, mut daemon: UnixServer<C>) -> UnixServer<C> {
         if let Some(timeout) = self.idle_timeout {
@@ -198,6 +241,7 @@ impl fmt::Debug for DaemonOptions {
                     .collect::<Vec<_>>(),
             )
             .field("busy_check", &self.busy_check.is_some())
+            .field("shim_transform", &self.shim_transform.is_some())
             .finish()
     }
 }
@@ -366,7 +410,13 @@ impl<C: Send + Sync + 'static> Server<C> {
         ensure_private_parent_dir(&options.socket_path)?;
 
         match mode {
-            Mode::Shim => shim(&options.socket_path, StdioTransport::new()),
+            // Without a transform, the shim this always was.
+            Mode::Shim => match options.shim_transform {
+                None => shim(&options.socket_path, StdioTransport::new()),
+                Some(transform) => {
+                    transformed_shim(&options.socket_path, StdioTransport::new(), transform)
+                }
+            },
             mode => self.serve_socket(mode, options, context_factory),
         }
     }
@@ -475,6 +525,21 @@ fn remote_shim<T: Transport + 'static>(addr: &RemoteAddr, client: T) -> Result<(
 /// standing on the process's own stdin; [`Server::serve_daemon`] always passes
 /// [`StdioTransport`].
 fn shim<T: Transport + 'static>(socket_path: &Path, client: T) -> Result<()> {
+    Bridge::run(client, start_upstream(socket_path)?)
+}
+
+/// [`shim`], with `transform` applied to everything `client` sends.
+fn transformed_shim<T: Transport + 'static>(
+    socket_path: &Path,
+    client: T,
+    transform: ShimTransform,
+) -> Result<()> {
+    crate::bridge::run_transformed(client, start_upstream(socket_path)?, transform)
+}
+
+/// Connect to the daemon on `socket_path`, relaunching this executable as one
+/// if none is up.
+fn start_upstream(socket_path: &Path) -> Result<crate::transport::UnixTransport> {
     let exe = std::env::current_exe()
         .map_err(|e| McpError::Internal(format!("cannot find the running executable: {}", e)))?;
 
@@ -484,8 +549,7 @@ fn shim<T: Transport + 'static>(socket_path: &Path, client: T) -> Result<()> {
     let exe = utf8(&exe, "the running executable")?;
     let socket = utf8(socket_path, "the socket path")?;
 
-    let upstream = Bridge::auto_start(socket_path, exe, &[DAEMON_FLAG, SOCKET_FLAG, socket])?;
-    Bridge::run(client, upstream)
+    Bridge::auto_start(socket_path, exe, &[DAEMON_FLAG, SOCKET_FLAG, socket])
 }
 
 /// A path as UTF-8, or an explanation of why it is not.
@@ -1203,6 +1267,18 @@ mod tests {
         assert!(init["capabilities"]["tools"].is_null());
 
         let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn test_debug_says_whether_a_shim_transform_is_installed() {
+        let bare = format!("{:?}", DaemonOptions::new("/tmp/x.sock"));
+        assert!(bare.contains("shim_transform: false"), "{bare}");
+
+        let hooked = format!(
+            "{:?}",
+            DaemonOptions::new("/tmp/x.sock").shim_transform(|_| Ok(()))
+        );
+        assert!(hooked.contains("shim_transform: true"), "{hooked}");
     }
 
     // ---- the shim --------------------------------------------------------

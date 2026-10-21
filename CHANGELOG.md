@@ -3,6 +3,21 @@
 Before 1.0, versioning is `0.BREAKING.FEATUREORFIX`. Compatible additions
 and fixes increment the last component; breaking changes increment the middle.
 
+## 0.7.3
+
+- Add `DaemonOptions::shim_transform`: a rewrite the `serve_daemon_with` shim
+  applies to every message its MCP client sends, before forwarding it to the
+  daemon. It is how a daemon learns what only the client's side knows - which
+  agent is calling, what directory it runs in - without its author
+  re-implementing the shim around `Bridge`. It runs in the local Unix shim
+  only, never in the daemon or the `--connect` shim, and never sees what the
+  daemon sends back.
+- Add `Bridge::run_with_transform`, the same hook for a shim wired by hand.
+- A transform that fails or panics keeps its message from being forwarded: a
+  request is answered with a JSON-RPC error carrying its id, and a notification
+  or response is dropped. The session carries on. See `bridge::transform`.
+- Without a transform, the shim forwards exactly as before.
+
 ## 0.7.2
 
 - Publish daemon PID files atomically after writing their complete contents.
