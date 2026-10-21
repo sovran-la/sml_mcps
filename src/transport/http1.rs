@@ -1412,10 +1412,18 @@ struct Slot {
 
 impl Slot {
     fn claim(live: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
-        live.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            (count < max).then_some(count + 1)
-        })
-        .ok()?;
+        // `fetch_update` spelled out: newer toolchains deprecate it in favour
+        // of `try_update`, which does not exist at our 1.85 MSRV.
+        let mut count = live.load(Ordering::SeqCst);
+        loop {
+            if count >= max {
+                return None;
+            }
+            match live.compare_exchange_weak(count, count + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(actual) => count = actual,
+            }
+        }
         Some(Self {
             live: Arc::clone(live),
         })
@@ -2834,6 +2842,43 @@ mod tests {
             "a finished connection gives its slot back"
         );
         drop(second);
+    }
+
+    #[test]
+    fn a_ceiling_of_zero_admits_nobody_and_counts_nothing() {
+        let live = Arc::new(AtomicUsize::new(0));
+        assert!(Slot::claim(&live, 0).is_none());
+        assert_eq!(live.load(Ordering::SeqCst), 0, "a refusal claims nothing");
+    }
+
+    #[test]
+    fn racing_claims_never_overshoot_the_ceiling() {
+        // The retry path: every thread reads the same count at once, so all
+        // but one compare-exchange loses and has to look again.
+        const THREADS: usize = 32;
+        const MAX: usize = 5;
+        let live = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+
+        let racers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let live = Arc::clone(&live);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    Slot::claim(&live, MAX)
+                })
+            })
+            .collect();
+        let slots: Vec<Slot> = racers
+            .into_iter()
+            .filter_map(|racer| racer.join().unwrap())
+            .collect();
+
+        assert_eq!(slots.len(), MAX, "exactly the ceiling gets in");
+        assert_eq!(live.load(Ordering::SeqCst), MAX);
+        drop(slots);
+        assert_eq!(live.load(Ordering::SeqCst), 0, "and every slot comes back");
     }
 
     #[test]
